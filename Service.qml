@@ -31,6 +31,15 @@ Item {
   // in Dashboard.qml opens `configPath` in the user's editor.
   readonly property string backendConfigFile: backend === "llama.cpp" ? "llama.env" : "ollama.json"
   readonly property string configPath: Qt.resolvedUrl("configs/" + backendConfigFile).toString().replace(/^file:\/\//, "")
+  // user unit dir, the same value systemd uses ($XDG_CONFIG_HOME or
+  // $HOME/.config + /systemd/user). The provisioner writes llama.cpp.service
+  // here through well-tested constants; this resolves to the live path.
+  readonly property string userUnitDir: {
+    var x = Quickshell.env("XDG_CONFIG_HOME")
+    var h = Quickshell.env("HOME")
+    var base = (x !== null && x !== "") ? x : ((h !== null && h !== "") ? h + "/.config" : "/tmp")
+    return base + "/systemd/user"
+  }
   readonly property string defaultConfigJson: '{"host":"127.0.0.1","port":11434,"api-key":""}'
   // Default llama.cpp env file. Written via an unquoted heredoc so $HOME
   // expands to the absolute preset path at write time (systemd does no
@@ -41,18 +50,314 @@ Item {
   property int configPort: 0
   property string configApiKey: ""
 
+  // Strict config validation (Phase 1). configValid is false when any field in
+  // the config file is malformed/unsafe; configWarning is the short human reason
+  // shown in the panel. On a violation the config is ignored (safe defaults kept)
+  // and — via refreshApi() — NO network call is made until the file is fixed.
+  // Written by _parseConfigBuffer, so it cannot be `readonly`; treated as
+  // read-only by consumers.
+  property bool configValid: true
+  property string configWarning: ""
+
+  // ── Validators (pure QML, no processes) ─────────────────────────────
+  // Loopback: 127.0.0.0/8 (no leading zeros), ::1, or localhost.
+  function isValidLoopbackHost(h) {
+    var s = String(h || "").trim()
+    if (s === "localhost" || s === "::1" || s === "127.0.0.1") return true
+    if (!/^127\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})$/.test(s)) return false
+    var octets = s.split(".")
+    for (var i = 1; i < 4; i++) {
+      if (parseInt(octets[i], 10) > 255) return false
+    }
+    return true
+  }
+
+  // Remote hostnames / IPv4 / bracketed IPv6. Charset allowlist plus IPv4
+  // literal sanity: anything with spaces, quotes, `/`, `$`, backticks, `;`,
+  // `&`, `|`, etc. fails; a dotted-quad must have valid octets (no leading
+  // zeros) and — like http-bind-to-all — the all-zero wildcard 0.0.0.0 is
+  // rejected outright (it means "every interface", never a valid endpoint).
+  function isValidRemoteHost(h) {
+    var s = String(h || "")
+    if (s === "") return false
+    if (!/^[A-Za-z0-9.\-:\[\]]+$/.test(s)) return false
+    if (/^\d+(\.\d+){3}$/.test(s)) {
+      var octets = s.split(".")
+      var allZero = true
+      for (var i = 0; i < octets.length; i++) {
+        var o = octets[i]
+        if (o.length > 1 && o.charAt(0) === "0") return false
+        if (parseInt(o, 10) > 255) return false
+        if (parseInt(o, 10) !== 0) allZero = false
+      }
+      return !allZero
+    }
+    return true
+  }
+
+  function isValidPort(p) {
+    return typeof p === "number" && Number.isInteger(p) && p >= 1 && p <= 65535
+  }
+
+  // Empty is valid (means "no auth"). A present key rides inside a curl config
+  // line (double-quoted), so `"`, `\` and control characters are rejected.
+  function isValidApiKey(k) {
+    var s = String(k || "")
+    if (s === "") return true
+    if (s.length > 256) return false
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i)
+      if (c === 0x22 || c === 0x5c || c < 0x20 || c === 0x7f) return false
+    }
+    return true
+  }
+
+  // Extra args end up in the unit's ExecStart (shell-expanded), so each token
+  // is restricted to a safe CLI skeleton. `~` is rejected too (no tilde paths).
+  function validateExtraArgs(s) {
+    var v = String(s || "").trim()
+    if (v === "") return true
+    var tokens = v.split(/\s+/)
+    for (var i = 0; i < tokens.length; i++) {
+      if (!/^[A-Za-z0-9._/+=:,%-]+$/.test(tokens[i])) return false
+    }
+    return true
+  }
+
+  // Absolute path only; reject quotes, backslash, `$`, backtick, newline/tab.
+  function isValidPresetPath(p) {
+    var s = String(p || "")
+    if (s === "") return true
+    if (s.charAt(0) !== "/") return false
+    return !/["\\$`\r\n\t]/.test(s)
+  }
+
   readonly property string effectiveHost: configHost !== "" ? configHost : "127.0.0.1"
   readonly property int effectivePort: configPort > 0 ? configPort : backendPort
-  readonly property string effectiveHealthEndpoint: "http://" + effectiveHost + ":" + effectivePort + (backend === "llama.cpp" ? "/health" : "/")
 
-  // curl auth header for the API, only sent when an api-key is configured.
-  readonly property string apiKeyCurlHeader: {
-    if (configApiKey === "") return ""
-    var safe = String(configApiKey).replace(/'/g, "'\\''")
-    return backend === "llama.cpp"
-      ? " -H 'X-Api-Key: " + safe + "'"
-      : " -H 'Authorization: Bearer " + safe + "'"
-  }
+  // Endpoint policy: http is allowed for loopback hosts only; any non-loopback
+  // host must be https (curl default certificate validation, never -k). The
+  // config stores no scheme, so a valid non-loopback host already implies https
+  // — there is no way to request plaintext http for a remote host.
+  readonly property string endpointScheme: isValidLoopbackHost(effectiveHost) ? "http" : "https"
+  readonly property bool hostOk: isValidLoopbackHost(effectiveHost) || isValidRemoteHost(effectiveHost)
+  readonly property bool portOk: isValidPort(effectivePort)
+  // Scheme rule: loopback ⇒ http OR non-loopback ⇒ https. It always holds once
+  // hostOk is true, but is kept explicit so the policy is auditable here.
+  // configValid is folded in so THIS single flag enforces the whole "invalid
+  // config ⇒ no network calls" policy in refreshApi().
+  readonly property bool endpointOk: configValid && hostOk && portOk && (isValidLoopbackHost(effectiveHost) || endpointScheme === "https")
+  readonly property string effectiveHealthEndpoint: endpointScheme + "://" + effectiveHost + ":" + effectivePort + (backend === "llama.cpp" ? "/health" : "/")
+  readonly property string effectiveListEndpoint: backend === "llama.cpp" ? endpointScheme + "://" + effectiveHost + ":" + effectivePort + "/v1/models" : ""
+
+  // ── Constant shell scripts (no user data concatenation) ────────────
+  // Every Process builds its command from these constants only. User values
+  // arrive as positional args ($1..$n); the API key arrives only through
+  // Process.environment and is handed to curl on stdin (`curl -K -`) — never
+  // in argv and never on disk.
+  readonly property string curlFnLlama:
+`hdr() { if [ -n "$DASH_API_KEY" ]; then
+           printf 'header = "X-Api-Key: %s"\n' "$DASH_API_KEY" | curl -K - "$@"
+         else
+           curl "$@"
+         fi }`
+
+  readonly property string curlFnOllama:
+`hdr() { if [ -n "$DASH_API_KEY" ]; then
+           printf 'header = "Authorization: Bearer %s"\n' "$DASH_API_KEY" | curl -K - "$@"
+         else
+           curl "$@"
+         fi }`
+
+  readonly property string healthScriptLlama: curlFnLlama + `
+set -o pipefail;
+hdr -s -o /dev/null -w '%{http_code} %{time_total}' --connect-timeout 3 --max-time 5 "$1" 2>/dev/null | head -c "$2"`
+
+  readonly property string healthScriptOllama: curlFnOllama + `
+set -o pipefail;
+hdr -s -o /dev/null -w '%{http_code} %{time_total}' --connect-timeout 3 --max-time 5 "$1" 2>/dev/null | head -c "$2"`
+
+  readonly property string listScriptLlama: curlFnLlama + `
+set -o pipefail;
+hdr -s "$1" 2>&1 | head -c "$2"`
+
+  readonly property string listScriptOllama: `
+set -o pipefail;
+ollama list 2>&1 | head -c "$1"`
+
+  // ── Systemd / process probes (constants, args-only) ───────────────
+  // $1 = scope flag ("--user" for llama.cpp, empty for the system ollama
+  // service), $2 = unit name, $3 = output cap. No user data is ever
+  // concatenated into these strings.
+  readonly property string checkServiceScript: `
+set -o pipefail;
+systemctl $1 list-unit-files $2 --no-legend 2>&1 | head -c $3`
+
+  readonly property string serviceScript: `
+set -o pipefail;
+systemctl $1 show $2 --property=ActiveState,SubState,ActiveEnterTimestamp 2>&1 | head -c $3`
+
+  readonly property string psScriptLlama: `
+set -o pipefail;
+pgrep -af '[l]lama-server' | grep -oE '(--model|-m)[= ][^ ]+' 2>&1 | head -c $1`
+
+  readonly property string psScriptOllama: `
+set -o pipefail;
+ollama ps 2>&1 | head -c $1`
+
+  readonly property string versionScript: `
+set -o pipefail;
+$1 --version 2>&1 | head -c $2`
+
+   // Config reader probe. Path is $1 (the only variable input), cap is $2.
+   // Refuses symlinks and special files: a config that is really a link, a
+   // FIFO/pipe, or a socket reports REFUSE instead of HAS so no data leaks
+   // (or hangs) and the panel warns instead of parsing it. A regular file is
+   // hardened to 0600 in place (idempotent; it may hold an API key) — the file
+   // is user-owned, so no privilege is needed and nothing is ever chmodded
+   // through a link.
+   readonly property string configScript: `
+f="$1";
+{ if [ -f "$f" ] && [ ! -L "$f" ] && [ ! -p "$f" ]; then
+    chmod 600 -- "$f" 2>/dev/null;
+    echo HAS; cat "$f";
+  elif [ -L "$f" ] || [ -p "$f" ]; then
+    echo REFUSE;
+  else
+    echo NO;
+  fi; } 2>/dev/null | head -c $2`
+
+  // Generic config-file writer (ollama JSON). Create-only, symlink-refusing,
+  // atomic, 0600 — writing a file in the user's own plugin directory needs
+  // no privilege, so there is no pkexec here at all. $1 = target, $2 = content.
+  // Exit codes: 4 = target already exists (not an error), 55 = parent dir is
+  // a symlink, 5/6 = temp file write/rename failed.
+  readonly property string createConfigScript: `
+set -o pipefail;
+f="$1";
+d=$(dirname -- "$f");
+[ -L "$d" ] && exit 55;
+[ -d "$d" ] || mkdir -p -- "$d";
+if [ -e "$f" ] || [ -L "$f" ]; then exit 4; fi;
+t=$(mktemp -- "$d/.dashboard-config.XXXXXX") || exit 5;
+printf '%s' "$2" > "$t" && chmod 600 "$t" && mv -f -- "$t" "$f" || { rm -f -- "$t"; exit 6; }`
+
+  // llama.env writer: the same create-only / symlink-refusing / atomic / 0600
+  // pattern as createConfigScript, but the content is a constant heredoc so
+  // $HOME expands at write time (as today). Only the path is an argument.
+  readonly property string createEnvScript: `
+set -o pipefail;
+f="$1";
+d=$(dirname -- "$f");
+[ -L "$d" ] && exit 55;
+[ -d "$d" ] || mkdir -p -- "$d";
+if [ -e "$f" ] || [ -L "$f" ]; then exit 4; fi;
+t=$(mktemp -- "$d/.llama.env.XXXXXX") || exit 5;
+cat > "$t" <<ENV
+` + root.llamaEnvDefault + `ENV
+chmod 600 "$t" && mv -f -- "$t" "$f" || { rm -f -- "$t"; exit 6; }`
+
+  // The user systemd unit template for llama.cpp (identical to the unit
+  // generated before Phase 4, so the dry-run comparison finds no change for
+  // existing installs). `$f` and `$abs` expand at write time (heredoc run in
+  // the provisioner); the `\${LLAMA_*}` tokens stay literal in the file so
+  // systemd reads them from the EnvironmentFile at runtime.
+  readonly property string llamaUnitBody: '[Unit]\nDescription=llama.cpp server (managed by local-ai-dashboard)\n' +
+    'After=network.target\n\n[Service]\nType=simple\n' +
+    'EnvironmentFile=$f\n' +
+    'ExecStart=/bin/bash -c \'exec "$abs" --host "\\${LLAMA_HOST:-127.0.0.1}" --port "\\${LLAMA_PORT:-8080}" --models-preset "\\${LLAMA_MODELS_PRESET}" --models-max "\\${LLAMA_MODELS_MAX:-1}" \\${LLAMA_EXTRA_ARGS}\'\n' +
+    'Restart=on-failure\n\n[Install]\nWantedBy=default.target\n'
+
+  // Phase 4 provisioning script (constant; args only). Args: $1 = env file
+  // path, $2 = user unit dir, $3 = backend binary name, $4 = consent (0/1),
+  // $5 = output cap for systemctl. Behaviour:
+  //   - env file: create-only / symlink+FIFO-refusing / atomic / 0600, and
+  //     chmod 600 an existing regular env file (Phase 3 guarantee).
+  //   - unit: generated in a temp file and compared with the installed one.
+  //     Identical -> plain `systemctl --user start`, no consent needed.
+  //     Different/missing -> dry-run: touch nothing, print the consent marker,
+  //     exit 64. With consent: .bak backup -> systemd-analyze --user verify ->
+  //     atomic swap -> daemon-reload -> start; on start failure restore .bak
+  //     (or remove the unit on first-time create) so the system is left exactly
+  //     as before. flock guards against concurrent provisioners.
+  // Exit codes: 0 or 4 done; 55 unsafe env path; 58 unsafe unit dir; 57/61
+  // temp file failure; 60 lock held; 62 verification failed; 63 rolled back;
+  // 64 consent required; 40 binary missing.
+  readonly property string provisionLlamaScript:
+`set -uo pipefail;
+f="$1"; ud="$2"; bin="$3"; yes="\${4:-0}"; cap="\${5:-512}"; u="$ud/llama.cpp.service";
+abs=$(command -v -- "$bin") || exit 40;
+[ -L "$ud" ] && exit 58; [ -d "$ud" ] || mkdir -p -- "$ud";
+exec 9>>"$ud/.local-ai-dashboard.lock"; flock -n 9 || exit 60;
+d=$(dirname -- "$f"); [ -L "$d" ] && exit 55; [ -d "$d" ] || mkdir -p -- "$d";
+if [ -e "$f" ] || [ -L "$f" ]; then
+  if [ -L "$f" ] || [ -p "$f" ]; then exit 55; fi;
+  [ -f "$f" ] && chmod 600 "$f";
+else
+  t=$(mktemp -- "$d/.llama.env.XXXXXX") || exit 57;
+  cat > "$t" <<ENV
+` + root.llamaEnvDefault + `ENV
+  chmod 600 "$t" && mv -f -- "$t" "$f" || { rm -f -- "$t"; exit 57; };
+fi;
+tmp=$(mktemp -- "$ud/.llama.cpp.service.XXXXXX") || exit 61;
+cat > "$tmp" <<UNIT
+` + root.llamaUnitBody + `UNIT
+chmod 644 "$tmp";
+if [ -e "$u" ] && cmp -s -- "$u" "$tmp"; then
+  rm -f -- "$tmp";
+  systemctl --user start llama.cpp.service 2>&1 | head -c "$cap";
+  exit $?;
+fi;
+[ "$yes" = "1" ] || { rm -f -- "$tmp"; echo "SERVICE-UPDATE-REQUIRED"; exit 64; };
+cp -a -- "$u" "$ud/.llama.cpp.service.bak" 2>/dev/null || true;
+systemd-analyze --user verify "$tmp" >/dev/null 2>&1 || { rm -f -- "$tmp" "$ud/.llama.cpp.service.bak"; exit 62; };
+mv -f -- "$tmp" "$u";
+systemctl --user daemon-reload;
+if systemctl --user start llama.cpp.service 2>&1 | head -c "$cap"; then exit 0; fi;
+if [ -e "$ud/.llama.cpp.service.bak" ]; then
+  mv -f -- "$ud/.llama.cpp.service.bak" "$u";
+else
+  rm -f -- "$u";
+fi;
+systemctl --user daemon-reload;
+exit 63`
+
+  readonly property string serviceMemoryScript: `
+set -o pipefail;
+cg=$(systemctl --user show $1 --property=ControlGroup --value 2>/dev/null);
+out="";
+[ -n "$cg" ] && [ -r "/sys/fs/cgroup$cg/memory.stat" ] && out=$(awk '$1=="anon"{a=$2}$1=="shmem"{s=$2}END{print (a+0)+(s+0)}' "/sys/fs/cgroup$cg/memory.stat" 2>/dev/null);
+[ -z "$out" ] && out=$(systemctl --user show $1 --property=MemoryCurrent --value 2>/dev/null);
+[ -n "$out" ] || out=0;
+echo "$out" | head -c $2`
+
+   readonly property string serviceVramScript: `
+set -o pipefail;
+cg=$(systemctl --user show $1 --property=ControlGroup --value 2>/dev/null);
+pid=$(systemctl --user show $1 --property=MainPID --value);
+pids="$pid"; [ -n "$cg" ] && [ -r "/sys/fs/cgroup$cg/cgroup.procs" ] && pids="$(tr '\\n' ' ' < "/sys/fs/cgroup$cg/cgroup.procs") $pid";
+if command -v nvidia-smi >/dev/null 2>&1; then
+nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null |
+awk -F',' -v ps="$pids" 'BEGIN{n=split(ps,a," ");for(i=1;i<=n;i++)if(a[i]!="")seen[a[i]]=1}{gsub(/[ \\t]/,"",$1);gsub(/[ \\t]/,"",$2);if(($1 in seen)&&$2~/^[0-9]+$/){sum+=$2;c++}}END{if(c>0)print sum" MiB"}';
+elif command -v rocm-smi >/dev/null 2>&1; then
+rocm-smi --showmeminfo vram 2>/dev/null | head -2;
+fi | head -c $2`
+
+   // Start/stop actions. Ollama runs on the SYSTEM unit, so it goes through
+   // pkexec — that IS the polkit consent gate, and stays as-is. llama.cpp stop
+   // is a plain user-unit stop (no privilege). $1 = unit name, $2 = cap; both
+   // are QML constants/numbers, never user data.
+   readonly property string pkStartScript: `
+set -o pipefail;
+pkexec /usr/bin/systemctl start "$1" 2>&1 | head -c "$2"`
+
+   readonly property string pkStopScript: `
+set -o pipefail;
+pkexec /usr/bin/systemctl stop "$1" 2>&1 | head -c "$2"`
+
+   readonly property string userStopScript: `
+set -o pipefail;
+systemctl --user stop "$1" 2>&1 | head -c "$2"`
 
   // ── State ─────────────────────────────────────────────────────────
   property bool installed: false       // backend binary on PATH
@@ -60,6 +365,11 @@ Item {
   property bool running: false
   property bool busy: false
   property bool hasConfig: false       // plugin config file exists
+  // Phase 4: the llama.cpp dry-run detected a unit change and is waiting for
+  // the user to confirm the write (or for the auto-cancel timer to expire).
+  property bool pendingProvision: false
+  // Set only for the confirm() relaunch so the dry-run keeps consent=0.
+  property bool _provisionConsented: false
   property string actionLabel: ""
   property string lastError: ""
 
@@ -196,6 +506,28 @@ Item {
     return "Failed to " + verb + " " + root.backendDisplayName
   }
 
+  // Phase 4 provisioning exit-code map (llama.cpp). The provisioner is
+  // deterministic and communicates failure modes via exit codes, so each
+  // code maps to a precise, actionable message instead of raw systemctl output.
+  function _provisionError(exitCode, output) {
+    var b = String(output || "").trim()
+    var why = ""
+    switch (exitCode) {
+      case 55: why = "Cannot start " + root.backendDisplayName + ": refusing to write the config (parent path is a symlink)."; break
+      case 57: why = "Cannot start " + root.backendDisplayName + ": the environment file could not be written."; break
+      case 58: why = "Cannot start " + root.backendDisplayName + ": refusing to write the systemd unit (its directory is a symlink)."; break
+      case 40: why = "Cannot start " + root.backendDisplayName + ": " + root.backendBinary + " is not on PATH."; break
+      case 60: why = "Another local-ai-dashboard instance is already provisioning " + root.backendDisplayName + ". Try again in a moment."; break
+      case 61: why = "Cannot start " + root.backendDisplayName + ": the systemd unit could not be created."; break
+      case 62: why = "Cannot start " + root.backendDisplayName + ": the generated systemd unit failed systemd-analyze verification. Nothing was changed."; break
+      case 63: why = "Start failed after provisioning — the previous systemd unit was restored. See the error below; check the debug log for details."; break
+      default:
+        if (b !== "") return _actionError(b, "start")
+        return "Failed to start " + root.backendDisplayName
+    }
+    return b !== "" ? why + "\n" + b : why
+  }
+
   // ── Process management ──────────────────────────────────────────────
   function launch(process, watchdog) {
     if (!process.running) {
@@ -227,6 +559,21 @@ Item {
       apiLatencyMs = -1
       return
     }
+    // Enforced endpoint policy: endpointOk folds in configValid, so if the
+    // config is invalid/unsafe (or a host/port violates the loopback-http /
+    // remote-https rule) no network process is launched at all — no health
+    // check, no model list. configWarning explains why on the panel;
+    // apiReachable just stays false.
+    if (!endpointOk) {
+      apiReachable = false
+      apiLatencyMs = -1
+      models = []
+      runningModels = []
+      serviceMemoryBytes = -1
+      serviceVramBytes = -1
+      serviceTotalBytes = -1
+      return
+    }
     // Clear transient errors on a fresh successful refresh cycle
     lastError = ""
     launch(apiHealthProcess, apiHealthWatchdog)
@@ -247,11 +594,35 @@ Item {
     // Start: llama.cpp self-provisions env + unit, so only needs the binary installed.
     if (busy || !installed) return
     if (backend === "ollama" && (!hasService || !hasConfig)) return
+    // A Start is always a fresh dry-run: clears any pending consent state.
+    pendingProvision = false
+    provisionTimer.stop()
+    _provisionConsented = false
     busy = true
     actionLabel = "Starting " + root.backendDisplayName + "…"
     lastError = ""
     startProcess.running = true
     startActionWatchdog.restart()
+  }
+
+  // The dry-run reported a unit change and the user clicked "Confirm": relaunch
+  // the provisioner with consent=1 so it can back up, atomically swap and start.
+  function confirmProvision() {
+    if (busy || !installed) return
+    _provisionConsented = true
+    pendingProvision = false
+    provisionTimer.stop()
+    busy = true
+    actionLabel = "Starting " + root.backendDisplayName + "…"
+    lastError = ""
+    startProcess.running = true
+    startActionWatchdog.restart()
+  }
+
+  function cancelProvision() {
+    pendingProvision = false
+    provisionTimer.stop()
+    _provisionConsented = false
   }
 
   function stopService() {
@@ -517,9 +888,10 @@ Item {
     _apiBuffer = ""
     var parts = raw.split(/\s+/)
     var code = parseInt(parts[0], 10)
-    var latency = parseInt(parts[1], 10)
+    // curl -w '%{http_code} %{time_total}' → e.g. "200 0.042" (seconds)
+    var seconds = parts.length > 1 ? parseFloat(parts[1], 10) : NaN
     apiReachable = (code === 200)
-    apiLatencyMs = isFinite(latency) && latency >= 0 ? latency : -1
+    apiLatencyMs = isFinite(seconds) && seconds >= 0 ? Math.round(seconds * 1000) : -1
   }
 
   // cgroup memory.stat (anon + shmem) → llama.cpp DRAM working set (bytes), excluding reclaimable page cache
@@ -591,16 +963,32 @@ Item {
     var first = newline !== -1 ? raw.substring(0, newline).trim() : raw
     var body = newline !== -1 ? raw.substring(newline + 1) : ""
     hasConfig = first === "HAS"
+    // A config path that is actually a symlink or special file is refused at
+    // the reader; report it clearly instead of pretending the config is gone.
+    if (first === "REFUSE") {
+      hasConfig = false
+      configHost = "127.0.0.1"
+      configPort = 0
+      configApiKey = ""
+      configValid = true
+      configWarning = truncate("Refusing to read config: " + root.configPath + " is a symlink or special file.", 256)
+      return
+    }
     if (!hasConfig) {
       configHost = "127.0.0.1"
       configPort = 0
       configApiKey = ""
+      configValid = true
+      configWarning = ""
       return
     }
+    // Collected values default to safe values. Any violation resets the
+    // applied state back to these and records a human reason for the panel.
+    var host = "127.0.0.1"
+    var port = -1  // -1 = never set in the file = use the backend default port
+    var apiKey = ""
+    var violations = []
     if (backend === "llama.cpp") {
-      var host = "127.0.0.1"
-      var port = 0
-      var apiKey = ""
       var envLines = body.split("\n")
       for (var i = 0; i < envLines.length; i++) {
         var line = String(envLines[i]).replace(/^\s+|\s+$/g, "")
@@ -609,35 +997,80 @@ Item {
         if (eq === -1) continue
         var key = line.substring(0, eq).replace(/^\s+|\s+$/g, "")
         var val = line.substring(eq + 1).replace(/^\s+|\s+$/g, "").replace(/^"(.*)"$/, "$1")
-        if (key === "LLAMA_HOST") host = val !== "" ? val : "127.0.0.1"
-        else if (key === "LLAMA_PORT") {
-          var p = parseInt(val, 10)
-          port = isFinite(p) && p > 0 ? p : 0
-        } else if (key === "LLAMA_API_KEY") apiKey = val
+        if (key === "LLAMA_HOST") {
+          host = val !== "" ? val : "127.0.0.1"
+        } else if (key === "LLAMA_PORT") {
+          if (val !== "") {
+            if (/^[0-9]+$/.test(val)) {
+              var pn = parseInt(val, 10)
+              if (pn >= 1 && pn <= 65535) port = pn
+              else violations.push("LLAMA_PORT out of range (1-65535)")
+            } else {
+              violations.push("LLAMA_PORT is not an integer")
+            }
+          }
+        } else if (key === "LLAMA_API_KEY") {
+          apiKey = val
+        } else if (key === "LLAMA_EXTRA_ARGS") {
+          if (!validateExtraArgs(val)) violations.push("LLAMA_EXTRA_ARGS contains unsafe characters")
+        } else if (key === "LLAMA_MODELS_PRESET") {
+          if (!isValidPresetPath(val)) violations.push("LLAMA_MODELS_PRESET is not a safe absolute path")
+        }
       }
-      configHost = host
-      configPort = port
-      configApiKey = apiKey
     } else {
+      var obj = null
       try {
-        var obj = JSON.parse(body)
-        configHost = String(obj["host"] || "127.0.0.1")
-        var p = parseInt(obj["port"], 10)
-        configPort = isFinite(p) && p > 0 ? p : 0
-        configApiKey = String(obj["api-key"] || "")
+        obj = JSON.parse(body)
       } catch(e) {
-        configHost = "127.0.0.1"
-        configPort = 0
-        configApiKey = ""
+        violations.push("config is not valid JSON")
+      }
+      if (obj !== null) {
+        if (typeof obj["host"] === "string") {
+          host = obj["host"] !== "" ? obj["host"] : "127.0.0.1"
+        } else {
+          violations.push("host must be a string")
+        }
+        if (typeof obj["port"] === "number" && Number.isInteger(obj["port"])) {
+          if (obj["port"] >= 1 && obj["port"] <= 65535) port = obj["port"]
+          else violations.push("port out of range (1-65535)")
+        } else {
+          violations.push("port must be an integer")
+        }
+        if (typeof obj["api-key"] === "string") {
+          apiKey = obj["api-key"]
+        } else {
+          violations.push("api-key must be a string")
+        }
       }
     }
+    // Common validation across both backends.
+    if (port === -1) port = 0  // never set by the config file: use the backend default port
+    if (!(isValidLoopbackHost(host) || isValidRemoteHost(host))) {
+      violations.push("host is not a valid loopback or remote host")
+    }
+    if (port !== 0 && !isValidPort(port)) violations.push("port is out of range (1-65535)")
+    if (!isValidApiKey(apiKey)) violations.push("api key contains unsafe characters")
+
+    if (violations.length > 0) {
+      configHost = "127.0.0.1"
+      configPort = 0
+      configApiKey = ""
+      configValid = false
+      configWarning = truncate("Invalid " + root.backendDisplayName + " config: " + violations.join("; ") + ".", 256)
+      return
+    }
+    configHost = host
+    configPort = port
+    configApiKey = apiKey
+    configValid = true
+    configWarning = ""
   }
 
-  // Read-only startup probe: reports whether the config file exists (HAS/NO)
-  // as the first output line and, if so, the file contents after it. Never
-  // creates or modifies the file — creation is user-initiated via
-  // createConfigFile().
-  function ensureAndReadConfig() {
+   // Startup config probe: reports HAS/NO as the first output line and, if so,
+   // the file contents after it. It never creates or overwrites the file (that
+   // is user-initiated via createConfigFile()); its only write is an idempotent
+   // 0600 hardening of an existing regular file, which may hold an API key.
+   function ensureAndReadConfig() {
     launch(configProcess, configWatchdog)
   }
 
@@ -681,7 +1114,9 @@ Item {
     id: checkServiceProcess
     running: false
     command: ["timeout", "-k", "2", "" + processTimeoutSec,
-              "bash", "-c", "set -o pipefail; systemctl" + (root.backend === "llama.cpp" ? " --user" : "") + " list-unit-files " + root.backendService + " --no-legend 2>&1 | head -c " + root.capCheck]
+              "bash", "-c", root.checkServiceScript, "dash",
+              root.backend === "llama.cpp" ? "--user" : "",
+              root.backendService, "" + root.capCheck]
     stdout: SplitParser { onRead: function(line) { root._onCheckLine(line) } }
     onExited: function(exitCode) {
       checkServiceWatchdog.stop()
@@ -694,7 +1129,9 @@ Item {
     id: serviceProcess
     running: false
     command: ["timeout", "-k", "2", "" + processTimeoutSec,
-              "bash", "-c", "set -o pipefail; systemctl" + (root.backend === "llama.cpp" ? " --user" : "") + " show " + root.backendService.replace('.service', '') + " --property=ActiveState,SubState,ActiveEnterTimestamp 2>&1 | head -c " + root.capService]
+              "bash", "-c", root.serviceScript, "dash",
+              root.backend === "llama.cpp" ? "--user" : "",
+              root.backendService.replace(".service", ""), "" + root.capService]
     stdout: SplitParser { onRead: function(line) { root._onServiceLine(line) } }
     onExited: function(exitCode) {
       serviceWatchdog.stop()
@@ -709,11 +1146,15 @@ Item {
     }
   }
 
+  // API health check. Constant script; the endpoint URL and output cap are
+  // positional args, the key travels via the process environment only.
   Process {
     id: apiHealthProcess
     running: false
     command: ["timeout", "-k", "2", "" + processTimeoutSec,
-              "bash", "-c", "set -o pipefail; start=$(date +%s%3N); status=$(curl -s -o /dev/null -w '%{http_code}'" + root.apiKeyCurlHeader + " --connect-timeout 3 --max-time 5 " + root.effectiveHealthEndpoint + "); end=$(date +%s%3N); echo \"$status $((end - start))\" | head -c " + root.capApi]
+              "bash", "-c", root.backend === "llama.cpp" ? root.healthScriptLlama : root.healthScriptOllama,
+              "dash", root.effectiveHealthEndpoint, "" + root.capApi]
+    environment: ({ "DASH_API_KEY": root.configApiKey })
     stdout: SplitParser { onRead: function(line) { root._onApiLine(line) } }
     onExited: function(exitCode) {
       apiHealthWatchdog.stop()
@@ -730,8 +1171,14 @@ Item {
   Process {
     id: listProcess
     running: false
-    command: ["timeout", "-k", "2", "" + processTimeoutSec,
-              "bash", "-c", "set -o pipefail; if [ \"" + root.backend + "\" = \"llama.cpp\" ]; then curl -s" + root.apiKeyCurlHeader + " http://" + root.effectiveHost + ":" + root.effectivePort + "/v1/models 2>&1 | head -c " + root.capList + "; else ollama list 2>&1 | head -c " + root.capList + "; fi"]
+    command: root.backend === "llama.cpp"
+      ? ["timeout", "-k", "2", "" + processTimeoutSec,
+         "bash", "-c", root.listScriptLlama, "dash",
+         root.effectiveListEndpoint, "" + root.capList]
+      : ["timeout", "-k", "2", "" + processTimeoutSec,
+         "bash", "-c", root.listScriptOllama, "dash",
+         "" + root.capList]
+    environment: ({ "DASH_API_KEY": root.configApiKey })
     stdout: SplitParser { onRead: function(line) { root.backend === "llama.cpp" ? root._onJsonLine(line) : root._onListLine(line) } }
     onExited: function(exitCode) {
       listWatchdog.stop()
@@ -748,8 +1195,11 @@ Item {
   Process {
     id: psProcess
     running: false
-    command: ["timeout", "-k", "2", "" + processTimeoutSec,
-              "bash", "-c", "set -o pipefail; if [ \"" + root.backend + "\" = \"llama.cpp\" ]; then pgrep -af '[l]lama-server' | grep -oE '(--model|-m)[= ][^ ]+' 2>&1 | head -c " + root.capPs + "; else ollama ps 2>&1 | head -c " + root.capPs + "; fi"]
+    command: root.backend === "llama.cpp"
+      ? ["timeout", "-k", "2", "" + processTimeoutSec,
+         "bash", "-c", root.psScriptLlama, "dash", "" + root.capPs]
+      : ["timeout", "-k", "2", "" + processTimeoutSec,
+         "bash", "-c", root.psScriptOllama, "dash", "" + root.capPs]
     stdout: SplitParser { onRead: function(line) { root.backend === "llama.cpp" ? root._onPgrepLine(line) : root._onPsLine(line) } }
     onExited: function(exitCode) {
       psWatchdog.stop()
@@ -766,7 +1216,8 @@ Item {
     id: versionProcess
     running: false
     command: ["timeout", "-k", "2", "" + processTimeoutSec,
-              "bash", "-c", "set -o pipefail; " + root.backendBinary + " --version 2>&1 | head -c " + root.capVersion]
+              "bash", "-c", root.versionScript, "dash",
+              root.backendBinary, "" + root.capVersion]
     stdout: SplitParser { onRead: function(line) { root._onVersionLine(line) } }
     onExited: function(exitCode) {
       versionWatchdog.stop()
@@ -781,7 +1232,8 @@ Item {
     id: configProcess
     running: false
     command: ["timeout", "-k", "2", "" + processTimeoutSec,
-              "bash", "-c", "f='" + root.configPath + "'; { if [ -f \"$f\" ]; then echo HAS; cat \"$f\"; else echo NO; fi; } 2>/dev/null | head -c " + root.capConfig]
+              "bash", "-c", root.configScript, "dash",
+              root.configPath, "" + root.capConfig]
     stdout: SplitParser { onRead: function(line) { root._onConfigLine(line) } }
     onExited: function(exitCode) {
       configWatchdog.stop()
@@ -798,13 +1250,8 @@ Item {
     id: serviceMemoryProcess
     running: false
     command: ["timeout", "-k", "2", "" + processTimeoutSec,
-              "bash", "-c",
-              "cg=$(systemctl --user show " + root.backendService.replace('.service', '') + " --property=ControlGroup --value 2>/dev/null); " +
-              "out=\"\"; " +
-              "[ -n \"$cg\" ] && [ -r \"/sys/fs/cgroup$cg/memory.stat\" ] && out=$(awk '$1==\"anon\"{a=$2}$1==\"shmem\"{s=$2}END{print (a+0)+(s+0)}' \"/sys/fs/cgroup$cg/memory.stat\" 2>/dev/null); " +
-              "[ -z \"$out\" ] && out=$(systemctl --user show " + root.backendService.replace('.service', '') + " --property=MemoryCurrent --value 2>/dev/null); " +
-              "[ -n \"$out\" ] || out=0; " +
-              "echo \"$out\" | head -c " + root.capServiceMemory]
+              "bash", "-c", root.serviceMemoryScript, "dash",
+              root.backendService.replace(".service", ""), "" + root.capServiceMemory]
     stdout: SplitParser { onRead: function(line) { root._onServiceMemoryLine(line) } }
     onExited: function(exitCode) {
       serviceMemoryWatchdog.stop()
@@ -824,16 +1271,8 @@ Item {
     id: serviceVramProcess
     running: false
     command: ["timeout", "-k", "2", "" + processTimeoutSec,
-              "bash", "-c",
-              "cg=$(systemctl --user show " + root.backendService.replace('.service', '') + " --property=ControlGroup --value 2>/dev/null); " +
-              "pid=$(systemctl --user show " + root.backendService.replace('.service', '') + " --property=MainPID --value); " +
-              "pids=\"$pid\"; [ -n \"$cg\" ] && [ -r \"/sys/fs/cgroup$cg/cgroup.procs\" ] && pids=\"$(tr '\\n' ' ' < \"/sys/fs/cgroup$cg/cgroup.procs\") $pid\"; " +
-              "if command -v nvidia-smi >/dev/null 2>&1; then " +
-              "nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null | " +
-              "awk -F',' -v ps=\"$pids\" 'BEGIN{n=split(ps,a,\" \");for(i=1;i<=n;i++)if(a[i]!=\"\")seen[a[i]]=1}{gsub(/[ \\t]/,\"\",$1);gsub(/[ \\t]/,\"\",$2);if(($1 in seen)&&$2~/^[0-9]+$/){sum+=$2;c++}}END{if(c>0)print sum\" MiB\"}'; " +
-              "elif command -v rocm-smi >/dev/null 2>&1; then " +
-              "rocm-smi --showmeminfo vram 2>/dev/null | head -2; " +
-              "fi | head -c " + root.capServiceVram]
+              "bash", "-c", root.serviceVramScript, "dash",
+              root.backendService.replace(".service", ""), "" + root.capServiceVram]
     stdout: SplitParser { onRead: function(line) { root._onServiceVramLine(line) } }
     onExited: function(exitCode) {
       serviceVramWatchdog.stop()
@@ -866,40 +1305,47 @@ Item {
     id: startProcess
     running: false
     command: {
-      var script
       if (root.backend === "llama.cpp") {
-        // Self-provision: env file + user unit, then start. One bash -c so
-        // stderr is captured; set -e fail-fast; pipefail + head preserve the
-        // real exit code into _startBuffer -> _actionError.
-        script = "set -o pipefail; { set -e; d=$(dirname \"" + root.configPath + "\"); " +
-          "ud=\"${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user\"; mkdir -p \"$d\" \"$ud\"; f=\"" + root.configPath + "\"; " +
-          "if [ ! -f \"$f\" ]; then cat > \"$f\" <<ENV\n" + root.llamaEnvDefault + "ENV\nfi; " +
-          "bin=$(command -v " + root.backendBinary + "); " +
-          "cat > \"$ud/llama.cpp.service\" <<UNIT\n" +
-          "[Unit]\nDescription=llama.cpp server (managed by local-ai-dashboard)\nAfter=network.target\n\n" +
-          "[Service]\nType=simple\nEnvironmentFile=$f\n" +
-          "ExecStart=/bin/bash -c 'exec \"$bin\" --host \"\\${LLAMA_HOST:-127.0.0.1}\" --port \"\\${LLAMA_PORT:-8080}\" " +
-          "--models-preset \"\\${LLAMA_MODELS_PRESET}\" --models-max \"\\${LLAMA_MODELS_MAX:-1}\" \\${LLAMA_EXTRA_ARGS}'\n" +
-          "Restart=on-failure\n\n[Install]\nWantedBy=default.target\nUNIT\n" +
-          "systemctl --user daemon-reload; systemctl --user start llama.cpp.service; } 2>&1 | head -c " + root.capAction
-      } else {
-        script = "set -o pipefail; pkexec /usr/bin/systemctl start " + root.backendService + " 2>&1 | head -c " + root.capAction
+        // Two-phase provisioning help (all constants; see provisionLlamaScript
+        // for the exit-code contract): dry-run with consent=0, then the panel
+        // offers "Confirm update & start" which relaunches with consent=1.
+        // Env file, unit write and start happen inside the one provisioner so
+        // the rollback guarantee covers all three.
+        return ["timeout", "-k", "2", "" + root.startTimeoutSec, "bash", "-c", root.provisionLlamaScript,
+                "dash", root.configPath, root.userUnitDir, root.backendBinary,
+                root._provisionConsented ? "1" : "0", "" + root.capAction]
       }
-      return ["timeout", "-k", "2", "" + root.startTimeoutSec, "bash", "-c", script]
+      return ["timeout", "-k", "2", "" + root.startTimeoutSec, "bash", "-c", root.pkStartScript,
+              "dash", root.backendService, "" + root.capAction]
     }
     stdout: SplitParser { onRead: function(line) { root._onStartLine(line) } }
     onExited: function(exitCode) {
       startActionWatchdog.stop()
       busy = false
       actionLabel = ""
-      if (exitCode !== 0) lastError = _actionError(_startBuffer, "start")
-      else {
-        lastError = ""
-        if (root.backend === "llama.cpp") {
+      if (root.backend === "llama.cpp") {
+        if (exitCode === 0 || exitCode === 4) {
+          // 4 = nothing to do (create-only race). Env + unit are in place.
+          lastError = ""
           hasConfig = true
           launch(configProcess, configWatchdog)
+        } else if (exitCode === 64) {
+          // Dry-run: the installed unit differs from the generated one, so
+          // nothing was written (or changed) and no start happened. The env
+          // file was still created if it was missing. Ask for consent.
+          lastError = ""
+          hasConfig = true
+          pendingProvision = true
+          provisionTimer.restart()
+          launch(configProcess, configWatchdog)
+        } else {
+          lastError = _provisionError(exitCode, _startBuffer)
         }
+      } else {
+        if (exitCode !== 0) lastError = _actionError(_startBuffer, "start")
+        else lastError = ""
       }
+      _provisionConsented = false
       _startBuffer = ""
       startDelay.restart()
     }
@@ -909,9 +1355,8 @@ Item {
     id: stopProcess
     running: false
     command: ["timeout", "-k", "2", "" + processTimeoutSec,
-              "bash", "-c", root.backend === "llama.cpp"
-                ? "set -o pipefail; systemctl --user stop llama.cpp.service 2>&1 | head -c " + root.capAction
-                : "set -o pipefail; pkexec /usr/bin/systemctl stop " + root.backendService + " 2>&1 | head -c " + root.capAction]
+              "bash", "-c", root.backend === "llama.cpp" ? root.userStopScript : root.pkStopScript,
+              "dash", root.backendService, "" + root.capAction]
     stdout: SplitParser { onRead: function(line) { root._onStopLine(line) } }
     onExited: function(exitCode) {
       stopActionWatchdog.stop()
@@ -924,28 +1369,37 @@ Item {
     }
   }
 
-  // Default config file creation. llama.cpp: plain bash, no pkexec — mkdir -p
-  // the config dir then write the env template only if missing. ollama keeps
-  // its single password prompt that writes the default JSON (stderr captured
-  // and classified by _actionError just like start/stop).
+  // Default config file creation. Both backends use the create-only,
+  // symlink-refusing, atomic, 0600 constant writer (createConfigScript /
+  // createEnvScript). No pkexec anywhere: the config lives in the user's own
+  // plugin directory, so no privilege (and no password prompt) is needed.
+  // Exit codes: 0 or 4 (already exists) = done; 55/5/6 = unsafe/failed write.
   Process {
     id: createConfigProcess
     running: false
-    command: ["timeout", "-k", "2", "" + startTimeoutSec,
-              "bash", "-c", root.backend === "llama.cpp"
-                ? "set -o pipefail; f='" + root.configPath + "'; { mkdir -p \"$(dirname \"$f\")\"; if [ ! -f \"$f\" ]; then cat > \"$f\" <<ENV\n" + root.llamaEnvDefault + "ENV\nfi; } 2>&1 | head -c " + root.capAction
-                : "set -o pipefail; f='" + root.configPath + "'; pkexec /usr/bin/bash -c 'mkdir -p \"$(dirname \"$1\")\" && printf \"%s\" \"$2\" > \"$1\"' bash \"$f\" '" + root.defaultConfigJson + "' 2>&1 | head -c " + root.capAction]
+    command: {
+      var args = ["timeout", "-k", "2", "" + startTimeoutSec,
+                  "bash", "-c", root.backend === "llama.cpp" ? root.createEnvScript : root.createConfigScript,
+                  "dash", root.configPath]
+      if (root.backend === "ollama") args.push(root.defaultConfigJson)
+      return args
+    }
     stdout: SplitParser { onRead: function(line) { root._onCreateLine(line) } }
     onExited: function(exitCode) {
       createConfigWatchdog.stop()
       busy = false
       actionLabel = ""
-      if (exitCode !== 0) {
-        lastError = _actionError(_createBuffer, "create")
-      } else {
+      if (exitCode === 0 || exitCode === 4) {
+        // 4 = target already existed (create-only race); still a done state.
         lastError = ""
         hasConfig = true
         launch(configProcess, configWatchdog)
+      } else if (exitCode === 55) {
+        lastError = "Cannot create " + root.backendDisplayName + " config: refusing to write (parent path is a symlink)."
+      } else if (exitCode === 5 || exitCode === 6) {
+        lastError = "Cannot create " + root.backendDisplayName + " config: temporary file write failed."
+      } else {
+        lastError = _actionError(_createBuffer, "create")
       }
       _createBuffer = ""
     }
@@ -1045,6 +1499,15 @@ Item {
     interval: startWatchdogMs
     repeat: false
     onTriggered: if (createConfigProcess.running) createConfigProcess.running = false
+  }
+
+  // Phase 4: auto-cancel the consent prompt after ~20 s (idling is safer than
+  // leaving a state that can only be dismissed manually).
+  Timer {
+    id: provisionTimer
+    interval: 20000
+    repeat: false
+    onTriggered: root.pendingProvision = false
   }
 
   // ── Refresh timers ─────────────────────────────────────────────────
