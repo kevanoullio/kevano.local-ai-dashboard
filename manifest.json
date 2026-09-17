@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "kevano.local-ai-dashboard",
   "name": "Local AI Dashboard",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "kevanoullio",
   "description": "Monitor and control local ai model services like llama-server/ollama from the Omarchy bar. Start and stop the systemd background service, view available models with current model status, monitor CPU/GPU/DRAM/VRAM usage, with quick access to view debug output via a new terminal session, and one click open your config files via nvim.",
   "kinds": [

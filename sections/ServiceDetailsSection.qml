@@ -17,9 +17,13 @@ Item {
   required property color dim
   required property string fontFamily
 
+  readonly property color warnColor: Qt.hsla(0.10, 0.68, 0.55, 1.0)
+
   signal configRequested()
   signal createConfigRequested()
   signal debugRequested()
+  signal confirmProvisionRequested()
+  signal cancelProvisionRequested()
 
   implicitHeight: contentCol.implicitHeight
   width: parent ? parent.width : 0
@@ -35,6 +39,18 @@ Item {
       width: parent.width
       text: root.service.sanitize(root.service.lastError)
       color: root.urgent
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      textFormat: Text.PlainText
+      wrapMode: Text.WordWrap
+    }
+
+    // ── Config warning ───────────────────────────────────────────
+    Text {
+      visible: root.service.configWarning !== ""
+      width: parent.width
+      text: root.service.sanitize(root.service.configWarning)
+      color: root.warnColor
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
       textFormat: Text.PlainText
@@ -193,6 +209,39 @@ Item {
           foreground: root.foreground
           fontFamily: root.fontFamily
           onClicked: root.createConfigRequested()
+        }
+
+        // ── Provisioning consent (llama.cpp Phase 4) ───────────────
+        Text {
+          Layout.columnSpan: 2
+          Layout.topMargin: Style.spacing.labelGap
+          visible: root.service.pendingProvision
+          width: parent.width
+          text: "Starting " + root.service.backendDisplayName + " needs to write a systemd unit (create or update). " +
+                "Confirm to write it and start, or Cancel to do nothing. This request expires automatically."
+          color: root.warnColor
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          textFormat: Text.PlainText
+          wrapMode: Text.WordWrap
+        }
+        UI.SettingsButton {
+          Layout.columnSpan: 2
+          Layout.fillWidth: true
+          visible: root.service.pendingProvision
+          label: "Confirm unit update & start"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          onClicked: root.confirmProvisionRequested()
+        }
+        UI.SettingsButton {
+          Layout.columnSpan: 2
+          Layout.fillWidth: true
+          visible: root.service.pendingProvision
+          label: "Cancel"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          onClicked: root.cancelProvisionRequested()
         }
       }
     }

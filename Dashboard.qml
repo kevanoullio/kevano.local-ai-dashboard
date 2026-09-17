@@ -195,6 +195,8 @@ Panel {
           onConfigRequested: root.openConfig()
           onCreateConfigRequested: root.activeService.createConfigFile()
           onDebugRequested: root.openDebug()
+          onConfirmProvisionRequested: root.activeService.confirmProvision()
+          onCancelProvisionRequested: root.activeService.cancelProvision()
         }
 
         // ── Running + available models ──────────────────────────────
