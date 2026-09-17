@@ -1,0 +1,4 @@
+#!/bin/bash
+# Mock llama-server for the test sandbox: makes `command -v llama-server`
+# resolve without requiring the real binary to be installed.
+exit 0
