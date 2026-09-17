@@ -1,0 +1,5 @@
+#!/bin/bash
+# Mock systemd-analyze for the test sandbox. FAIL_VERIFY=1 simulates a unit
+# that fails `systemd-analyze --user verify`.
+if [ -n "${FAIL_VERIFY:-}" ]; then echo "Unit file failed verification." >&2; exit 1; fi
+exit 0

@@ -1,0 +1,25 @@
+#!/bin/bash
+# Mock systemctl for the test sandbox. Logs every call to ${__mocklog:?};
+# honors FAIL_START (simulate `start` failing). Never touches a real systemd.
+echo "CALL systemctl $*" >> "${__mocklog:?}"
+case "$1" in
+  --user) shift ;;
+esac
+case "$1" in
+  start)
+    [ "$2" = "llama.cpp.service" ] || [ "$2" = "ollama.service" ] || { echo "unexpected unit: $2" >&2; exit 9; }
+    if [ -n "${FAIL_START:-}" ]; then echo "Job for $2 failed because the service entered a failed state." >&2; exit 1; fi
+    echo "mock started"
+    ;;
+  stop) echo "mock stopped" ;;
+  daemon-reload) : ;;
+  show)
+    [ -n "$2" ] && [ -f "$HOME/.config/systemd/user/$2" ] && echo "$2 running"
+    ;;
+  list-unit-files)
+    [ -n "$2" ] && [ -f "$HOME/.config/systemd/user/$2" ] && echo "$2 enabled"
+    ;;
+  daemon-reload) : ;;
+  *) echo "unexpected systemctl: $*" >&2; exit 9 ;;
+esac
+exit 0
