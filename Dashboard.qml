@@ -94,6 +94,11 @@ Panel {
 
   onOpenedChanged: if (opened) {
     cursorActive = false
+    // Re-read each backend's config so dashboard-side settings (e.g. llama.cpp's
+    // LLAMA_UNLOAD_INACTIVITY_SEC auto-unload timeout) picked up from the file
+    // take effect on open, without requiring a service restart.
+    serviceOllama.reloadConfig()
+    serviceLlama.reloadConfig()
     serviceOllama.refresh()
     serviceLlama.refresh()
     Qt.callLater(function() { if (keyCatcher) keyCatcher.forceActiveFocus() })
@@ -207,6 +212,7 @@ Panel {
           dim: root.dim
           urgent: root.urgent
           fontFamily: root.fontFamily
+          onUnloadRequested: root.activeService.unloadModel(modelId)
         }
       }
     }

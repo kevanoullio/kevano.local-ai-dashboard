@@ -44,7 +44,7 @@ Item {
   // Default llama.cpp env file. Written via an unquoted heredoc so $HOME
   // expands to the absolute preset path at write time (systemd does no
   // tilde/var expansion inside env files).
-  readonly property string llamaEnvDefault: '# llama.cpp server configuration\n# Managed by local-ai-dashboard. Edit values, then start/restart from the panel.\nLLAMA_HOST=127.0.0.1\nLLAMA_PORT=8080\nLLAMA_API_KEY=\nLLAMA_MODELS_PRESET="$HOME/.config/llama.cpp/models.ini"\nLLAMA_MODELS_MAX=1\nLLAMA_EXTRA_ARGS=\n'
+  readonly property string llamaEnvDefault: '# llama.cpp server configuration\n# Managed by local-ai-dashboard. Edit values, then start/restart from the panel.\nLLAMA_HOST=127.0.0.1\nLLAMA_PORT=8080\nLLAMA_API_KEY=\nLLAMA_MODELS_PRESET="$HOME/.config/llama.cpp/models.ini"\nLLAMA_MODELS_MAX=1\nLLAMA_EXTRA_ARGS=\n# Auto-unload the loaded model after this many seconds without a request (0 = disabled).\nLLAMA_UNLOAD_INACTIVITY_SEC=0\n'
 
   property string configHost: "127.0.0.1"
   property int configPort: 0
@@ -184,6 +184,25 @@ hdr -s "$1" 2>&1 | head -c "$2"`
   readonly property string listScriptOllama: `
 set -o pipefail;
 ollama list 2>&1 | head -c "$1"`
+
+  // Per-model unload (issue #6): POST /models/unload with body {"model":<id>}
+  // (the key is `model`, not `name`). $1 = model id, $2 = endpoint, $3 = cap.
+  // The id arrives from /v1/models JSON: it is charset-validated in
+  // unloadModel() AND stripped of quotes/backslashes/control bytes here before
+  // JSON encoding — user data is never concatenated into this script.
+  // curl -w '%{http_code}' appends the status code after the response body.
+  readonly property string unloadScriptLlama: curlFnLlama + `
+set -o pipefail;
+safe=$(printf '%s' "$1" | tr -d '"\\\\' | tr -d '\n\r\t');
+body=$(printf '{"model":"%s"}' "$safe");
+hdr -s -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data "$body" --connect-timeout 3 --max-time 5 "$2" 2>&1 | head -c "$3"`
+
+  // Idle source (issue #6): GET /slots?model=<id> → per-slot is_processing +
+  // id_task. $1 = /slots base, $2 = model id (charset-validated before launch),
+  // $3 = cap.
+  readonly property string slotsScriptLlama: curlFnLlama + `
+set -o pipefail;
+hdr -s "$1?model=$2" 2>&1 | head -c "$3"`
 
   // ── Systemd / process probes (constants, args-only) ───────────────
   // $1 = scope flag ("--user" for llama.cpp, empty for the system ollama
@@ -340,8 +359,56 @@ if command -v nvidia-smi >/dev/null 2>&1; then
 nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null |
 awk -F',' -v ps="$pids" 'BEGIN{n=split(ps,a," ");for(i=1;i<=n;i++)if(a[i]!="")seen[a[i]]=1}{gsub(/[ \\t]/,"",$1);gsub(/[ \\t]/,"",$2);if(($1 in seen)&&$2~/^[0-9]+$/){sum+=$2;c++}}END{if(c>0)print sum" MiB"}';
 elif command -v rocm-smi >/dev/null 2>&1; then
-rocm-smi --showmeminfo vram 2>/dev/null | head -2;
-fi | head -c $2`
+ rocm-smi --showmeminfo vram 2>/dev/null | head -2;
+ fi | head -c $2`
+
+   // Bounded no-load GGUF header read (llama.cpp). $1 = .gguf path, $2 = cap.
+   // Reads ONLY the first 16 KiB (the metadata KV section precedes the tensor
+   // table) and pulls the arch id plus the u32 keys needed for totalLayers +
+   // the KV-cache estimate. No weights are read, nothing is mmap'd past the
+   // prefix, and no model is loaded. Emits a first-line marker (GGUF-OK /
+   // GGUF-NO) then `key=value` lines. Refuses symlinks / special files.
+   readonly property string ggufScript: `
+f="$1";
+if [ ! -e "$f" ] || [ -L "$f" ] || [ ! -f "$f" ]; then echo GGUF-NO; exit 0; fi;
+sz=$(stat -c %s -- "$f" 2>/dev/null);
+head -c 16384 -- "$f" | od -A n -t x1 -v | awk -v SZ="$sz" '
+BEGIN { for (i = 0; i < 256; i++) HEXVAL[sprintf("%02x", i)] = i; for (i = 32; i < 127; i++) { c = sprintf("%c", i); ORD[c] = i; HEXC[sprintf("%02x", i)] = c } }
+function hexof(s,  n, i, out) { out = ""; for (i = 1; i <= length(s); i++) out = out sprintf("%02x", ORD[substr(s, i, 1)]); return out }
+function unhex(h,  n, i, out) { out = ""; for (i = 1; i + 1 <= length(h); i += 2) out = out HEXC[substr(h, i, 2)]; return out }
+function byteat(off) { return HEXVAL[substr(H, off * 2 + 1, 2)] }
+function u32le(off) { return byteat(off) + byteat(off + 1) * 256 + byteat(off + 2) * 65536 + byteat(off + 3) * 16777216 }
+function u64lehex(v,  i, out) { out = ""; for (i = 0; i < 8; i++) out = out sprintf("%02x", int(v / (256 ^ i)) % 256); return out }
+{ buf = buf $0 }
+END {
+  gsub(/[ \t\r]/, "", buf)
+  H = buf
+  if (substr(H, 1, 8) != "47475546") { print "GGUF-NO"; exit }
+  pa = index(H, u64lehex(20) hexof("general.architecture"))
+  if (pa == 0) { print "GGUF-NO"; exit }
+  pb = int((pa - 1) / 2)
+  if (u32le(pb + 28) != 8) { print "GGUF-NO"; exit }
+  klen = u32le(pb + 32)
+  if (klen < 1 || klen > 64) { print "GGUF-NO"; exit }
+  arch = unhex(substr(H, (pb + 40) * 2 + 1, klen * 2))
+  print "GGUF-OK"
+  print "arch=" arch
+  n = 6
+  KS[0] = arch ".block_count";              NM[0] = "block_count"
+  KS[1] = arch ".attention.head_count";    NM[1] = "head_count"
+  KS[2] = arch ".attention.head_count_kv"; NM[2] = "head_count_kv"
+  KS[3] = arch ".embedding_length";        NM[3] = "embedding_length"
+  KS[4] = arch ".nextn_predict_layers";    NM[4] = "nextn_predict_layers"
+  KS[5] = arch ".full_attention_interval"; NM[5] = "full_attention_interval"
+  for (i = 0; i < n; i++) {
+    p = index(H, u64lehex(length(KS[i])) hexof(KS[i]))
+    if (p == 0) continue
+    kb = int((p - 1) / 2) + 8
+    if (u32le(kb + length(KS[i])) != 4) continue
+    print NM[i] "=" u32le(kb + length(KS[i]) + 4)
+  }
+  if (SZ ~ /^[0-9]+$/) print "size=" SZ
+}' | head -c $2`
 
    // Start/stop actions. Ollama runs on the SYSTEM unit, so it goes through
    // pkexec — that IS the polkit consent gate, and stays as-is. llama.cpp stop
@@ -370,8 +437,21 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
   property bool pendingProvision: false
   // Set only for the confirm() relaunch so the dry-run keeps consent=0.
   property bool _provisionConsented: false
-  property string actionLabel: ""
-  property string lastError: ""
+   property string actionLabel: ""
+   property string lastError: ""
+
+   // ── Per-model unload + auto-unload (llama.cpp, issue #6) ─────────
+   // Parsed from LLAMA_UNLOAD_INACTIVITY_SEC in the env file; 0 = disabled
+   // (the default, and the value when the key is absent on older env files).
+   property int unloadInactivitySec: 0
+   // Model id for the unload currently in flight (single-flight; "" = none).
+   property string _unloadId: ""
+   // Idle tracking: the loaded model id being polled, the last seen slot
+   // signature ("processing:idTask") and the wall-clock ms of the most recent
+   // observed activity (-1 = no baseline).
+   property string _slotsModelId: ""
+   property string _lastSig: ""
+   property double _lastActivityMs: -1
 
   // ── API health ─────────────────────────────────────────────────────
   property bool apiReachable: false
@@ -431,6 +511,9 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
   readonly property int capConfig: 2048    // config file read output
   readonly property int capServiceMemory: 64  // memory.stat anon+shmem sum (bytes)
   readonly property int capServiceVram: 64    // nvidia-smi/rocm-smi per-PID value
+    readonly property int capGguf: 512          // GGUF header marker + arch + 6 key=value lines
+   readonly property int capSlots: 8192        // /slots?model=<id> first-slot state
+   readonly property int capUnload: 512        // unload response body + http_code
 
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined
@@ -454,6 +537,14 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
     return gb.toFixed(1) + " GB"
   }
 
+  function formatMB(bytes) {
+    var b = parseInt(String(bytes), 10)
+    if (!isFinite(b) || b <= 0) return "\u2014"
+    var mb = b / (1024 * 1024)
+    if (mb >= 1024) return formatGB(b)
+    return Math.round(mb) + " MB"
+  }
+
   // CPU/GPU split (llama.cpp): CPU = measured DRAM fraction of the full
   // footprint (DRAM + per-PID VRAM); GPU covers the remainder. Both halves
   // are measured — no size-based estimate. Returns CPU percent, or -1 when
@@ -463,13 +554,155 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
     return Math.round(serviceMemoryBytes / serviceTotalBytes * 100)
   }
 
-  // Full llama.cpp memory footprint (DRAM + VRAM) formatted for display,
-  // or "" when unknown.
-  function memoryTotalGB() {
-    return serviceTotalBytes >= 0 ? formatGB(serviceTotalBytes) : ""
-  }
+   // Full llama.cpp memory footprint (DRAM + VRAM) formatted for display,
+   // or "" when unknown.
+   function memoryTotalGB() {
+     return serviceTotalBytes >= 0 ? formatGB(serviceTotalBytes) : ""
+   }
 
-  function sanitize(str) {
+   // ── llama.cpp running-model derivation helpers (pure, no processes) ──
+   // All of these take plain values and return plain numbers/arrays so they
+   // are unit-testable in isolation. Unknown / not-applicable → -1 (the display
+   // layer renders -1 as "—").
+
+   // Parse llama.cpp's resolved CLI arg array (/v1/models[].status.args) for the
+   // few flags we need. Tokens are matched EXACTLY so `--model` never collides
+   // with `--models-preset`/`--model-draft`, and `--n-gpu-layers` never with
+   // `--n-gpu-layers-draft`. Both `flag value` and `flag=value` forms are handled.
+   function _parseLlamaArgs(args) {
+      var out = { model: "", ngl: "", draftPath: "", nglDraft: "", specType: "", cacheK: "", cacheV: "", noKvOffload: false }
+     if (!args || typeof args.length !== "number") return out
+     for (var i = 0; i < args.length; i++) {
+       var a = String(args[i] == null ? "" : args[i])
+       var eq = a.indexOf("=")
+       var flag = eq !== -1 ? a.substring(0, eq) : a
+       var inlineVal = eq !== -1 ? a.substring(eq + 1) : null
+       function next() { return inlineVal !== null ? inlineVal : String(args[i + 1] == null ? "" : args[i + 1]) }
+       function consume() { if (inlineVal === null) i++ }
+        if (flag === "--model" || flag === "-m") { out.model = next(); consume() }
+        else if (flag === "--model-draft" || flag === "-md") { out.draftPath = next(); consume() }
+        else if (flag === "--n-gpu-layers" || flag === "-ngl") { out.ngl = next(); consume() }
+        else if (flag === "--n-gpu-layers-draft" || flag === "--gpu-layers-draft" || flag === "-ngld" || flag === "--spec-draft-ngl") { out.nglDraft = next(); consume() }
+        else if (flag === "--cache-type-k") { out.cacheK = next(); consume() }
+        else if (flag === "--cache-type-v") { out.cacheV = next(); consume() }
+        else if (flag === "--spec-type") { out.specType = next(); consume() }
+        else if (flag === "--no-kv-offload") { out.noKvOffload = true }
+     }
+     return out
+   }
+
+    // Main/MTP GPU/CPU layer split from the resolved --n-gpu-layers token, the
+    // total block_count, and the MTP layer count. MTP layers sit on TOP of the
+    // stack, so N offloaded layers are counted from the bottom: "all" → every
+    // layer on GPU; integer N → the first N layers (main before MTP); anything
+    // else (missing flag, auto, non-numeric, unknown total) → nulls (the display
+    // layer renders them as "—").
+    function _mtpSplit(nglRaw, total, mtp) {
+      var out = { mainGpu: null, mainCpu: null, mtpGpu: null, mtpCpu: null }
+      if (!isFinite(total) || total <= 0) return out
+      var t = Math.round(total)
+      var m = (isFinite(mtp) && mtp > 0) ? Math.min(Math.round(mtp), t) : 0
+      var s = String(nglRaw == null ? "" : nglRaw).trim()
+      if (s === "") return out
+      var n = 0
+      if (s === "all") n = t
+      else {
+        n = parseInt(s, 10)
+        if (!isFinite(n)) return out
+        if (n < 0) n = 0
+        if (n > t) n = t
+      }
+      var main = t - m
+      var mainGpu = Math.min(n, main)
+      var mtpGpu = Math.max(0, Math.min(m, n - main))
+      out.mainGpu = mainGpu
+      out.mainCpu = main - mainGpu
+      out.mtpGpu = mtpGpu
+      out.mtpCpu = m - mtpGpu
+      return out
+    }
+
+   function _percentLayersOnGPU(gpu, total) {
+     if (!isFinite(total) || total <= 0 || !isFinite(gpu) || gpu < 0) return -1
+     return Math.round(gpu / total * 100)
+   }
+
+   function _percentLayersOnCPU(cpu, total) {
+     if (!isFinite(total) || total <= 0 || !isFinite(cpu) || cpu < 0) return -1
+     return Math.round(cpu / total * 100)
+   }
+
+   // Bits-per-element for a KV-cache dtype. Empty (no --cache-type-k/v flag) is
+   // llama.cpp's f16 default. Unknown quant → -1 so the estimate falls back to "—".
+   function _kvDtypeBits(t) {
+     var s = String(t == null ? "" : t).trim()
+     if (s === "") return 16
+     switch (s) {
+       case "f32": return 32
+       case "f16": case "bf16": return 16
+       case "q8_0": return 8.5
+       case "q6_k": return 6.5625
+       case "q5_1": return 5.5
+       case "q5_0": return 5.25
+       case "q4_1": case "q4_0": return 4.5
+       default: return -1
+     }
+   }
+
+    // KV-cache byte estimate (upper bound). layers = the full-attention
+    // (KV-holding) layer count — round(mainLayers / full_attention_interval) for
+    // hybrid models, falling back to the main/total block count — NOT raw
+    // block_count; ctx = context length, headKV = KV heads,
+    // headDim = n_embd / query heads, kBits/vBits per element.
+    // Any unknown input → -1 (display renders "—").
+   function _kvEstimateBytes(layers, ctx, headKV, headDim, kBits, vBits) {
+     if (!isFinite(layers) || layers <= 0) return -1
+     if (!isFinite(ctx) || ctx <= 0) return -1
+     if (!isFinite(headKV) || headKV <= 0) return -1
+     if (!isFinite(headDim) || headDim <= 0) return -1
+     if (!isFinite(kBits) || kBits < 0 || !isFinite(vBits) || vBits < 0) return -1
+      var bytes = layers * ctx * headKV * headDim * (kBits + vBits) / 8
+      if (!isFinite(bytes) || bytes <= 0) return -1
+      return Math.round(bytes)
+    }
+
+   // GPU/CPU weight bytes for display. Prefer the exact layer-ratio split when the
+   // offload count is known; otherwise fall back to the measured per-device footprint
+   // (an estimate — measured VRAM/DRAM can include KV cache). Unknown → -1 ("—").
+   function _weightBytes(sizeBytes, gpu, cpu, total, vramBytes, memBytes) {
+     var out = [-1, -1]
+     if (sizeBytes > 0 && total > 0 && gpu >= 0 && cpu >= 0) {
+       out[0] = Math.round(sizeBytes * gpu / total)
+       out[1] = Math.round(sizeBytes * cpu / total)
+     } else {
+       if (vramBytes >= 0) out[0] = vramBytes   // ≈ measured GPU footprint
+       if (memBytes  >= 0) out[1] = memBytes    // ≈ measured DRAM working set
+     }
+     return out
+   }
+
+    // Resolve GGUF-dependent fields for each entry, returning a NEW array so the
+    // view re-renders. Cached headers resolve synchronously; misses queue a bounded
+    // read (the async _applyGgufToRunning republishes when it lands). The base
+    // model resolves first, then the draft (--model-draft) model if present.
+    function _resolveRunningEntries(entries) {
+      var out = entries.slice()
+      for (var j = 0; j < out.length; j++) {
+        var e = out[j]
+        if (!e || e.modelPath === "") continue
+        var cachedGguf = _ggufCache[e.modelPath]
+        if (cachedGguf !== undefined) _applyGguf(e, cachedGguf)
+        else _queueGguf(e.modelPath)
+        if (e.draftPath !== "") {
+          var cachedDraft = _ggufCache[e.draftPath]
+          if (cachedDraft !== undefined) _applyGgufDraft(e, cachedDraft)
+          else _queueGguf(e.draftPath)
+        }
+      }
+      return out
+    }
+
+   function sanitize(str) {
     return String(str || "").replace(/[<>&]/g, function(c) {
       if (c === "<") return "&lt;"
       if (c === ">") return "&gt;"
@@ -557,6 +790,7 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
     if (!running) {
       apiReachable = false
       apiLatencyMs = -1
+      _resetIdleTracking()
       return
     }
     // Enforced endpoint policy: endpointOk folds in configValid, so if the
@@ -572,6 +806,7 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
       serviceMemoryBytes = -1
       serviceVramBytes = -1
       serviceTotalBytes = -1
+      _resetIdleTracking()
       return
     }
     // Clear transient errors on a fresh successful refresh cycle
@@ -655,6 +890,57 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
     else startService()
   }
 
+  // ── Per-model unload (llama.cpp router, issue #6) ──────────────────
+  // Releases only the named model via POST /models/unload; the router process
+  // stays up. The id comes from /v1/models JSON (external data): it is
+  // validated to a safe charset here and stripped again inside the constant
+  // script before JSON encoding — never concatenated into the script itself.
+  function unloadModel(id) {
+    if (backend !== "llama.cpp") return false
+    if (busy || !running || !endpointOk || unloadProcess.running) return false
+    var m = String(id == null ? "" : id).trim()
+    if (m === "" || !/^[A-Za-z0-9._\-/]+$/.test(m)) return false
+    if (!_isModelLoaded(m)) return false
+    _unloadId = m
+    launch(unloadProcess, unloadWatchdog)
+    return true
+  }
+
+  function _isModelLoaded(id) {
+    var arr = runningModels || []
+    for (var i = 0; i < arr.length; i++) {
+      if (arr[i] && String(arr[i].id || "") === id) return true
+    }
+    return false
+  }
+
+  // ── Idle tracking (issue #6 auto-unload source) ────────────────────
+  // `firstLoadedId` is the id of the first model /v1/models reports loaded
+  // ("" = none). The inactivity baseline starts at first observation of a
+  // model and only advances on observed activity (is_processing true, or an
+  // id_task change between polls) — never backwards. Disabled (0) or nothing
+  // loaded → tracking is reset and no /slots poll runs.
+  function _syncIdleTracking(firstLoadedId) {
+    var id = String(firstLoadedId == null ? "" : firstLoadedId)
+    if (id !== "" && !/^[A-Za-z0-9._\-/]+$/.test(id)) id = ""
+    if (unloadInactivitySec <= 0 || id === "") {
+      _resetIdleTracking()
+      return
+    }
+    if (id !== _slotsModelId) {
+      _slotsModelId = id
+      _lastSig = ""
+      _lastActivityMs = Date.now()
+    }
+    if (!slotsProcess.running) launch(slotsProcess, slotsWatchdog)
+  }
+
+  function _resetIdleTracking() {
+    _slotsModelId = ""
+    _lastSig = ""
+    _lastActivityMs = -1
+  }
+
   // ── Streaming parsers ──────────────────────────────────────────────
   //
   // Output is bounded at the OS pipe level by `head -c N` (see cap*
@@ -696,6 +982,7 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
       serviceMemoryBytes = -1
       serviceVramBytes = -1
       serviceTotalBytes = -1
+      _resetIdleTracking()
     }
   }
 
@@ -769,15 +1056,40 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
         if (m.status && m.status.value === "loaded") {
           var loadedName = m.id || "Unknown model"
           var pathParts = String(loadedName).split("/")
-          var sizeBytes = parseInt(m.meta && m.meta.size, 10)
+          var meta = m.meta || {}
+          var sizeBytes = parseInt(meta.size, 10)
           if (!isFinite(sizeBytes) || sizeBytes < 0) sizeBytes = 0
+          // context: b10729 exposes no status.context; the authoritative value
+          // is meta.n_ctx (loaded only). Keep a `context` string for compat.
+          var ctxLen = parseInt(meta.n_ctx, 10)
+          if (!isFinite(ctxLen) || ctxLen < 0) ctxLen = -1
+          var parsed = _parseLlamaArgs(m.status.args)
           _psModels.push({
             name: truncate(pathParts[pathParts.length - 1] || "Unknown model", 128),
             id: truncate(m.id || "", 64),
             size: sizeBytes > 0 ? root.formatGB(sizeBytes) : "",
             sizeBytes: sizeBytes,
             processor: truncate(m.status.processor || m.status.backend || "CPU", 32),
-            context: truncate(m.status.context || "", 32),
+            context: ctxLen > 0 ? String(ctxLen) : "",
+            contextLen: ctxLen,
+            modelPath: parsed.model,
+            ngl: parsed.ngl,
+            draftPath: parsed.draftPath,
+            nglDraft: parsed.nglDraft,
+            specType: parsed.specType,
+            cacheK: parsed.cacheK,
+            cacheV: parsed.cacheV,
+            noKvOffload: parsed.noKvOffload,
+            totalLayers: -1,
+            mainLayers: -1,
+            mtpLayers: 0,
+            mtpSizeBytes: -1,
+            draftSizeBytes: -1,
+            mainGpu: null,
+            mainCpu: null,
+            mtpGpu: 0,
+            mtpCpu: 0,
+            kvCacheBytes: -1,
             until: "loaded"
           })
         }
@@ -794,9 +1106,178 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
       _psModels = []
     }
     models = _listModels
-    runningModels = _psModels
+    runningModels = _resolveRunningEntries(_psModels)
+    var firstLoadedId = _psModels.length > 0 ? String(_psModels[0].id || "") : ""
     _psModels = []
     _listHeaderSeen = false
+    _syncIdleTracking(firstLoadedId)
+  }
+
+  // ── GGUF header read (llama.cpp): totalLayers + KV-cache inputs ──────
+  // Bounded no-load read of the model file's own metadata. Results are cached
+  // by path so a running model is re-resolved synchronously on every later
+  // refresh (no re-read). Unknown/unreadable → the entry keeps -1 ("—").
+
+  property var _ggufCache: ({})   // path -> {bc, hc, hckv, embd, npl, fai, sz}
+  property string _ggufPath: ""   // path currently being read (single-flight)
+  property string _ggufBuffer: ""
+  readonly property int _ggufBufferMax: 512
+
+  function _onGgufLine(line) {
+    var s = String(line || "")
+    if (_ggufBuffer.length + s.length + 1 <= _ggufBufferMax) _ggufBuffer += s + "\n"
+  }
+
+  // Start a header read for `path` (single-flight; a read already in flight is
+  // left alone and the caller retries on the next refresh once it's cached).
+  function _queueGguf(path) {
+    if (path === "" || ggufProcess.running) return
+    if (_ggufCache[path] !== undefined) return
+    _ggufPath = path
+    _ggufBuffer = ""
+    launch(ggufProcess, ggufWatchdog)
+  }
+
+  // Fold the parsed BASE-model header into one running-model entry: layer split
+  // + KV est. block_count includes any built-in MTP layers (nextn_predict_
+  // layers); the main stack is what --n-gpu-layers / KV accounting operate on.
+  // With a separate draft (--model-draft) the MTP fields are owned by
+  // _applyGgufDraft and left untouched here.
+  function _applyGguf(entry, g) {
+    var total = (g.bc > 0) ? g.bc : -1
+    entry.totalLayers = total
+    var npl = (isFinite(g.npl) && g.npl > 0) ? Math.round(g.npl) : 0
+    if (entry.draftPath !== "") {
+      // Separate draft: the base stack is plain main layers; the MTP count,
+      // size, and placement come from the draft header.
+      entry.mainLayers = (total > 0) ? Math.max(0, total - npl) : -1
+      var splitMain = _mtpSplit(entry.ngl, total, 0)
+      entry.mainGpu = splitMain.mainGpu
+      entry.mainCpu = splitMain.mainCpu
+    } else {
+      var mtpLayers = (total > 0 && npl > 0) ? Math.min(npl, total) : 0
+      var mainLayers = (total > 0) ? Math.max(0, total - mtpLayers) : -1
+      entry.mtpLayers = mtpLayers
+      entry.mainLayers = mainLayers
+      var sb = (entry.sizeBytes > 0) ? entry.sizeBytes : -1
+      entry.mtpSizeBytes = (mtpLayers > 0 && sb > 0 && total > 0)
+        ? Math.round(sb / total * mtpLayers) : -1
+      var splitAll = _mtpSplit(entry.ngl, total, mtpLayers)
+      entry.mainGpu = splitAll.mainGpu
+      entry.mainCpu = splitAll.mainCpu
+      entry.mtpGpu = splitAll.mtpGpu
+      entry.mtpCpu = splitAll.mtpCpu
+    }
+    var ctx = (isFinite(entry.contextLen) && entry.contextLen > 0) ? entry.contextLen : -1
+    var hc = (g.hc > 0) ? g.hc : -1
+    // MHA models omit head_count_kv → KV heads == query heads.
+    var hckv = (g.hckv > 0) ? g.hckv : ((hc > 0) ? hc : -1)
+    var embd = (g.embd > 0) ? g.embd : -1
+    var headDim = (hc > 0 && embd > 0) ? embd / hc : -1
+    // Only full-attention layers store context-scaling KV (hybrid models keep
+    // a fixed recurrent state in the rest); no interval key → all main layers.
+    var fai = (isFinite(g.fai) && g.fai > 1) ? Math.round(g.fai) : -1
+    var kvLayers = entry.mainLayers
+    if (fai > 1 && entry.mainLayers > 0) kvLayers = Math.max(1, Math.round(entry.mainLayers / fai))
+    if (!isFinite(kvLayers) || kvLayers <= 0) kvLayers = total
+    entry.kvCacheBytes = _kvEstimateBytes(kvLayers, ctx, hckv, headDim,
+      _kvDtypeBits(entry.cacheK), _kvDtypeBits(entry.cacheV))
+  }
+
+  // Fold the parsed DRAFT (MTP) model header into its running-model entry: the
+  // draft's block_count IS the MTP layer count and its file size is the MTP
+  // weight size. Placement comes from --n-gpu-layers-draft, which budgets the
+  // draft independently of the main --n-gpu-layers.
+  function _applyGgufDraft(entry, g) {
+    var mtpLayers = (g.bc > 0) ? Math.round(g.bc) : 0
+    entry.mtpLayers = mtpLayers
+    if (g.sz > 0) {
+      entry.mtpSizeBytes = g.sz
+      entry.draftSizeBytes = g.sz
+    }
+    var split = _mtpSplit(entry.nglDraft, mtpLayers, mtpLayers)
+    entry.mtpGpu = split.mtpGpu
+    entry.mtpCpu = split.mtpCpu
+  }
+
+  // Apply a freshly-parsed header to the matching running model and republish
+  // the array so the Repeater re-renders with the resolved values. The path is
+  // matched against both the base (--model) and draft (--model-draft) paths.
+  function _applyGgufToRunning(path, g) {
+    var arr = runningModels || []
+    var changed = false
+    for (var i = 0; i < arr.length; i++) {
+      var e = arr[i]
+      if (!e) continue
+      if (String(e.modelPath || "") === path) { _applyGguf(e, g); changed = true }
+      else if (String(e.draftPath || "") === path) { _applyGgufDraft(e, g); changed = true }
+    }
+    if (changed) runningModels = arr.slice()
+  }
+
+  function _finishGguf() {
+    var raw = _ggufBuffer.trim()
+    _ggufBuffer = ""
+    var path = _ggufPath
+    _ggufPath = ""
+    var bc = -1, hc = -1, hckv = -1, embd = -1, npl = -1, fai = -1, sz = -1, ok = false
+    var lines = raw.split("\n")
+    for (var i = 0; i < lines.length; i++) {
+      var line = String(lines[i]).trim()
+      if (line === "GGUF-OK") { ok = true; continue }
+      var eq = line.indexOf("=")
+      if (eq <= 0) continue
+      var key = line.substring(0, eq)
+      var val = parseInt(line.substring(eq + 1), 10)
+      if (key === "block_count") bc = isFinite(val) ? val : -1
+      else if (key === "head_count_kv") hckv = isFinite(val) ? val : -1
+      else if (key === "head_count") hc = isFinite(val) ? val : -1
+      else if (key === "embedding_length") embd = isFinite(val) ? val : -1
+      else if (key === "nextn_predict_layers") npl = isFinite(val) ? val : -1
+      else if (key === "full_attention_interval") fai = isFinite(val) ? val : -1
+      else if (key === "size") sz = isFinite(val) ? val : -1
+    }
+    // Only cache a confirmed GGUF header with a usable layer count.
+    if (!ok || bc < 0 || path === "") return
+    _ggufCache[path] = { bc: bc, hc: hc, hckv: hckv, embd: embd, npl: npl, fai: fai, sz: sz }
+    _applyGgufToRunning(path, _ggufCache[path])
+  }
+
+  // ── /slots?model=<id> → idle tracking (issue #6) ───────────────────
+  // llama.cpp exposes no last-request timestamp; the slot state is the idle
+  // source: is_processing (request in flight right now) and id_task (monotonic
+  // request counter that advances on each new request).
+  property string _slotsBuffer: ""
+  readonly property int _slotsBufferMax: 8192
+
+  function _onSlotsLine(line) {
+    var s = String(line || "")
+    if (_slotsBuffer.length + s.length + 1 <= _slotsBufferMax) _slotsBuffer += s + "\n"
+  }
+
+  function _finishSlots() {
+    var raw = _slotsBuffer.trim()
+    _slotsBuffer = ""
+    if (_slotsModelId === "") return
+    var obj = null
+    try { obj = JSON.parse(raw) } catch(e) { obj = null }
+    var slot = (obj && typeof obj.length === "number" && obj.length > 0) ? obj[0] : null
+    if (!slot || typeof slot !== "object") {
+      // Unparseable / empty / error response: assume busy so an in-flight
+      // request is never unloaded on bad data.
+      _lastActivityMs = Date.now()
+      return
+    }
+    var proc = (slot.is_processing === true) ? "1" : "0"
+    var task = String(slot.id_task == null ? "" : slot.id_task)
+    var sig = proc + ":" + task
+    if (proc === "1") {
+      _lastActivityMs = Date.now()
+    } else if (task !== "" && sig !== _lastSig) {
+      // id_task advanced since the last poll → a request completed between polls.
+      _lastActivityMs = Date.now()
+    }
+    _lastSig = sig
   }
 
   // ollama ps → running models
@@ -970,6 +1451,7 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
       configHost = "127.0.0.1"
       configPort = 0
       configApiKey = ""
+      unloadInactivitySec = 0
       configValid = true
       configWarning = truncate("Refusing to read config: " + root.configPath + " is a symlink or special file.", 256)
       return
@@ -978,6 +1460,7 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
       configHost = "127.0.0.1"
       configPort = 0
       configApiKey = ""
+      unloadInactivitySec = 0
       configValid = true
       configWarning = ""
       return
@@ -987,6 +1470,7 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
     var host = "127.0.0.1"
     var port = -1  // -1 = never set in the file = use the backend default port
     var apiKey = ""
+    var unloadSec = 0  // 0 = auto-unload disabled (absent key stays disabled)
     var violations = []
     if (backend === "llama.cpp") {
       var envLines = body.split("\n")
@@ -1015,6 +1499,16 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
           if (!validateExtraArgs(val)) violations.push("LLAMA_EXTRA_ARGS contains unsafe characters")
         } else if (key === "LLAMA_MODELS_PRESET") {
           if (!isValidPresetPath(val)) violations.push("LLAMA_MODELS_PRESET is not a safe absolute path")
+        } else if (key === "LLAMA_UNLOAD_INACTIVITY_SEC") {
+          if (val !== "") {
+            if (/^[0-9]+$/.test(val)) {
+              var uns = parseInt(val, 10)
+              if (isFinite(uns) && uns >= 0) unloadSec = uns
+              else violations.push("LLAMA_UNLOAD_INACTIVITY_SEC is out of range")
+            } else {
+              violations.push("LLAMA_UNLOAD_INACTIVITY_SEC is not an integer")
+            }
+          }
         }
       }
     } else {
@@ -1055,6 +1549,7 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
       configHost = "127.0.0.1"
       configPort = 0
       configApiKey = ""
+      unloadInactivitySec = 0
       configValid = false
       configWarning = truncate("Invalid " + root.backendDisplayName + " config: " + violations.join("; ") + ".", 256)
       return
@@ -1062,17 +1557,28 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
     configHost = host
     configPort = port
     configApiKey = apiKey
+    unloadInactivitySec = unloadSec
     configValid = true
     configWarning = ""
   }
 
-   // Startup config probe: reports HAS/NO as the first output line and, if so,
-   // the file contents after it. It never creates or overwrites the file (that
-   // is user-initiated via createConfigFile()); its only write is an idempotent
-   // 0600 hardening of an existing regular file, which may hold an API key.
-   function ensureAndReadConfig() {
-    launch(configProcess, configWatchdog)
-  }
+    // Startup config probe: reports HAS/NO as the first output line and, if so,
+    // the file contents after it. It never creates or overwrites the file (that
+    // is user-initiated via createConfigFile()); its only write is an idempotent
+    // 0600 hardening of an existing regular file, which may hold an API key.
+    function ensureAndReadConfig() {
+     launch(configProcess, configWatchdog)
+    }
+
+    // Re-read the backend config file on demand (called when the panel opens).
+    // This is what makes dashboard-side settings like LLAMA_UNLOAD_INACTIVITY_SEC
+    // take effect without a service restart: the value is re-parsed into
+    // unloadInactivitySec and the auto-unload timer's `running` binding reacts.
+    // Host/port edits still need a service restart to bind on the server side,
+    // but the endpoint policy + idle timeout update immediately here.
+    function reloadConfig() {
+     launch(configProcess, configWatchdog)
+    }
 
   function isCloudModel(name) {
     var n = String(name || "").toLowerCase()
@@ -1187,7 +1693,7 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
         else _finishList()
       } else {
         _listModels = []; _listHeaderSeen = false
-        if (root.backend === "llama.cpp") runningModels = []
+        if (root.backend === "llama.cpp") { runningModels = []; root._resetIdleTracking() }
       }
     }
   }
@@ -1281,10 +1787,75 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
     }
   }
 
-  // ── Start/stop/create stderr capture ──────────────────────────────
+  // llama.cpp → bounded no-load GGUF header read for the loaded model's own
+  // metadata (totalLayers + KV-cache inputs). $1 = .gguf path, $2 = cap. The
+  // path arrives only as a positional arg (never concatenated into the script);
+  // the script refuses symlinks/special files and reads at most 16 KiB.
+  Process {
+    id: ggufProcess
+    running: false
+    command: ["timeout", "-k", "2", "" + processTimeoutSec,
+              "bash", "-c", root.ggufScript, "dash",
+              root._ggufPath, "" + root.capGguf]
+    stdout: SplitParser { onRead: function(line) { root._onGgufLine(line) } }
+    onExited: function(exitCode) {
+      ggufWatchdog.stop()
+      if (exitCode === 0) _finishGguf()
+      else _ggufBuffer = ""
+      _ggufPath = ""
+    }
+  }
+
+  // llama.cpp → GET /slots?model=<id> (issue #6 idle source). $1 = /slots base,
+  // $2 = model id (charset-validated in _syncIdleTracking), $3 = cap. Runs only
+  // while auto-unload is enabled and a model is loaded; single-flight.
+  Process {
+    id: slotsProcess
+    running: false
+    command: ["timeout", "-k", "2", "" + processTimeoutSec,
+              "bash", "-c", root.slotsScriptLlama, "dash",
+              root.endpointScheme + "://" + root.effectiveHost + ":" + root.effectivePort + "/slots",
+              root._slotsModelId, "" + root.capSlots]
+    environment: ({ "DASH_API_KEY": root.configApiKey })
+    stdout: SplitParser { onRead: function(line) { root._onSlotsLine(line) } }
+    onExited: function(exitCode) {
+      slotsWatchdog.stop()
+      if (exitCode === 0) _finishSlots()
+      else _slotsBuffer = ""
+    }
+  }
+
+  // llama.cpp → POST /models/unload (issue #6). $1 = model id, $2 = endpoint,
+  // $3 = cap. The id is validated in unloadModel(); the script strips any
+  // quote/backslash/control byte before JSON encoding.
+  Process {
+    id: unloadProcess
+    running: false
+    command: ["timeout", "-k", "2", "" + processTimeoutSec,
+              "bash", "-c", root.unloadScriptLlama, "dash",
+              root._unloadId,
+              root.endpointScheme + "://" + root.effectiveHost + ":" + root.effectivePort + "/models/unload",
+              "" + root.capUnload]
+    environment: ({ "DASH_API_KEY": root.configApiKey })
+    stdout: SplitParser { onRead: function(line) { root._onUnloadLine(line) } }
+    onExited: function(exitCode) {
+      unloadWatchdog.stop()
+      var id = _unloadId
+      _unloadId = ""
+      if (exitCode === 0) {
+        _finishUnload(id)
+      } else {
+        _unloadBuffer = ""
+        lastError = "Failed to unload " + (id !== "" ? id : "model") + " from " + root.backendDisplayName + "."
+      }
+    }
+  }
+
+  // ── Start/stop/create/unload output capture ────────────────────────
   property string _startBuffer: ""
   property string _stopBuffer: ""
   property string _createBuffer: ""
+  property string _unloadBuffer: ""
 
   function _onStartLine(line) {
     var s = String(line || "")
@@ -1299,6 +1870,30 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
   function _onCreateLine(line) {
     var s = String(line || "")
     if (_createBuffer.length + s.length + 1 <= capAction) _createBuffer += s + "\n"
+  }
+
+  function _onUnloadLine(line) {
+    var s = String(line || "")
+    if (_unloadBuffer.length + s.length + 1 <= capUnload) _unloadBuffer += s + "\n"
+  }
+
+  // Unload result: curl -w '%{http_code}' appended the status to the response
+  // body. 2xx = the model was released; anything else is surfaced (the router
+  // stays up either way, so this never touches the service state).
+  function _finishUnload(id) {
+    var raw = truncate(_unloadBuffer.trim(), capUnload)
+    _unloadBuffer = ""
+    var m = raw.match(/(\d{3})$/)
+    var code = m ? parseInt(m[1], 10) : -1
+    if (code >= 200 && code < 300) {
+      lastError = ""
+      _resetIdleTracking()
+      refresh()
+    } else {
+      var detail = raw.replace(/(\d{3})$/, "").trim()
+      lastError = "Failed to unload " + (id !== "" ? id : "model") + " from " + root.backendDisplayName + "." +
+        (detail !== "" ? " " + truncate(detail, 160) : "")
+    }
   }
 
   Process {
@@ -1481,6 +2076,27 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
   }
 
   Timer {
+    id: ggufWatchdog
+    interval: watchdogMs
+    repeat: false
+    onTriggered: reap(ggufProcess, ggufWatchdog)
+  }
+
+  Timer {
+    id: slotsWatchdog
+    interval: watchdogMs
+    repeat: false
+    onTriggered: reap(slotsProcess, slotsWatchdog)
+  }
+
+  Timer {
+    id: unloadWatchdog
+    interval: watchdogMs
+    repeat: false
+    onTriggered: if (unloadProcess.running) unloadProcess.running = false
+  }
+
+  Timer {
     id: startActionWatchdog
     interval: startWatchdogMs
     repeat: false
@@ -1508,6 +2124,26 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
     interval: 20000
     repeat: false
     onTriggered: root.pendingProvision = false
+  }
+
+  // Issue #6 auto-unload check: at most one check per second while enabled.
+  // The actual unload goes through unloadModel(), which re-checks
+  // busy/running/endpoint/loaded, so a start or stop in flight is never
+  // raced. Firing resets the baseline so it cannot fire again until the next
+  // model load re-arms tracking.
+  Timer {
+    id: unloadCheckTimer
+    interval: 1000
+    repeat: true
+    running: root.backend === "llama.cpp" && root.unloadInactivitySec > 0 && root.running && !root.busy
+    onTriggered: {
+      if (!root.running || root.busy) return
+      if (root._slotsModelId === "" || root._lastActivityMs < 0) return
+      if (Date.now() - root._lastActivityMs <= root.unloadInactivitySec * 1000) return
+      var id = root._slotsModelId
+      root._resetIdleTracking()
+      root.unloadModel(id)
+    }
   }
 
   // ── Refresh timers ─────────────────────────────────────────────────
