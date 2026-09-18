@@ -78,7 +78,7 @@ setup_e2e() { # fresh isolated plugin sandbox under tests/.cache/e2e
   mkdir -p "$E2E/plugin/configs" "$E2E/home/.config/systemd/user" "$E2E/bin"
   cp "$ROOT/Service.qml" "$ROOT/Dashboard.qml" "$E2E/plugin/"
   cp -r "$ROOT/sections" "$ROOT/ui" "$E2E/plugin/"
-  cp "$LIB/mocks/systemctl" "$LIB/mocks/systemd-analyze" "$LIB/mocks/llama-server" "$E2E/bin/"
+  cp "$LIB/mocks/systemctl" "$LIB/mocks/systemd-analyze" "$LIB/mocks/llama-server" "$LIB/mocks/curl" "$E2E/bin/"
   chmod +x "$E2E/bin"/*
   : > "$E2E/mocklog"
 }
