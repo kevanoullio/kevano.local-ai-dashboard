@@ -1,4 +1,5 @@
 # omarchy-local-ai-dashboard
+
 Monitor and control local AI model services like ollama and llama.cpp from the Omarchy bar. Start and stop systemd background services, view available models with current status, monitor CPU/GPU/DRAM/VRAM usage, stream debug output via a new terminal session, and open config files directly in nvim.
 
 It provides a unified interface for various local backends—including `ollama` and `llama-server`—allowing you to inspect models, adjust service setups, stream terminal logs, and enforce single-service resource isolation. Support for `vLLM` is a planned feature.
@@ -114,6 +115,7 @@ Displays an itemized list of all local models recognized by the selected service
 - **Model Name:** Currently active model identifier
 - **Memory:** Full process footprint — measured DRAM working set added to measured per-service VRAM (`nvidia-smi` on NVIDIA, `rocm-smi` on AMD). Reclaimable file/page cache (the mmap'd `.gguf`) is deliberately excluded so the number reflects committed memory rather than the cached model file.
 - **Resource Split:** Measured CPU (DRAM) / GPU (VRAM) share of that total: `CPU% = DRAM / (DRAM + VRAM)`, `GPU% = 100 - CPU%`.
+- **Layer detail (llama.cpp):** Per loaded model, the GPU/CPU layer counts and weight GB split are exact only when the preset sets `--n-gpu-layers`. When it is absent, the layer counts and percentages show "—" and the weight GB falls back to a measured "~" VRAM/DRAM estimate (the service's measured footprint, which can include KV cache). The KV cache size shown next to the context length is always an upper-bound "~" estimate from the model's GGUF header.
 - **Available models list:** Below loaded models, all available models are listed with indicators for cloud models and running status.
 
 ---
@@ -146,6 +148,7 @@ This clones the repo into `~/.config/omarchy/plugins/kevano.local-ai-dashboard` 
    ```
 
 2. Register the plugin by adding it to a `bar.layout` region in your Omarchy 4 configuration file (`~/.config/omarchy/shell.json`). For example, the right region:
+
 ```json
 {
   "bar": {
@@ -158,7 +161,17 @@ This clones the repo into `~/.config/omarchy/plugins/kevano.local-ai-dashboard` 
 }
 ```
 
-3. Restart or reload your Omarchy shell session.
+1. Reload the plugin so the shell picks it up. No full shell restart is needed — this re-scans the plugin directories and hot-reloads the plugin code in place:
+
+```
+omarchy-shell shell rescanPlugins
+```
+
+1. If the rescanning the plugins did not show your latest changes, then restart the shell altogether:
+
+```
+omarchy-restart-shell
+```
 
 ---
 
@@ -222,15 +235,15 @@ The dashboard treats config files and service state as untrusted input and keeps
 
 The dashboard relies on standard Linux utilities to query local APIs and manage background units:
 
-* `curl` and `jq` for API response handling.
-* `systemd` (both system and user service instances).
-* A polkit authentication agent for managing ollama's system-level service via `pkexec` (Omarchy ships one by default).
-* `nvim` for inline file editing.
-* Your preferred terminal emulator (e.g., `kitty`, `foot`) for log streaming.
+- `curl` and `jq` for API response handling.
+- `systemd` (both system and user service instances).
+- A polkit authentication agent for managing ollama's system-level service via `pkexec` (Omarchy ships one by default).
+- `nvim` for inline file editing.
+- Your preferred terminal emulator (e.g., `kitty`, `foot`) for log streaming.
 
 ---
 
 ## Credits & License
 
-* **Original Inspiration:** Based on [`omarchy-ollama-status`](https://github.com/LinuxGamerUK/omarchy-ollama-status) by **LinuxGamerUK**.
-* **License:** Distributed under the terms of the [MIT License](https://www.google.com/search?q=LICENSE).
+- **Original Inspiration:** Based on [`omarchy-ollama-status`](https://github.com/LinuxGamerUK/omarchy-ollama-status) by **LinuxGamerUK**.
+- **License:** Distributed under the terms of the [MIT License](https://www.google.com/search?q=LICENSE).
