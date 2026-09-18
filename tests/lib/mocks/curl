@@ -1,0 +1,58 @@
+#!/bin/bash
+# Mock curl for the test sandbox. Routes known llama.cpp API endpoints to
+# deterministic responses and logs every invocation to ${__mocklog:?}.
+#
+# Usage: hdr() { if [ -n "$DASH_API_KEY" ]; then printf 'header = "X-Api-Key: %s"\n' "$DASH_API_KEY" | curl -K - "$@"; else curl "$@"; fi }
+# The mock is invoked as `curl "$@"` (the hdr wrapper is irrelevant since
+# we handle the key inline). All calls are logged to __mocklog.
+echo "CURL $*" >> "${__mocklog:-/dev/null}"
+
+# ── Helpers ──────────────────────────────────────────────────────────────
+url=""
+body=""
+method="GET"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -X) method="$2"; shift 2 ;;
+    --data) body="$2"; shift 2 ;;
+    -H) shift 2 ;;          # headers are ignored by the mock
+    -s|-S|--silent|--show-error) shift ;;  # flags, skip
+    -w) shift 2 ;;          # write-out, skip
+    -o) shift 2 ;;          # output file, skip
+    -d) body="$2"; shift 2 ;;  # short --data
+    -k) shift ;;            # insecure, skip
+    --*)
+      # Could be --connect-timeout N, --max-time N, etc.
+      case "$1" in
+        --connect-timeout|--max-time|--retry) shift 2 ;;
+        *) shift ;;
+      esac
+      ;;
+    -*) shift ;;             # other flags, skip
+    *)
+      if [[ "$1" == http* ]]; then
+        url="$1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+# ── Routing ──────────────────────────────────────────────────────────────
+if [[ "$url" == */models/unload ]] && [ "$method" = "POST" ]; then
+  # POST /models/unload → echo request body + HTTP status code.
+  echo "$body"
+  echo "200"
+elif [[ "$url" == */slots* ]]; then
+  # GET /slots?model=<id> → fixed idle slot response.
+  echo '[{"id":0,"n_ctx":262144,"speculative":false,"is_processing":false,"id_task":7,"n_prompt_tokens":0,"n_prompt_tokens_processed":0,"n_prompt_tokens_cache":0,"params":{"seed":-1,"temperature":0.5,"top_k":40,"top_p":0.95,"min_p":0.0,"top_n_sigma":-1.0,"xtc_probability":0.0,"xtc_threshold":0.1,"typical_p":1.0,"repeat_last_n":64,"repeat_penalty":1.1,"presence_penalty":0.0,"frequency_penalty":0.0,"dry_multiplier":0.0,"dry_base":1.75,"dry_allowed_length":2,"dry_penalty_last_n":0,"penalize_nl":false,"tail_free_sampling_parameter":0.9,"logit_bias_0_1536":0.0}]'
+elif [[ "$url" == */v1/models* ]]; then
+  # GET /v1/models → return a minimal loaded-model response for e2e tests.
+  echo '{"data":[{"id":"test-model","aliases":[],"tags":[],"object":"model","owned_by":"llamacpp","created":1700000000,"status":{"value":"loaded","processor":"CPU"},"meta":{"size":"1073741824","n_ctx":"131072"}}]}'
+else
+  # Default: 404.
+  echo '{"error":"not found"}' >&2
+  exit 1
+fi
+
+exit 0

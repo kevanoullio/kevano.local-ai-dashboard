@@ -23,7 +23,8 @@ Item {
     if (!svc) { console.log("DUMP-INSTANCE-FAIL"); Qt.quit(); return }
     var names = [
       "llamaEnvDefault", "llamaUnitBody", "provisionLlamaScript",
-      "createEnvScript", "configScript", "createConfigScript"
+      "createEnvScript", "configScript", "createConfigScript",
+      "ggufScript", "unloadScriptLlama", "slotsScriptLlama"
     ]
     for (var i = 0; i < names.length; i++) {
       console.log(">>>DUMP:" + names[i] + "<<<")

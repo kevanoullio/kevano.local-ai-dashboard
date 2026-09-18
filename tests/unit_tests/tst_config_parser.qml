@@ -53,6 +53,38 @@ Item {
     A.check("empty-has/host", s.configHost, "127.0.0.1")
     A.check("empty-has/port", s.configPort, 0)
 
+    // ── LLAMA_UNLOAD_INACTIVITY_SEC (issue #6 auto-unload) ────────────────
+    // Absent on older env files = disabled (0). Valid integer is applied; any
+    // non-integer (incl. negative / fractional) is a violation that resets the
+    // whole config to safe defaults, so a valid value never survives a bad one.
+    parse("HAS\nLLAMA_UNLOAD_INACTIVITY_SEC=3600\n")
+    A.check("unload/valid", s.unloadInactivitySec, 3600)
+    A.check("unload/valid-flag", s.configValid, true)
+
+    parse("HAS\nLLAMA_UNLOAD_INACTIVITY_SEC=0\n")
+    A.check("unload/explicit-zero", s.unloadInactivitySec, 0)
+    A.check("unload/explicit-zero-valid", s.configValid, true)
+
+    parse("HAS\n")
+    A.check("unload/absent-stays-disabled", s.unloadInactivitySec, 0)
+
+    parse("HAS\nLLAMA_UNLOAD_INACTIVITY_SEC=abc\n")
+    A.check("unload/nonint/valid", s.configValid, false)
+    A.check("unload/nonint/reset", s.unloadInactivitySec, 0)
+    A.check("unload/nonint/warning", s.configWarning.indexOf("LLAMA_UNLOAD_INACTIVITY_SEC is not an integer") !== -1, true)
+
+    parse("HAS\nLLAMA_UNLOAD_INACTIVITY_SEC=-5\n")
+    A.check("unload/negative/valid", s.configValid, false)
+    A.check("unload/negative/reset", s.unloadInactivitySec, 0)
+
+    parse("HAS\nLLAMA_UNLOAD_INACTIVITY_SEC=1.5\n")
+    A.check("unload/fractional/valid", s.configValid, false)
+    A.check("unload/fractional/reset", s.unloadInactivitySec, 0)
+
+    parse("HAS\nLLAMA_PORT=99999\nLLAMA_UNLOAD_INACTIVITY_SEC=3600\n")
+    A.check("unload/sibling-violation-reset", s.unloadInactivitySec, 0)
+    A.check("unload/sibling-violation-invalid", s.configValid, false)
+
     var o = A.service("@SERVICE_QML_PATH@", root, "ollama")
     o._configBuffer = "HAS\n{\"host\":\"127.0.0.1\",\"port\":11434,\"api-key\":\"k\"}\n"
     o._parseConfigBuffer()

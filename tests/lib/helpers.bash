@@ -13,6 +13,9 @@ CE="$(lconst createEnvScript)"
 CR="$(lconst configScript)"
 CW="$(lconst createConfigScript)"
 UBODY="$(lconst llamaUnitBody)"
+GG="$(lconst ggufScript)"          # no-load GGUF header read
+UL="$(lconst unloadScriptLlama)"   # POST /models/unload
+SL="$(lconst slotsScriptLlama)"    # GET /slots?model=<id>
 
 # ---- sandbox ------------------------------------------------------------
 SB=""
@@ -23,7 +26,7 @@ sandbox_setup() {
   FAIL=0
   SB=$(mktemp -d "$T/.cache/it.XXXXXX")
   mkdir -p "$SB/bin" "$SB/cfg" "$SB/ud" "$SB/home"
-  cp "$MOCKS/systemctl" "$MOCKS/systemd-analyze" "$MOCKS/llama-server" "$SB/bin/"
+  cp "$MOCKS/systemctl" "$MOCKS/systemd-analyze" "$MOCKS/llama-server" "$MOCKS/curl" "$SB/bin/"
   chmod +x "$SB/bin"/*
   MOCKLOG="$SB/mocklog"
   : > "$MOCKLOG"
@@ -67,6 +70,6 @@ expect_eq()    { local want=$1 got=$2 label=$3; [ "$want" = "$got" ] || { echo "
 expect_file()  { [ -e "$1" ] || { echo "  FAIL: missing file $1" >&3; FAIL=1; }; }
 expect_no_file() { [ ! -e "$1" ] || { echo "  FAIL: unexpected file $1" >&3; FAIL=1; }; }
 expect_perms() { local p got; p=$1 f=$2 label=$3; got=$(stat -c %a "$f" 2>/dev/null); [ "$got" = "$p" ] || { echo "  FAIL $label: perms=$got want=$p" >&3; FAIL=1; }; }
-expect_contains() { grep -q "$1" "$2" || { echo "  FAIL: [$2] lacks [$1]" >&3; FAIL=1; }; }
-expect_grep()   { grep -q "$1" "$2" || { echo "  FAIL: [$2] lacks [$1]" >&3; FAIL=1; }; }
-expect_no_grep() { ! grep -q "$1" "$2" || { echo "  FAIL: [$2] unexpectedly contains [$1]" >&3; FAIL=1; } }
+expect_contains() { grep -q -- "$1" "$2" || { echo "  FAIL: [$2] lacks [$1]" >&3; FAIL=1; }; }
+expect_grep()   { grep -q -- "$1" "$2" || { echo "  FAIL: [$2] lacks [$1]" >&3; FAIL=1; }; }
+expect_no_grep() { ! grep -q -- "$1" "$2" || { echo "  FAIL: [$2] unexpectedly contains [$1]" >&3; FAIL=1; } }
