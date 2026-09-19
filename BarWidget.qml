@@ -63,12 +63,6 @@ BarWidget {
 
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.LeftButton) root.toggle()
-      else {
-        var s = controller._activeService
-        if (!s) return
-        if (buttonCode === Qt.RightButton) s.toggleService()
-        else if (buttonCode === Qt.MiddleButton) s.refresh()
-      }
     }
   }
 }
