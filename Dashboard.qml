@@ -141,6 +141,11 @@ Panel {
       anchors.fill: parent
       onMoveRequested: function(dx, dy) {
         if (!root.cursorActive) root.cursorActive = true
+        if (dx !== 0 && root.activeBackend === "llama.cpp") {
+          root.switchBackend("ollama")
+        } else if (dx !== 0 && root.activeBackend === "ollama") {
+          root.switchBackend("llama.cpp")
+        }
       }
       onActivateRequested: {
         if (root.cursorActive && root.focusSection === "header") root.activeService.toggleService()
@@ -151,6 +156,8 @@ Panel {
         if (t === "s" || t === "S") root.activeService.startService()
         else if (t === "x" || t === "X") root.activeService.stopService()
         else if (t === "r" || t === "R") { root.serviceOllama.refresh(); root.serviceLlama.refresh() }
+        else if (t === "c" || t === "C") root.openConfig()
+        else if (t === "d" || t === "D") root.openDebug()
       }
     }
 

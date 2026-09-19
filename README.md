@@ -19,7 +19,7 @@ This project is an extended derivative work based on `omarchy-ollama-status` by 
 ## Project Structure
 
 The plugin is split into a `Dashboard.qml` shell that owns all shared state
-(backend selection, cursor/keyboard navigation, `Service` instances) plus a set
+(backend selection, cursor and keyboard navigation, `Service` instances) plus a set
 of reusable UI components and per-section files. Each section is "state-in /
 signal-out": it receives data as properties and reports interactions back as
 signals, so the shell remains the single source of truth.
@@ -45,6 +45,11 @@ kevano.local-ai-dashboard/
 ├── Service.qml                      # Backend service model (systemctl/API logic)
 ├── LICENSE
 ├── manifest.json                    # Plugin metadata + entry point declaration
+├── tests/                           # Hermetic test suite (unit, integration, e2e)
+│   ├── run_all.sh                   #   Orchestrates all test phases
+│   ├── unit_tests/                  #   QML harnesses (~135 assertions)
+│   ├── integration_tests/           #   BATS scripts (29 tests)
+│   └── e2e_tests/                   #   Sandbox lifecycle harnesses
 └── README.md
 ```
 
@@ -55,10 +60,35 @@ registers a `Controller` that loads `Dashboard.qml` on demand. Both the
 
 ---
 
+## Testing
+
+The project ships a hermetic test suite under `tests/` that exercises QML logic,
+shell scripts, and end-to-end workflows inside an isolated sandbox (no live
+systemd or host configs touched). Run all phases from the repo root:
+
+```bash
+bash tests/run_all.sh
+```
+
+Individual phases:
+- **Unit tests** (`tests/run_unit_tests.sh`) — 6 Quickshell harnesses (~135 assertions) covering config parsing, defaults, exit-code maps, provisioning state, security contracts, and input validators.
+- **Integration tests** (`tests/run_integration_tests.sh`) — 29 BATS tests exercising the embedded bash scripts (config reader/writer, env writer, provision create flows, rollback/unsafe matrices) against mocked `systemctl` and `systemd-analyze`.
+- **End-to-end tests** (`tests/run_e2e_tests.sh`) — 3 sandbox harnesses covering llama.cpp full lifecycle, rollback on start failure, and Dashboard→section signal wiring.
+
+A detailed description of the test architecture, constant extraction process,
+and how to add new tests is in [tests/README.md](tests/README.md).
+
+`tests/.cache/` holds scratch artifacts (dumped constants, per-run logs, generated
+BATS files) and is git-ignored — it is regenerated on every run. `scratch/`
+contains local discovery notes from development and is also git-ignored; both
+directories can be safely deleted without affecting the plugin.
+
+---
+
 ## Features & Architecture
 
 - **Dual systemd scope model:** ollama runs as a system-wide daemon (system instance, managed via `pkexec`), while llama.cpp runs as a per-user service (user instance, self-provisioned on first start with no root or polkit required). Both can run side-by-side independently.
-- **Multi-Service Selection Bar:** Displays all installed or configured local AI services at a glance. Easily switch the target view without affecting active background processes.
+- **Multi-Service Selection Bar:** Displays all installed or configured local AI services at a glance. Easily switch the target view without affecting active background processes. The bar icon is dimmed when no installed service has a systemd unit; otherwise it uses the normal foreground color.
 - **Single-Active Service Enforcer:** Activating a service automatically initiates a graceful shutdown of any currently running backend and waits for complete resource/VRAM forfeit before starting the target engine.
 - **Single-panel layout:** Hero cards at top for backend selection + power toggle, followed by a status/details grid and a model inventory list — all in one scrollable panel.
 - **Interactive Terminal Debugging:** One-click action to launch a terminal attached to live systemd or process logs.
@@ -97,26 +127,56 @@ Two clickable backend selector cards display the current status of each availabl
 
 #### Service Details Grid
 
-Displays operational information for the currently selected service in a two-column grid:
+Displays operational information for the currently selected service in a two-column grid. When conditions warrant, error notices and config warnings appear above the grid:
 
 - **Status:** `RUNNING` or `STOPPED`
 - **Version:** Version string reported by the engine
 - **API:** The host and port the service is serving on (shown when running)
 - **Latency:** API response latency in milliseconds (shown when reachable, color-coded)
 - **Since:** Timestamp of when the service was started
-- **Configure [Backend]:** Opens the service's config file in Neovim for editing
+
+Conditional buttons:
+
+- **Configure [Backend]:** Opens the service's config file in Neovim for editing (only visible when a config file exists)
 - **View debug output:** Spawns a terminal attached to live systemd logs (only available when running)
-- **Create [Backend] config file:** Generates the default config file (only shown when no config exists)
+- **Create [Backend] config file:** Generates the default config file (only shown when no config exists yet)
+
+When starting llama.cpp requires writing or updating its systemd unit, a consent flow appears with "Confirm unit update & start" and "Cancel" buttons. This request also expires automatically after ~20 seconds.
 
 #### Model Inventory
 
-Displays an itemized list of all local models recognized by the selected service engine. When the service is running, loaded models appear at the top with memory telemetry:
+Displays an itemized list of all local models recognized by the selected service engine. When the service is running, loaded models appear at the top with detailed telemetry; below them, all available models are listed with indicators for cloud models and running status.
 
-- **Model Name:** Currently active model identifier
-- **Memory:** Full process footprint — measured DRAM working set added to measured per-service VRAM (`nvidia-smi` on NVIDIA, `rocm-smi` on AMD). Reclaimable file/page cache (the mmap'd `.gguf`) is deliberately excluded so the number reflects committed memory rather than the cached model file.
-- **Resource Split:** Measured CPU (DRAM) / GPU (VRAM) share of that total: `CPU% = DRAM / (DRAM + VRAM)`, `GPU% = 100 - CPU%`.
-- **Layer detail (llama.cpp):** Per loaded model, the GPU/CPU layer counts and weight GB split are exact only when the preset sets `--n-gpu-layers`. When it is absent, the layer counts and percentages show "—" and the weight GB falls back to a measured "~" VRAM/DRAM estimate (the service's measured footprint, which can include KV cache). The KV cache size shown next to the context length is always an upper-bound "~" estimate from the model's GGUF header.
-- **Available models list:** Below loaded models, all available models are listed with indicators for cloud models and running status.
+**Loaded model detail (llama.cpp):** Each loaded model renders as a multi-line block:
+
+- **Model Size:** Layer count and total file size (base + draft)
+- **GPU Layers / CPU Layers:** Per-device layer counts, weight GB, and percentage of the main stack on that device. A `(+N MTP ~X MB)` suffix appears when MTP draft layers are present.
+- **Context:** Context length with location indicator (`on GPU` or `on CPU`)
+- **KV Cache:** Estimated KV cache size with dtype info (e.g., `K f16 / V f16`) and location
+- **GPU Total / CPU Total:** Combined weight + co-located KV cache per device (shown when applicable)
+
+Layer counts and percentages show "—" when the preset sets no explicit `--n-gpu-layers`; in that case the weight GB falls back to a measured "~" VRAM/DRAM estimate. The KV cache size is always an upper-bound "~" estimate from the model's GGUF header.
+
+**Loaded model detail (ollama):** A single-line summary showing memory footprint and CPU/GPU split: `"Memory: X.X GB | CPU: Y% | GPU: Z%"`, parsed from the engine's `processor` string.
+
+**Available models list:** Each entry shows a status indicator (cloud ☁, loaded ●, unloaded ○), model name, size, and download date.
+
+---
+
+### Keyboard Shortcuts
+
+The panel accepts keyboard input when it has focus. All service-scoped actions (start, stop, edit config, view debug) apply only to the currently selected backend. Service navigation is global — switching backends does not alter their running state.
+
+| Key | Action |
+|-----|--------|
+| **Left / Right** | Switch between installed backends (cycles llama.cpp ↔ ollama) |
+| **s** | Start the active service |
+| **x** | Stop the active service |
+| **r** | Refresh both backends simultaneously |
+| **c** | Open the active backend's config file in Neovim |
+| **d** | View live debug output (systemd journal) in a terminal |
+
+The power toggle on the Hero card can also be activated with **Enter** when the header section is cursor-focused.
 
 ---
 
@@ -235,7 +295,7 @@ The dashboard treats config files and service state as untrusted input and keeps
 
 The dashboard relies on standard Linux utilities to query local APIs and manage background units:
 
-- `curl` and `jq` for API response handling.
+- `curl` for API health checks, model listing, and config file reading.
 - `systemd` (both system and user service instances).
 - A polkit authentication agent for managing ollama's system-level service via `pkexec` (Omarchy ships one by default).
 - `nvim` for inline file editing.
