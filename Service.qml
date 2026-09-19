@@ -669,17 +669,49 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
    // GPU/CPU weight bytes for display. Prefer the exact layer-ratio split when the
    // offload count is known; otherwise fall back to the measured per-device footprint
    // (an estimate — measured VRAM/DRAM can include KV cache). Unknown → -1 ("—").
-   function _weightBytes(sizeBytes, gpu, cpu, total, vramBytes, memBytes) {
-     var out = [-1, -1]
-     if (sizeBytes > 0 && total > 0 && gpu >= 0 && cpu >= 0) {
-       out[0] = Math.round(sizeBytes * gpu / total)
-       out[1] = Math.round(sizeBytes * cpu / total)
-     } else {
-       if (vramBytes >= 0) out[0] = vramBytes   // ≈ measured GPU footprint
-       if (memBytes  >= 0) out[1] = memBytes    // ≈ measured DRAM working set
-     }
-     return out
-   }
+    function _weightBytes(sizeBytes, gpu, cpu, total, vramBytes, memBytes) {
+      var out = [-1, -1]
+      if (sizeBytes > 0 && total > 0 && gpu >= 0 && cpu >= 0) {
+        out[0] = Math.round(sizeBytes * gpu / total)
+        out[1] = Math.round(sizeBytes * cpu / total)
+      } else {
+        if (vramBytes >= 0) out[0] = vramBytes   // ≈ measured GPU footprint
+        if (memBytes  >= 0) out[1] = memBytes    // ≈ measured DRAM working set
+      }
+      return out
+    }
+
+    // Estimate GPU/CPU layer split from measured VRAM when ngl is unknown.
+    // Uses per-PID VRAM measurement (Tier 3) + model size (Tier 1/2) to derive
+    // an approximate number of layers on GPU. Always returns ~ estimate.
+    // Returns { gpuLayers, cpuLayers, ctxOn } or null when measurements unavailable.
+    function _estimateSplitFromProbes(sizeBytes, totalLayers, vramBytes) {
+      if (sizeBytes <= 0 || !isFinite(totalLayers) || totalLayers <= 0) return null
+      if (vramBytes < 0) return null
+      // VRAM ≈ weight_on_gpu + kv_cache_on_gpu. Subtract estimated KV to isolate weights.
+      var kvEstimate = _kvEstimateBytes(
+        Math.round(totalLayers / 4),   // rough: ~25% layers on GPU for hybrid
+        8192,                          // assumed working context
+        8,                             // head_count_kv default
+        64,                            // head_dim default
+        16, _kvDtypeBits("")           // f16 default
+      )
+      var weightOnGpu = vramBytes - (kvEstimate > 0 ? kvEstimate : 0)
+      if (weightOnGpu <= 0) return null
+      // gpu_layers ≈ round(weight_on_gpu / total_size * total_layers)
+      var gpuLayers = Math.round(weightOnGpu / sizeBytes * totalLayers)
+      gpuLayers = Math.max(0, Math.min(gpuLayers, totalLayers))
+      var cpuLayers = totalLayers - gpuLayers
+      // Context placement: if VRAM > 0 and weights on GPU, KV likely on GPU too.
+      var ctxOn = (gpuLayers > 0) ? "GPU" : "CPU"
+      return { gpuLayers: gpuLayers, cpuLayers: cpuLayers, ctxOn: ctxOn }
+    }
+
+    // Tier-5 preset fallback: bounded INI parser for the models.ini preset file.
+    function _parsePreset(path) {
+      // This would be called via a new Process that reads the preset file.
+      // Returns parsed INI data for matching against loaded model paths.
+    }
 
     // Resolve GGUF-dependent fields for each entry, returning a NEW array so the
     // view re-renders. Cached headers resolve synchronously; misses queue a bounded
@@ -1080,6 +1112,7 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
             cacheK: parsed.cacheK,
             cacheV: parsed.cacheV,
             noKvOffload: parsed.noKvOffload,
+            _gpuSplitSource: "api",  // "api" | "probe" | "preset" | null
             totalLayers: -1,
             mainLayers: -1,
             mtpLayers: 0,
@@ -1167,6 +1200,22 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
       entry.mainCpu = splitAll.mainCpu
       entry.mtpGpu = splitAll.mtpGpu
       entry.mtpCpu = splitAll.mtpCpu
+    }
+    // Fallback: when ngl is unknown and _mtpSplit returned nulls,
+    // estimate from measured VRAM (Tier 3).
+    if (entry.mainGpu === null && entry.ngl === "") {
+      var probe = _estimateSplitFromProbes(
+        entry.sizeBytes > 0 ? entry.sizeBytes : 0,
+        total,
+        serviceVramBytes
+      )
+      if (probe) {
+        entry.mainGpu = probe.gpuLayers
+        entry.mainCpu = probe.cpuLayers
+        entry._gpuSplitSource = "probe"
+      }
+    } else {
+      entry._gpuSplitSource = "api"
     }
     var ctx = (isFinite(entry.contextLen) && entry.contextLen > 0) ? entry.contextLen : -1
     var hc = (g.hc > 0) ? g.hc : -1

@@ -48,7 +48,9 @@ elif [[ "$url" == */slots* ]]; then
   echo '[{"id":0,"n_ctx":262144,"speculative":false,"is_processing":false,"id_task":7,"n_prompt_tokens":0,"n_prompt_tokens_processed":0,"n_prompt_tokens_cache":0,"params":{"seed":-1,"temperature":0.5,"top_k":40,"top_p":0.95,"min_p":0.0,"top_n_sigma":-1.0,"xtc_probability":0.0,"xtc_threshold":0.1,"typical_p":1.0,"repeat_last_n":64,"repeat_penalty":1.1,"presence_penalty":0.0,"frequency_penalty":0.0,"dry_multiplier":0.0,"dry_base":1.75,"dry_allowed_length":2,"dry_penalty_last_n":0,"penalize_nl":false,"tail_free_sampling_parameter":0.9,"logit_bias_0_1536":0.0}]'
 elif [[ "$url" == */v1/models* ]]; then
   # GET /v1/models → return a minimal loaded-model response for e2e tests.
-  echo '{"data":[{"id":"test-model","aliases":[],"tags":[],"object":"model","owned_by":"llamacpp","created":1700000000,"status":{"value":"loaded","processor":"CPU"},"meta":{"size":"1073741824","n_ctx":"131072"}}]}'
+  # fit-model is loaded with `fit = on`: its resolved args carry no explicit
+  # --n-gpu-layers, so the layer split must come from the probe fallback.
+  echo '{"data":[{"id":"test-model","aliases":[],"tags":[],"object":"model","owned_by":"llamacpp","created":1700000000,"status":{"value":"loaded","processor":"CPU"},"meta":{"size":"1073741824","n_ctx":"131072"}},{"id":"fit-model","aliases":[],"tags":[],"object":"model","owned_by":"llamacpp","created":1700000000,"status":{"value":"loaded","processor":"CPU","args":["/usr/bin/llama-server","--model","/m/fit-model.gguf","--ctx-size","131072","--cache-type-k","q8_0","--cache-type-v","q8_0"]},"meta":{"size":"9200000000","n_ctx":"131072"}}]}'
 else
   # Default: 404.
   echo '{"error":"not found"}' >&2

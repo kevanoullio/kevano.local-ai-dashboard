@@ -33,15 +33,18 @@ Item {
     A.check("args-null/ngl", p3.ngl, "")
     A.check("args-null/noKvOffload", p3.noKvOffload, false)
 
-    // ── _layerSplit: ngl token + total → [gpu, cpu] (clamped / unknown) ──────
-    A.check("split/all", s._layerSplit("all", 65), [65, 0])
-    A.check("split/int-inrange", s._layerSplit("20", 65), [20, 45])
-    A.check("split/int-overclamp", s._layerSplit("99", 65), [65, 0])
-    A.check("split/zero", s._layerSplit("0", 65), [0, 65])
-    A.check("split/badtotal", s._layerSplit("all", -1), [-1, -1])
-    A.check("split/empty", s._layerSplit("", 65), [-1, -1])
-    A.check("split/nonnumeric", s._layerSplit("x", 65), [-1, -1])
-    A.check("split/null", s._layerSplit(null, 65), [-1, -1])
+    // ── _mtpSplit: ngl token + total + mtp → {mainGpu, mainCpu, mtpGpu, mtpCpu}
+    A.check("split/all", s._mtpSplit("all", 65, 0), {mainGpu: 65, mainCpu: 0, mtpGpu: 0, mtpCpu: 0})
+    A.check("split/int-inrange", s._mtpSplit("20", 65, 0), {mainGpu: 20, mainCpu: 45, mtpGpu: 0, mtpCpu: 0})
+    A.check("split/int-overclamp", s._mtpSplit("99", 65, 0), {mainGpu: 65, mainCpu: 0, mtpGpu: 0, mtpCpu: 0})
+    A.check("split/zero", s._mtpSplit("0", 65, 0), {mainGpu: 0, mainCpu: 65, mtpGpu: 0, mtpCpu: 0})
+    A.check("split/badtotal", s._mtpSplit("all", -1, 0), {mainGpu: null, mainCpu: null, mtpGpu: null, mtpCpu: null})
+    A.check("split/empty", s._mtpSplit("", 65, 0), {mainGpu: null, mainCpu: null, mtpGpu: null, mtpCpu: null})
+    A.check("split/nonnumeric", s._mtpSplit("x", 65, 0), {mainGpu: null, mainCpu: null, mtpGpu: null, mtpCpu: null})
+    A.check("split/null", s._mtpSplit(null, 65, 0), {mainGpu: null, mainCpu: null, mtpGpu: null, mtpCpu: null})
+    // MTP layers sit on top of the stack: offload counts from the bottom.
+    A.check("split/all-mtp", s._mtpSplit("all", 65, 5), {mainGpu: 60, mainCpu: 0, mtpGpu: 5, mtpCpu: 0})
+    A.check("split/part-mtp", s._mtpSplit("30", 65, 5), {mainGpu: 30, mainCpu: 30, mtpGpu: 0, mtpCpu: 5})
 
     // ── percent helpers: ratio of a part to the total, unknown → -1 ──────────
     A.check("pctGpu/full", s._percentLayersOnGPU(65, 65), 100)
@@ -75,15 +78,23 @@ Item {
     A.check("kvest/unknown-kbits", s._kvEstimateBytes(1, 1024, 1, 64, -1, 8), -1)
     A.check("kvest/unknown-vbits", s._kvEstimateBytes(1, 1024, 1, 64, 8, -1), -1)
 
+    // ── _estimateSplitFromProbes: VRAM → layer estimate (~; null when unknown) ─
+    // VRAM is reduced by the rough KV-cache estimate before the weight ratio.
+    A.check("probe/empty-vram", s._estimateSplitFromProbes(100, 65, -1), null)
+    A.check("probe/no-size", s._estimateSplitFromProbes(0, 65, 2*1024*1024*1024), null)
+    A.check("probe/full-gpu", s._estimateSplitFromProbes(10*1024*1024*1024, 65, 9*1024*1024*1024), {gpuLayers: 57, cpuLayers: 8, ctxOn: "GPU"})
+    A.check("probe/full-cpu", s._estimateSplitFromProbes(10*1024*1024*1024, 65, 0), null)
+    A.check("probe/half-gpu", s._estimateSplitFromProbes(10*1024*1024*1024, 65, 5*1024*1024*1024), {gpuLayers: 31, cpuLayers: 34, ctxOn: "GPU"})
+
     // ── _resolveRunningEntries: fresh reference + synchronous cached resolve ──
     s._ggufCache["/m/a.gguf"] = { bc: 65, hc: 24, hckv: 4, embd: 5120 }
-    var entries = [{ modelPath: "/m/a.gguf", ngl: "all", contextLen: 262144,
+    var entries = [{ modelPath: "/m/a.gguf", draftPath: "", ngl: "all", contextLen: 262144,
       sizeBytes: 100, cacheK: "q8_0", cacheV: "q8_0" }]
     var out = s._resolveRunningEntries(entries)
     A.ok("resolve/fresh-ref", out !== entries)
     A.check("resolve/totalLayers", out[0].totalLayers, 65)
-    A.check("resolve/gpuLayers", out[0].gpuLayers, 65)
-    A.check("resolve/cpuLayers", out[0].cpuLayers, 0)
+    A.check("resolve/mainGpu", out[0].mainGpu, 65)
+    A.check("resolve/mainCpu", out[0].mainCpu, 0)
     A.ok("resolve/kvCacheBytes", out[0].kvCacheBytes > 0)
 
     // ── _weightBytes: exact split / measured fallback / all unknown ───────────
@@ -110,15 +121,16 @@ Item {
     // here we test the QML side that turns its `GGUF-OK` + key=value lines into
     // the cached header and the per-entry layer split + KV estimate.
     s._ggufCache = ({})
-    s.runningModels = [{ modelPath: "/m/g1.gguf", ngl: "all", contextLen: 262144, sizeBytes: 0, cacheK: "", cacheV: "" }]
+    s.runningModels = [{ modelPath: "/m/g1.gguf", draftPath: "", ngl: "all", contextLen: 262144, sizeBytes: 0, cacheK: "", cacheV: "" }]
     s._ggufPath = "/m/g1.gguf"
     s._ggufBuffer = "GGUF-OK\narch=qwen35\nblock_count=65\nhead_count=40\nhead_count_kv=8\nembedding_length=5120\n"
     s._finishGguf()
     A.ok("gguf/cached", s._ggufCache["/m/g1.gguf"] !== undefined)
     A.check("gguf/cache-bc", s._ggufCache["/m/g1.gguf"].bc, 65)
     A.check("gguf/totalLayers", s.runningModels[0].totalLayers, 65)
-    A.check("gguf/gpuLayers", s.runningModels[0].gpuLayers, 65)
-    A.check("gguf/cpuLayers", s.runningModels[0].cpuLayers, 0)
+    A.check("gguf/mainGpu", s.runningModels[0].mainGpu, 65)
+    A.check("gguf/mainCpu", s.runningModels[0].mainCpu, 0)
+    A.check("gguf/split-source-api", s.runningModels[0]._gpuSplitSource, "api")
     A.ok("gguf/kvCacheBytes-est", s.runningModels[0].kvCacheBytes > 0)
     A.check("gguf/kvCacheBytes-formula", s.runningModels[0].kvCacheBytes, s._kvEstimateBytes(65, 262144, 8, 5120 / 40, 16, 16))
     // No MTP/interval keys → non-hybrid fallback: main = total, no MTP split.
@@ -126,14 +138,14 @@ Item {
     A.check("gguf/mtpLayers-fallback", s.runningModels[0].mtpLayers, 0)
 
     // ctx unknown (contextLen -1) → KV estimate degrades to -1 ("—")
-    s.runningModels = [{ modelPath: "/m/g2.gguf", ngl: "all", contextLen: -1, sizeBytes: 0, cacheK: "", cacheV: "" }]
+    s.runningModels = [{ modelPath: "/m/g2.gguf", draftPath: "", ngl: "all", contextLen: -1, sizeBytes: 0, cacheK: "", cacheV: "" }]
     s._ggufPath = "/m/g2.gguf"
     s._ggufBuffer = "GGUF-OK\narch=qwen35\nblock_count=65\nhead_count=40\nhead_count_kv=8\nembedding_length=5120\n"
     s._finishGguf()
     A.check("gguf/kvCacheBytes-noctx", s.runningModels[0].kvCacheBytes, -1)
 
     // GGUF-NO marker → nothing cached, entry keeps its -1 ("—") initial state
-    s.runningModels = [{ modelPath: "/m/g3.gguf", ngl: "all", contextLen: 262144, sizeBytes: 0, cacheK: "", cacheV: "", totalLayers: -1 }]
+    s.runningModels = [{ modelPath: "/m/g3.gguf", draftPath: "", ngl: "all", contextLen: 262144, sizeBytes: 0, cacheK: "", cacheV: "", totalLayers: -1 }]
     s._ggufPath = "/m/g3.gguf"
     s._ggufBuffer = "GGUF-NO\n"
     s._finishGguf()
@@ -144,7 +156,7 @@ Item {
     // KV estimate counts only full-attention layers (main / interval), and the
     // MTP share is derived from the model size.
     s._ggufCache = ({})
-    s.runningModels = [{ modelPath: "/m/g4.gguf", ngl: "all", contextLen: 96256,
+    s.runningModels = [{ modelPath: "/m/g4.gguf", draftPath: "", ngl: "all", contextLen: 96256,
       sizeBytes: 12040883104, cacheK: "q5_0", cacheV: "q4_0" }]
     s._ggufPath = "/m/g4.gguf"
     s._ggufBuffer = "GGUF-OK\narch=qwen35\nblock_count=65\nnextn_predict_layers=1\nfull_attention_interval=4\nhead_count=24\nhead_count_kv=4\nembedding_length=5120\n"
@@ -154,6 +166,17 @@ Item {
     A.check("hybrid/mtpLayers", s.runningModels[0].mtpLayers, 1)
     A.ok("hybrid/mtpSizeBytes", s.runningModels[0].mtpSizeBytes > 0)
     A.check("hybrid/kvCacheBytes", s.runningModels[0].kvCacheBytes, s._kvEstimateBytes(16, 96256, 4, 5120 / 24, 5.25, 4.5))
+
+    // ── Integration: ngl unknown (fit = on) → probe fallback in _applyGguf ───
+    s._ggufCache = ({})
+    s.runningModels = [{ modelPath: "/m/fit-model.gguf", draftPath: "", ngl: "", contextLen: 131072,
+      sizeBytes: 9200000000, cacheK: "q8_0", cacheV: "q8_0" }]
+    s._ggufPath = "/m/fit-model.gguf"
+    s.serviceVramBytes = 7500000000  // ~7 GB VRAM measured
+    s._ggufBuffer = "GGUF-OK\narch=qwen35\nblock_count=80\nhead_count=24\nhead_count_kv=8\nembedding_length=5120\n"
+    s._finishGguf()
+    A.ok("fit-model/split-from-probe", s.runningModels[0].mainGpu > 0)
+    A.ok("fit-model/source-marked", s.runningModels[0]._gpuSplitSource === "probe")
 
     A.finish()
   }

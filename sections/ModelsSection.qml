@@ -91,8 +91,17 @@ Item {
     var sizeBytes = num(m.sizeBytes)
     var draftSize = num(m.draftSizeBytes)
 
+    // Split source: "api" = explicit --n-gpu-layers from the resolved CLI,
+    // "probe" = Tier-3 estimate derived from measured per-PID VRAM.
+    var splitSource = m._gpuSplitSource || "unknown"
+    // Tier-3 live estimate (measured VRAM ÷ model size): re-derived here so a
+    // VRAM reading that lands after the GGUF header still shows without
+    // waiting for the next /v1/models poll. null = nothing to derive from.
+    var estProbe = (total > 0) ? s._estimateSplitFromProbes(sizeBytes, total, s.serviceVramBytes) : null
+
     function gb(b) { return b >= 0 ? s.formatGB(b) : "\u2014" }
     function nn(n) { return n >= 0 ? String(n) : "\u2014" }
+    function nnP(n) { return n >= 0 ? (splitSource === "probe" ? "~" : "") + String(n) : "\u2014" }
     function comma(n) {
       var d = String(Math.round(n))
       var out = ""
@@ -103,16 +112,19 @@ Item {
       return out
     }
 
-    // Per-device weight bytes: the layer-ratio split of the base weights when
-    // the offload count is known, plus the MTP share when its placement is
-    // known; otherwise the measured per-device footprint (an estimate —
-    // measured VRAM/DRAM can include KV cache). Unknown → -1 ("—").
-    var gpuExact = (gpu >= 0 && sizeBytes > 0 && total > 0)
-    var cpuExact = (cpu >= 0 && sizeBytes > 0 && total > 0)
+    // Per-device weight bytes: the exact layer-ratio split of the base weights
+    // when the offload count is known from the API, plus the MTP share when its
+    // placement is known; then the probe ratio estimate; otherwise the measured
+    // per-device footprint (an estimate — measured VRAM/DRAM can include KV
+    // cache). Unknown → -1 ("—").
+    var gpuExact = (gpu >= 0 && splitSource === "api" && sizeBytes > 0 && total > 0)
+    var cpuExact = (cpu >= 0 && splitSource === "api" && sizeBytes > 0 && total > 0)
     var gpuW = -1
     if (gpuExact) {
       gpuW = Math.round(sizeBytes * gpu / total)
       if (mtp > 0 && mtpGpu >= 0 && mtpSize > 0) gpuW += Math.round(mtpSize * mtpGpu / mtp)
+    } else if (estProbe !== null && estProbe.gpuLayers >= 0 && sizeBytes > 0) {
+      gpuW = Math.round(sizeBytes * estProbe.gpuLayers / total)
     } else if (s.serviceVramBytes >= 0) {
       gpuW = s.serviceVramBytes   // ≈ measured GPU footprint
     }
@@ -120,6 +132,8 @@ Item {
     if (cpuExact) {
       cpuW = Math.round(sizeBytes * cpu / total)
       if (mtp > 0 && mtpCpu >= 0 && mtpSize > 0) cpuW += Math.round(mtpSize * mtpCpu / mtp)
+    } else if (estProbe !== null && estProbe.cpuLayers >= 0 && sizeBytes > 0) {
+      cpuW = Math.round(sizeBytes * estProbe.cpuLayers / total)
     } else if (s.serviceMemoryBytes >= 0) {
       cpuW = s.serviceMemoryBytes   // ≈ measured DRAM working set
     }
@@ -129,14 +143,27 @@ Item {
     function gbWg(b) { return b >= 0 ? (gpuEst ? "~" : "") + s.formatGB(b) : "\u2014" }
     function gbWc(b) { return b >= 0 ? (cpuEst ? "~" : "") + s.formatGB(b) : "\u2014" }
     // Percent of the MAIN stack on each device; MTP is its own parenthetical.
-    var pGpu = s._percentLayersOnGPU(gpu, main)
-    var pCpu = s._percentLayersOnCPU(cpu, main)
+    var pGpu = -1
+    var pCpu = -1
+    var pctEst = false
+    if (main > 0 && gpu >= 0 && cpu >= 0) {
+      pGpu = s._percentLayersOnGPU(gpu, main)
+      pCpu = s._percentLayersOnCPU(cpu, main)
+      pctEst = (splitSource === "probe")
+    } else if (estProbe !== null && main > 0) {
+      // Tier-3 fallback: estimate percentage from measured VRAM.
+      pGpu = Math.round(estProbe.gpuLayers / main * 100)
+      pCpu = 100 - pGpu
+      pctEst = true
+    }
 
     // Where the context/KV cache lives: pinned to CPU with --no-kv-offload, on
-    // the GPU when any layer is offloaded, otherwise all-CPU. "" = unknown.
+    // the GPU when any layer is offloaded (exact split), from the probe
+    // estimate, otherwise all-CPU. "" = unknown.
     var ctxOn = ""
     if (m.noKvOffload === true) ctxOn = "CPU"
-    else if (gpu > 0) ctxOn = "GPU"
+    else if (gpu > 0 && splitSource !== "probe") ctxOn = "GPU"
+    else if (estProbe !== null && estProbe.ctxOn !== "") ctxOn = estProbe.ctxOn
     else if (main > 0 && cpu >= main) ctxOn = "CPU"
 
     var kvBytes = num(m.kvCacheBytes)
@@ -149,8 +176,10 @@ Item {
     var sizeLine = "Model Size: " + nn((main >= 0) ? main : total) + " layers" + root._mtpParen(mtp, mtp, mtpSize)
     sizeLine += " | " + gb(totalSize)
     lines.push(sizeLine)
-    lines.push("GPU Layers: " + nn(gpu) + root._mtpParen(mtpGpu, mtp, mtpSize) + " | " + gbWg(gpuW) + " | " + (pGpu >= 0 ? pGpu + "%" : "\u2014"))
-    lines.push("CPU Layers: " + nn(cpu) + root._mtpParen(mtpCpu, mtp, mtpSize) + " | " + gbWc(cpuW) + " | " + (pCpu >= 0 ? pCpu + "%" : "\u2014"))
+    var pctGpu = pGpu >= 0 ? (pctEst ? "~" : "") + pGpu + "%" : "\u2014"
+    var pctCpu = pCpu >= 0 ? (pctEst ? "~" : "") + pCpu + "%" : "\u2014"
+    lines.push("GPU Layers: " + nnP(gpu) + root._mtpParen(mtpGpu, mtp, mtpSize) + " | " + gbWg(gpuW) + " | " + pctGpu)
+    lines.push("CPU Layers: " + nnP(cpu) + root._mtpParen(mtpCpu, mtp, mtpSize) + " | " + gbWc(cpuW) + " | " + pctCpu)
     var ctxLine = "Context: " + (ctxLen >= 0 ? comma(ctxLen) + " tok" : "\u2014")
     if (ctxOn !== "") ctxLine += " on " + ctxOn
     lines.push(ctxLine)
