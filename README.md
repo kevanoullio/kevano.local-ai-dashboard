@@ -98,24 +98,24 @@ directories can be safely deleted without affecting the plugin.
 
 ## Model Information Retrieval — Source Ladder
 
-Every displayed per-model and per-service value is resolved through a **fixed,
-documented precedence ladder**. The engine's own API is always preferred; the
-model file comes second; measured per-PID probes and the preset fill in what
-remains. This section is the ground truth for where each number comes from and
+Every displayed per-model and per-service value is resolved through a **per-field,
+fixed precedence ladder** across five tiers. The engine's own API is always
+preferred; the model file comes second; measured probes fill in runtime state;
+derivation computes final values; and the preset serves as a last-resort
+fallback. This section is the ground truth for where each number comes from and
 whether it is exact, measured, or an estimate — the same contract is condensed
 for tooling in [AGENTS.md](AGENTS.md).
 
-### Precedence by field category
+### Tier precedence
 
-The ladder is **per-field**, not one global order: the tiers rarely compete for
-the same value, so category decides precedence.
+The ladder is **per-field**, not one global order: within a field, the first
+tier that answers wins.
 
-1. **Static / model fields** (size, layers, context, quant, dtype):
-   **API → model file (GGUF) → models.ini preset.**
-2. **Runtime / location fields** (weight bytes on a device, KV cache,
-   DRAM/VRAM footprint, CPU/GPU split):
-   **exact service-args split → measured per-PID probe → GGUF-derived estimate
-   → preset default.**
+1. **API** — `/v1/models` JSON response + resolved CLI args from `status.args`
+2. **GGUF** — bounded 16 KiB header read of the `.gguf` file
+3. **Probes** — cgroup memory.stat (DRAM) + per-PID GPU memory (VRAM)
+4. **Derivation** — pure computation from tiers 1-3 inputs
+5. **Preset** — direct `models.ini` read for values the API didn't resolve
 
 ### Marker conventions
 
@@ -123,35 +123,115 @@ the same value, so category decides precedence.
   estimation (e.g. layer ratio × size). Rendered with no prefix.
 - **`~` estimate / measured** — a GGUF-derived upper bound (KV cache), a number
   that fell back to the measured per-device footprint, a measured cgroup/GPU
-  figure, or a derived CPU/GPU percentage. Rendered with a `~` prefix.
-- **`—`** — no source answered for that field (unknown).
+  figure, a derived CPU/GPU percentage, or a derivation consuming any estimated
+  input. Rendered with a `~` prefix.
+- **`—`** — no source answered for that field (unknown). Never guess.
 
 ### llama.cpp loaded-model matrix
 
-| Field | Source (in resolution order) | Tier | Marker |
-|---|---|---|---|
-| Name / id | `GET /v1/models` → `m.id` | 1 | exact |
-| Loaded status | `/v1/models` → `status.value` (`loaded`/`unloaded`) | 1 | exact |
-| Model size | `meta.size` (loaded only) → `.gguf` file size from `ggufScript` | 1 → 2 | exact |
-| Effective context | `meta.n_ctx` (loaded); also per-slot `/slots` → `n_ctx` | 1 | exact |
-| Model-max context | GGUF `context_length`; `meta.n_ctx_train` (planned) | 2 / 1 | exact |
-| Total / main / MTP layers | GGUF `block_count`, `nextn_predict_layers`, `full_attention_interval` | 2 | exact |
-| GPU / CPU layer split | resolved `--n-gpu-layers` in `status.args` (+ totals, `"all"` = total) | 1 | exact |
-| Layer % on GPU / CPU | derived from split over the main stack | 1→2 | exact |
-| Weight bytes per device | layer-ratio split of the size | 1→2 | exact, `~` on measured fallback |
-| KV cache size | GGUF `head_count_kv` / `embedding_length` + context + `--cache-type-k/v` dtype | 2 | `~` upper bound |
-| KV cache dtype | `status.args` `--cache-type-k` / `--cache-type-v` (default `f16`) | 1 | exact |
-| KV cache placement | `--no-kv-offload` flag + offloaded layers | 1 | exact |
-| Quantization | `meta.ftype`; GGUF `general.file_type` (planned) | 1 / 2 | exact |
-| Model / draft paths | `--model` / `--model-draft` in `status.args` | 1 | exact |
-| Service DRAM | cgroup `memory.stat` `anon + shmem` (service cgroup) | 3 | measured (`~`) |
-| Service VRAM | per-PID GPU memory: `nvidia-smi --query-compute-apps=pid,used_memory` (NVIDIA) / `rocm-smi --showpids` (AMD) | 3 | measured (`~`) |
-| Service CPU / GPU split | DRAM ÷ (DRAM + VRAM) | 3 | measured (`~`) |
+| Field | Tier 1 (API) | Tier 2 (GGUF) | Tier 3 (Probes) | Tier 4 (Derivation) | Tier 5 (Preset) | Marker |
+|---|---|---|---|---|---|---|
+| Name / id | `m.id` from `/v1/models` | — | — | — | — | exact |
+| Loaded status | `status.value` (`loaded`) | — | — | — | — | exact |
+| Model size | `meta.size` | `.gguf` file stat | — | — | — | exact |
+| Context length | `meta.n_ctx` | — | — | — | — | exact |
+| Total layers | — | `block_count` | — | — | — | exact |
+| Main / MTP layers | — | `block_count` + `nextn_predict_layers` + `full_attention_interval` | — | — | — | exact |
+| GPU/CPU layer split | `--n-gpu-layers` in `status.args` | — | estimated from VRAM/~ | derived from above | explicit preset value | exact / ~ / — |
+| Layer % on GPU/CPU | — | — | — | split ÷ total | — | exact / ~ / — |
+| Weight GB per device | — | — | — | size × split ratio | — | exact / ~ / — |
+| KV cache size | — | GGUF formula (~ upper bound) | — | layers × ctx × heads × bits | — | ~ |
+| KV cache dtype | `--cache-type-k/v` in args | — | — | — | — | exact |
+| KV cache placement | `--no-kv-offload` + offload count | — | — | — | — | exact |
+| Service DRAM | — | — | cgroup `anon+shmem` | — | — | ~ |
+| Service VRAM | — | — | per-PID nvidia-smi/rocm-smi | — | — | ~ |
 
 **ollama:** no separate ladder — the engine reports everything itself. Running
 models come from `ollama ps` (per-model size + the `processor` string, e.g.
 `51%/49% CPU/GPU`); the available list comes from `ollama list` (size, modified
 date, cloud flag). All values are engine-reported and treated as exact.
+
+### Worked examples
+
+#### Example 1: `qwen3.8-27b-fast` (explicit `n-gpu-layers = all`)
+
+```ini
+[qwen3.8-27b-fast]
+model = $HOME/.lmstudio/models/.../Qwen3.8-27B-UD-IQ3_S.gguf
+n-gpu-layers = all
+cache-type-k = q5_0
+cache-type-v = q4_0
+```
+
+**Resolution:**
+- Name: Tier 1 → `m.id` from `/v1/models`
+- Size: Tier 1 → `meta.size` = 3.8 GB (exact)
+- Context: Tier 1 → `meta.n_ctx` = 131072 (exact)
+- Total layers: Tier 2 → GGUF `block_count` = 65 (exact)
+- GPU/CPU split: Tier 1 → `status.args` contains `--n-gpu-layers all` → gpu=65, cpu=0 (exact)
+- Layer %: Tier 4 → 65/65 × 100 = 100% GPU (exact)
+- Weight GB GPU: Tier 4 → 3.8 GB × 65/65 = 3.8 GB (exact)
+- Weight GB CPU: Tier 4 → 3.8 GB × 0/65 = 0 GB (exact)
+- KV dtype K/V: Tier 1 → `--cache-type-k q5_0` / `--cache-type-v q4_0` (exact, from API args)
+- KV cache size: Tier 2+4 → GGUF formula ≈ ~0.8 GB (~ upper bound)
+- KV placement: Tier 1 → gpu > 0 → GPU (exact)
+- GPU Total: Tier 4 → 3.8 GB + ~0.8 GB = ~4.6 GB
+- CPU Total: Tier 4 → 0 GB (KV on GPU, so N/A)
+
+**Displayed:**
+```
+Model Size: 65 layers | 3.8 GB
+GPU Layers: 65 | 3.8 GB | 100%
+CPU Layers: 0 | 0.0 GB | 0%
+Context: 131,072 tok on GPU
+KV Cache: ~0.8 GB (K q5_0 / V q4_0) on GPU
+GPU Total: ~4.6 GB
+CPU Total: —
+```
+
+#### Example 2: `qwen3.6-35b-a3b` (`fit = on`, no explicit `n-gpu-layers`)
+
+```ini
+[*]                    # Global defaults
+fit = on
+fit-target = 1024
+flash-attn = on
+cache-type-k = q8_0
+cache-type-v = q8_0
+
+[qwen3.6-35b-a3b]
+model = $HOME/.lmstudio/models/.../Qwen3.6-35B-A3B-UD-IQ4_XS.gguf
+# NO n-gpu-layers — relies on global fit = on
+ctx-size = 262144
+```
+
+**Resolution:**
+- Name: Tier 1 → `m.id` from `/v1/models`
+- Size: Tier 1 → `meta.size` = 9.2 GB (exact)
+- Context: Tier 1 → `meta.n_ctx` = 262144 (exact)
+- Total layers: Tier 2 → GGUF `block_count` = 80 (exact)
+- GPU/CPU split: Tier 1 → `status.args` has NO `--n-gpu-layers` (not set explicitly)
+  - Tier 3 → measured VRAM = 7.5 GB from nvidia-smi per-PID
+  - Tier 4 → estimate: gpu_layers = round(7.5 GB / 9.2 GB × 80) ≈ 65 layers (~)
+- Layer %: Tier 4 → ~65/80 × 100 ≈ ~81% GPU (~ estimated)
+- Weight GB GPU: Tier 4 → 9.2 GB × 65/80 ≈ ~7.5 GB (~)
+- Weight GB CPU: Tier 4 → 9.2 GB × 15/80 ≈ ~1.7 GB (~)
+- KV dtype K/V: Tier 1 → `--cache-type-k q8_0` / `--cache-type-v q8_0` (exact, from API args)
+- KV cache size: Tier 2+4 → GGUF formula ≈ ~1.2 GB (~ upper bound)
+- KV placement: Tier 3 probe estimate → gpu > 0 → GPU
+- GPU Total: Tier 4 → ~7.5 GB + ~1.2 GB = ~8.7 GB
+- CPU Total: Tier 4 → — (KV on GPU, so N/A)
+
+**Displayed:**
+```
+Model Size: 80 layers | 9.2 GB
+GPU Layers: ~65 | ~7.5 GB | ~81%
+CPU Layers: ~15 | ~1.7 GB | ~19%
+Context: 262,144 tok on GPU
+KV Cache: ~1.2 GB (K q8_0 / V q8_0) on GPU
+GPU Total: ~8.7 GB
+CPU Total: —
+```
 
 ### Where models.ini values actually come from
 
@@ -164,16 +244,20 @@ as the **resolved command line the service was actually launched with**:
 This is authoritative (it is exactly what the router passed to each worker) and
 is present even for **unloaded** preset models while the service runs.
 
-A direct `models.ini` read is reserved for the **service-stopped** state (Tier
-4): when the API cannot answer, it is the only way to keep listing preset
-models and their configured intent. That reader is planned, not yet built.
+A direct `models.ini` read is the **Tier 5 fallback only**: it is used when the
+API did not resolve a preset value (e.g. global defaults such as `fit = on`
+that never appear in `status.args`), and it is the **service-stopped** fallback
+(the only way to keep listing preset models and their configured intent when no
+API answers). That reader is planned, not yet built.
 
 ### Anti-patterns (do not reintroduce)
 
 - **Total-GPU VRAM as a per-model proxy** — e.g. `nvidia-smi --query-gpu=memory.used`
   or DRM `mem_info_vram_used_total`. These count every process on the GPU.
   GPU memory is attributed only by summing the **per-PID** GPU contexts of the
-  llama.cpp service processes.
+  llama.cpp service processes (`nvidia-smi --query-compute-apps=pid,used_memory`
+  / `rocm-smi --showpids`). This holds even for the Tier-3 layer-split estimate:
+  it must consume a per-PID VRAM reading, never a whole-GPU figure.
 - **`memory.current` / systemd `MemoryCurrent` for the footprint** — both
   include reclaimable page cache, i.e. the mmap'd `.gguf` pages, double-counting
   weight pages already held as anon or on the GPU. The cgroup `anon + shmem`
@@ -182,10 +266,11 @@ models and their configured intent. That reader is planned, not yet built.
   models store KV on full-attention layers only, and KV is quantized
   (`--cache-type-k/v`), so the GGUF-derived formula is an approximation by
   construction.
-- **Guessing offload from VRAM math** — device placement comes from the resolved
-  `--n-gpu-layers` (or the preset); never inferred by dividing measured VRAM.
-- **Layer counts / percentages when no explicit `--n-gpu-layers` exists** —
-  render `—`, never a guess.
+- **Guessing offload from VRAM math when a higher tier answered** — the layer
+  split prefers the resolved `--n-gpu-layers` (Tier 1) and the explicit preset
+  value (Tier 5). The measured-VRAM estimate (~, Tier 3) is used **only when
+  neither Tier 1 nor Tier 5 provides `--n-gpu-layers`**, always from a per-PID
+  reading, rounded to whole layers. When even that is unavailable, render `—`.
 
 ---
 
@@ -248,7 +333,7 @@ Displays an itemized list of all local models recognized by the selected service
 - **KV Cache:** Estimated KV cache size with dtype info (e.g., `K f16 / V f16`) and location
 - **GPU Total / CPU Total:** Combined weight + co-located KV cache per device (shown when applicable)
 
-Layer counts and percentages show "—" when the preset sets no explicit `--n-gpu-layers`; in that case the weight GB falls back to a measured "~" VRAM/DRAM estimate. The KV cache size is always an upper-bound "~" estimate from the model's GGUF header.
+When the preset sets no explicit `--n-gpu-layers`, layer counts and percentages fall back to a `~` estimate derived from measured per-PID VRAM (Tier 3 → Tier 4), and show "—" only when even that is unavailable; the weight GB follows the same split (exact layer-ratio when known, otherwise the measured "~" VRAM/DRAM footprint). The KV cache size is always an upper-bound "~" estimate from the model's GGUF header.
 
 For the full precedence ladder, the exact source of every value, and the
 anti-pattern rules, see [Model Information Retrieval — Source Ladder](#model-information-retrieval--source-ladder).
