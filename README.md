@@ -96,6 +96,99 @@ directories can be safely deleted without affecting the plugin.
 
 ---
 
+## Model Information Retrieval — Source Ladder
+
+Every displayed per-model and per-service value is resolved through a **fixed,
+documented precedence ladder**. The engine's own API is always preferred; the
+model file comes second; measured per-PID probes and the preset fill in what
+remains. This section is the ground truth for where each number comes from and
+whether it is exact, measured, or an estimate — the same contract is condensed
+for tooling in [AGENTS.md](AGENTS.md).
+
+### Precedence by field category
+
+The ladder is **per-field**, not one global order: the tiers rarely compete for
+the same value, so category decides precedence.
+
+1. **Static / model fields** (size, layers, context, quant, dtype):
+   **API → model file (GGUF) → models.ini preset.**
+2. **Runtime / location fields** (weight bytes on a device, KV cache,
+   DRAM/VRAM footprint, CPU/GPU split):
+   **exact service-args split → measured per-PID probe → GGUF-derived estimate
+   → preset default.**
+
+### Marker conventions
+
+- **Exact** — read verbatim from the API or the model file, or derived without
+  estimation (e.g. layer ratio × size). Rendered with no prefix.
+- **`~` estimate / measured** — a GGUF-derived upper bound (KV cache), a number
+  that fell back to the measured per-device footprint, a measured cgroup/GPU
+  figure, or a derived CPU/GPU percentage. Rendered with a `~` prefix.
+- **`—`** — no source answered for that field (unknown).
+
+### llama.cpp loaded-model matrix
+
+| Field | Source (in resolution order) | Tier | Marker |
+|---|---|---|---|
+| Name / id | `GET /v1/models` → `m.id` | 1 | exact |
+| Loaded status | `/v1/models` → `status.value` (`loaded`/`unloaded`) | 1 | exact |
+| Model size | `meta.size` (loaded only) → `.gguf` file size from `ggufScript` | 1 → 2 | exact |
+| Effective context | `meta.n_ctx` (loaded); also per-slot `/slots` → `n_ctx` | 1 | exact |
+| Model-max context | GGUF `context_length`; `meta.n_ctx_train` (planned) | 2 / 1 | exact |
+| Total / main / MTP layers | GGUF `block_count`, `nextn_predict_layers`, `full_attention_interval` | 2 | exact |
+| GPU / CPU layer split | resolved `--n-gpu-layers` in `status.args` (+ totals, `"all"` = total) | 1 | exact |
+| Layer % on GPU / CPU | derived from split over the main stack | 1→2 | exact |
+| Weight bytes per device | layer-ratio split of the size | 1→2 | exact, `~` on measured fallback |
+| KV cache size | GGUF `head_count_kv` / `embedding_length` + context + `--cache-type-k/v` dtype | 2 | `~` upper bound |
+| KV cache dtype | `status.args` `--cache-type-k` / `--cache-type-v` (default `f16`) | 1 | exact |
+| KV cache placement | `--no-kv-offload` flag + offloaded layers | 1 | exact |
+| Quantization | `meta.ftype`; GGUF `general.file_type` (planned) | 1 / 2 | exact |
+| Model / draft paths | `--model` / `--model-draft` in `status.args` | 1 | exact |
+| Service DRAM | cgroup `memory.stat` `anon + shmem` (service cgroup) | 3 | measured (`~`) |
+| Service VRAM | per-PID GPU memory: `nvidia-smi --query-compute-apps=pid,used_memory` (NVIDIA) / `rocm-smi --showpids` (AMD) | 3 | measured (`~`) |
+| Service CPU / GPU split | DRAM ÷ (DRAM + VRAM) | 3 | measured (`~`) |
+
+**ollama:** no separate ladder — the engine reports everything itself. Running
+models come from `ollama ps` (per-model size + the `processor` string, e.g.
+`51%/49% CPU/GPU`); the available list comes from `ollama list` (size, modified
+date, cloud flag). All values are engine-reported and treated as exact.
+
+### Where models.ini values actually come from
+
+The plugin does **not** scan `models.ini` to populate loaded-model fields, and
+it does **not** parse journald output for statistics (journald is display-only,
+for "View debug output"). Per-model values that originate in the preset —
+layer offload, KV cache type, KV offload, model/draft paths — reach the panel
+as the **resolved command line the service was actually launched with**:
+`GET /v1/models[].status.args`, parsed in `Service.qml`'s `_parseLlamaArgs()`.
+This is authoritative (it is exactly what the router passed to each worker) and
+is present even for **unloaded** preset models while the service runs.
+
+A direct `models.ini` read is reserved for the **service-stopped** state (Tier
+4): when the API cannot answer, it is the only way to keep listing preset
+models and their configured intent. That reader is planned, not yet built.
+
+### Anti-patterns (do not reintroduce)
+
+- **Total-GPU VRAM as a per-model proxy** — e.g. `nvidia-smi --query-gpu=memory.used`
+  or DRM `mem_info_vram_used_total`. These count every process on the GPU.
+  GPU memory is attributed only by summing the **per-PID** GPU contexts of the
+  llama.cpp service processes.
+- **`memory.current` / systemd `MemoryCurrent` for the footprint** — both
+  include reclaimable page cache, i.e. the mmap'd `.gguf` pages, double-counting
+  weight pages already held as anon or on the GPU. The cgroup `anon + shmem`
+  working set excludes them.
+- **KV cache shown as exact** — it is always an upper-bound `~`: hybrid-attention
+  models store KV on full-attention layers only, and KV is quantized
+  (`--cache-type-k/v`), so the GGUF-derived formula is an approximation by
+  construction.
+- **Guessing offload from VRAM math** — device placement comes from the resolved
+  `--n-gpu-layers` (or the preset); never inferred by dividing measured VRAM.
+- **Layer counts / percentages when no explicit `--n-gpu-layers` exists** —
+  render `—`, never a guess.
+
+---
+
 ## Interface Layout
 
 ### Header: Service Selector
@@ -156,6 +249,9 @@ Displays an itemized list of all local models recognized by the selected service
 - **GPU Total / CPU Total:** Combined weight + co-located KV cache per device (shown when applicable)
 
 Layer counts and percentages show "—" when the preset sets no explicit `--n-gpu-layers`; in that case the weight GB falls back to a measured "~" VRAM/DRAM estimate. The KV cache size is always an upper-bound "~" estimate from the model's GGUF header.
+
+For the full precedence ladder, the exact source of every value, and the
+anti-pattern rules, see [Model Information Retrieval — Source Ladder](#model-information-retrieval--source-ladder).
 
 **Loaded model detail (ollama):** A single-line summary showing memory footprint and CPU/GPU split: `"Memory: X.X GB | CPU: Y% | GPU: Z%"`, parsed from the engine's `processor` string.
 
