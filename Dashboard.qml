@@ -92,8 +92,24 @@ Panel {
     return false
   }
 
+  // TEMP (top-left popup bug, see latest-fix.md): open-time diagnostics to
+  // separate the injection-timing hypothesis from the screen-mapping one.
+  // Remove once the bug is reproduced and fixed.
+  function _diagPanelOpen() {
+    var p = panel
+    console.log("[local-ai-dashboard:diag] open bar=" + (bar ? ("ok pos=" + bar.position) : "null")
+      + " anchorItem=" + (anchorItem ? "set" : "null")
+      + " anchorWindow=" + (p.anchorWindow ? ("w=" + p.barW + " h=" + p.barH) : "null")
+      + " screen=" + (p.screen ? (p.screen.name + " w=" + p.screen.width + " h=" + p.screen.height) : "null")
+      + " barPos=" + p.barPos
+      + " anchorScreenPos=(" + p.anchorScreenPos.x + "," + p.anchorScreenPos.y + ")"
+      + " cardOrigin=(" + p.cardOrigin.x + "," + p.cardOrigin.y + ")")
+  }
+
   onOpenedChanged: if (opened) {
     cursorActive = false
+    _diagPanelOpen()
+    Qt.callLater(function() { _diagPanelOpen() })
     // Re-read each backend's config so dashboard-side settings (e.g. llama.cpp's
     // LLAMA_UNLOAD_INACTIVITY_SEC auto-unload timeout) picked up from the file
     // take effect on open, without requiring a service restart.

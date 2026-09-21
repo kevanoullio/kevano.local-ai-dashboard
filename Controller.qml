@@ -26,11 +26,14 @@ Item {
     active: true
     source: Qt.resolvedUrl("Dashboard.qml")
     visible: false
-    onLoaded: {
-      root.injectPanel()
-      Qt.callLater(root.injectPanel)
-    }
+    onLoaded: root.injectPanel()
   }
+
+  // The bar facade and anchor button can resolve only after the panel loads
+  // (host-side `bar` injection is async at boot), so re-inject whenever
+  // either changes instead of relying on the one-shot onLoaded pass.
+  onBarChanged: injectPanel()
+  onAnchorButtonChanged: injectPanel()
 
   function open() {
     if (panelLoader.item) panelLoader.item.open()
