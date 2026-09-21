@@ -128,6 +128,55 @@ run_e2e_phase() {
   fi
   bash "$LIB/gen_assert_bats.sh" "$CACHE/generated/e2e/e2e_dashboard_wiring.bats" "$wlog" "dashboard-wiring"
 
+  # Controller reactive-injection arc (top-left popup fix): source-pin the
+  # BarWidget/Controller/Dashboard wiring first (against the real Dashboard
+  # still in the sandbox), then live-drive the real Controller.qml against a
+  # stub panel — Dashboard's `import "sections"` folder can't resolve under
+  # quickshell -p, so its own wiring stays source-pinned like dashboard-wiring.
+  setup_e2e
+  cp "$ROOT/Controller.qml" "$ROOT/BarWidget.qml" "$E2E/plugin/"
+  wlog="$CACHE/run-e2e_popup_wiring.log"
+  : > "$wlog"
+  pw_pin() {
+    if rg -q "$3" "$2"; then
+      printf 'LAD-PASS  popup-wiring/%s\n' "$1" >> "$wlog"
+    else
+      printf 'LAD-FAIL  popup-wiring/%s  got=missing expected=%s\n' "$1" "$3" >> "$wlog"
+    fi
+  }
+  pw_pin controller-onBarChanged     "$E2E/plugin/Controller.qml" 'onBarChanged: injectPanel\(\)'
+  pw_pin controller-onAnchorButton   "$E2E/plugin/Controller.qml" 'onAnchorButtonChanged: injectPanel\(\)'
+  pw_pin controller-injects-bar      "$E2E/plugin/Controller.qml" 'panelLoader\.item\.bar = bar'
+  pw_pin controller-injects-anchor   "$E2E/plugin/Controller.qml" 'panelLoader\.item\.anchorItem = anchorButton'
+  pw_pin controller-injects-host     "$E2E/plugin/Controller.qml" 'panelLoader\.item\.hostWidget = widgetHost'
+  if rg -q 'Qt\.callLater' "$E2E/plugin/Controller.qml"; then
+    printf 'LAD-FAIL  popup-wiring/controller-no-calllater  got=Qt.callLater-present expected=absent\n' >> "$wlog"
+  else
+    printf 'LAD-PASS  popup-wiring/controller-no-calllater\n' >> "$wlog"
+  fi
+  pw_pin barwidget-onBarChanged      "$E2E/plugin/BarWidget.qml" 'onBarChanged: controller\.injectPanel\(\)'
+  pw_pin barwidget-anchorButton      "$E2E/plugin/BarWidget.qml" 'anchorButton: button'
+  pw_pin dashboard-panel-anchor      "$E2E/plugin/Dashboard.qml" 'anchorItem: root\.anchorItem'
+  pw_pin dashboard-panel-bar         "$E2E/plugin/Dashboard.qml" 'bar: root\.bar'
+  pw_pin dashboard-panel-owner       "$E2E/plugin/Dashboard.qml" 'owner: root\.hostWidget \|\| root'
+  n_pw=$(grep -c 'LAD-PASS' "$wlog" || true)
+  f_pw=$(grep -c 'LAD-FAIL' "$wlog" || true)
+  printf 'LAD-SUMMARY:%d:%d\n' $((n_pw + f_pw)) "$f_pw" >> "$wlog"
+  bash "$LIB/gen_assert_bats.sh" "$CACHE/generated/e2e/e2e_popup_wiring.bats" "$wlog" "popup-wiring"
+
+  cat > "$E2E/plugin/Dashboard.qml" <<'STUB_DASHBOARD'
+import QtQuick
+
+Item {
+  property var bar: null
+  property var anchorItem: null
+  property var hostWidget: null
+}
+STUB_DASHBOARD
+  bash "$LIB/run_qml_harness.sh" "$T/e2e_tests/e2e_controller_reinjection.qml" "$E2E/plugin/Service.qml" \
+    HOME="$E2E/home" PATH="$E2E/bin:$PATH" __mocklog="$E2E/mocklog" || true
+  bash "$LIB/gen_assert_bats.sh" "$CACHE/generated/e2e/e2e_controller_reinjection.bats" "$CACHE/run-e2e_controller_reinjection.log" "e2e_controller_reinjection"
+
   "$bats_bin" -t "$CACHE"/generated/e2e/*.bats || FAILED=$((FAILED+1))
 }
 

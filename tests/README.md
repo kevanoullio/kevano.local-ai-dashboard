@@ -79,10 +79,11 @@ tests/
 │   ├── env_writer.bats
 │   ├── provision_dryrun_create.bats
 │   └── provision_rollback_unsafe.bats
-└── e2e_tests/                      # Phase 4 — 3 sandbox harnesses
+└── e2e_tests/                      # Phase 4 — 4 sandbox harnesses
     ├── e2e_llama_lifecycle.qml
     ├── e2e_llama_rollback.qml
-    └── e2e_dashboard_confirm_wiring.qml
+    ├── e2e_dashboard_confirm_wiring.qml
+    └── e2e_controller_reinjection.qml
 ```
 
 `tests/.cache/` is scratch (ignored by git). It holds the dumped constants
@@ -202,9 +203,20 @@ with `blockAllReads: true` for synchronous file assertions.
   the signal arc propagates (`confirmProvisionRequested` → `confirmProvision`, so
   `_provisionConsented === true`; `cancelProvisionRequested` → prompt cleared).
    The Dashboard→section side of the arc is additionally pinned as a
-   source-level `rg` check emitted into its own LAD log (folder imports can't
-   resolve under `quickshell -p <file>`), so it shows up in the same generated
-   bats run as `dashboard-wiring dashboard-wiring`.
+    source-level `rg` check emitted into its own LAD log (folder imports can't
+    resolve under `quickshell -p <file>`), so it shows up in the same generated
+    bats run as `dashboard-wiring dashboard-wiring`.
+- `e2e_controller_reinjection.qml` (5 asserts): loads the real `Controller.qml`
+    from the sandbox (its Loader picks up a stub `Dashboard` panel the driver
+    plants there) and proves the top-left popup fix: `bar`/`anchorButton` set
+    AFTER the panel loads propagate to `panelLoader.item` via
+    `onBarChanged`/`onAnchorButtonChanged` — the one-shot `onLoaded` injection
+    is no longer the only path. The host-side wiring is additionally pinned as
+    source-level `rg` checks (`popup-wiring/*`): both reactive handlers, the
+    three `injectPanel()` assignments, no `Qt.callLater` left in
+    `Controller.qml` (the self-rescheduling hazard), `BarWidget`'s
+    `onBarChanged: controller.injectPanel()` + `anchorButton: button`, and the
+    Dashboard's live `anchorItem`/`bar`/`owner` bindings on its `KeyboardPanel`.
 
 ## Adding a test
 
