@@ -185,6 +185,30 @@ tier that answers wins.
   input. Rendered with a `~` prefix.
 - **`—`** — no source answered for that field (unknown). Never guess.
 
+### Executable ladder
+
+The precedence above is not duplicated across call sites. `Service.qml` owns it in
+one place: **`_resolveFieldSources(entry, p)`** walks the tiers once per field and
+returns every value tagged with the **winning Tier** (1-5) and its **render
+marker** ("", "~", "—"). `sections/ModelsSection.qml::llamaDetailBlock` and
+`_weightBytes` consume these resolved values (via **`_resolveWeights`**) instead of
+re-deriving precedence, so the golden rules are unit-testable in a single pure
+function:
+
+- **Tier 5 beats Tier 3**: a resolved `models.ini` `n-gpu-layers` (any `all`/`N`
+  token) wins over a live VRAM estimate. `_isPresetSplitToken` rejects `auto` and
+  empty values, which do not answer.
+- **Tier 1 beats Tier 5**: an explicit `--n-gpu-layers` in `status.args` beats the
+  preset.
+- **`~` when any input was `~`**: the marker propagates from an estimated split
+  (probe) through to the derived weight bytes; a derivation consuming an estimate
+  is itself rendered `~`.
+
+`**_presetSectionFor(entry)**` is the preset resolver's read side (Tier 5): the
+model's own section merged over the `[*]` globals — section keys win, globals
+chain through — matching `_applyGgufPresetSplit` semantics. The entry's
+`_gpuSplitSource` (`api`/`preset`/`probe`) records which tier answered the split.
+
 ### llama.cpp loaded-model matrix
 
 | Field | Tier 1 (API) | Tier 2 (GGUF) | Tier 3 (Probes) | Tier 4 (Derivation) | Tier 5 (Preset) | Marker |
@@ -192,9 +216,12 @@ tier that answers wins.
 | Name / id | `m.id` from `/v1/models` | — | — | — | — | exact |
 | Loaded status | `status.value` (`loaded`) | — | — | — | — | exact |
 | Model size | `meta.size` | `.gguf` file stat | — | — | — | exact |
+| Parameter count | `meta.n_params` | — | — | — | — | exact |
+| Quantization | — | `general.file_type` (GGUF header) → `_ftypeLabel` (llama.h enum, build 10729) | — | — | — | exact |
 | Context length | `meta.n_ctx` | — | — | — | — | exact |
 | Total layers | — | `block_count` | — | — | — | exact |
 | Main / MTP layers | — | `block_count` + `nextn_predict_layers` + `full_attention_interval` | — | — | — | exact |
+| Expected weight size | — | — | — | `n_params` × `_bytesPerParam(ftype)` | — | ~ |
 | GPU/CPU layer split | `--n-gpu-layers` in `status.args` | — | estimated from VRAM/~ | derived from above | explicit preset value | exact / ~ / — |
 | Layer % on GPU/CPU | — | — | — | split ÷ total | — | exact / ~ / — |
 | Weight GB per device | — | — | — | size × split ratio | — | exact / ~ / — |
@@ -224,6 +251,9 @@ cache-type-v = q4_0
 **Resolution:**
 - Name: Tier 1 → `m.id` from `/v1/models`
 - Size: Tier 1 → `meta.size` = 3.8 GB (exact)
+- Quant: Tier 2 → GGUF `general.file_type` → `iq3_s` (exact)
+- Params: Tier 1 → `meta.n_params` = 27.6B (exact)
+- Expected weight: Tier 4 → 27.6B × 0.77 = ~19.8 GB (~)
 - Context: Tier 1 → `meta.n_ctx` = 131072 (exact)
 - Total layers: Tier 2 → GGUF `block_count` = 65 (exact)
 - GPU/CPU split: Tier 1 → `status.args` contains `--n-gpu-layers all` → gpu=65, cpu=0 (exact)
@@ -238,6 +268,7 @@ cache-type-v = q4_0
 
 **Displayed:**
 ```
+Quant: iq3_s | 27.6B params | ~19.8 GB expected
 Model Size: 65 layers | 3.8 GB
 GPU Layers: 65 | 3.8 GB | 100%
 CPU Layers: 0 | 0.0 GB | 0%
@@ -266,6 +297,9 @@ ctx-size = 262144
 **Resolution:**
 - Name: Tier 1 → `m.id` from `/v1/models`
 - Size: Tier 1 → `meta.size` = 9.2 GB (exact)
+- Quant: Tier 2 → GGUF `general.file_type` → `iq4_xs` (exact)
+- Params: Tier 1 → `meta.n_params` = 30.5B (exact)
+- Expected weight: Tier 4 → 30.5B × 0.544 = ~15.5 GB (~)
 - Context: Tier 1 → `meta.n_ctx` = 262144 (exact)
 - Total layers: Tier 2 → GGUF `block_count` = 80 (exact)
 - GPU/CPU split: Tier 1 → `status.args` has NO `--n-gpu-layers` (not set explicitly)
@@ -282,6 +316,7 @@ ctx-size = 262144
 
 **Displayed:**
 ```
+Quant: iq4_xs | 30.5B params | ~15.5 GB expected
 Model Size: 80 layers | 9.2 GB
 GPU Layers: ~65 | ~7.5 GB | ~81%
 CPU Layers: ~15 | ~1.7 GB | ~19%
@@ -302,11 +337,26 @@ as the **resolved command line the service was actually launched with**:
 This is authoritative (it is exactly what the router passed to each worker) and
 is present even for **unloaded** preset models while the service runs.
 
-A direct `models.ini` read is the **Tier 5 fallback only**: it is used when the
-API did not resolve a preset value (e.g. global defaults such as `fit = on`
-that never appear in `status.args`), and it is the **service-stopped** fallback
-(the only way to keep listing preset models and their configured intent when no
-API answers). That reader is planned, not yet built.
+A direct `models.ini` read is the **Tier 5 fallback only**, used in exactly two
+cases the API cannot answer, via the bounded (16 KiB), single-flight reader
+`modelsIniScript` → `_parsePreset`:
+
+- **Global-default layer split** — values that never surface in `status.args`
+  because they came from the `[*]` block (e.g. a global `n-gpu-layers`) resolve
+  the split in `_applyGguf` before the Tier-3 estimate. The section keyed by the
+  model's **file path** wins; the `[*]` globals are the fallback; only validated
+  tokens (`all`, an integer, or `auto`) apply and land as an **exact** split
+  (source `preset`, same marker rules as `api` — no `~`). `auto` still degrades
+  to the Tier-3 probe, exactly as an unset flag does.
+- **Service-stopped available list** — with no API to answer, the preset is the
+  only way to keep listing preset models and their configured intent. Every
+  section carrying a `model =` key becomes an entry, named after the file's
+  basename, rendered with `preset intent: N GPU layers` (the section's
+  `n-gpu-layers`, or the `[*]` globals') under its name.
+
+The reader refuses symlinks/special files, reads at most 16 KiB, and is parsed
+once per session (cached); an unknown or missing preset leaves both consumers
+on their lower tiers (list stays empty, split falls back to Tier 3).
 
 ### Anti-patterns (do not reintroduce)
 
@@ -329,6 +379,12 @@ API answers). That reader is planned, not yet built.
   value (Tier 5). The measured-VRAM estimate (~, Tier 3) is used **only when
   neither Tier 1 nor Tier 5 provides `--n-gpu-layers`**, always from a per-PID
   reading, rounded to whole layers. When even that is unavailable, render `—`.
+- **Guessing quant or params from the filename or `meta.size`** — the quant is
+  an exact Tier-2 value read only from the GGUF header's `general.file_type`
+  (mapped via `_ftypeLabel`), and params are an exact Tier-1 value read only
+  from `meta.n_params`. Never derive them heuristically (file-name substrings,
+  size ratios); `meta.size` is the aggregate file size and encodes no
+  quantization. Unknown renders `—`.
 
 ### Where each tier lives in the code
 
@@ -338,7 +394,7 @@ API answers). That reader is planned, not yet built.
 | 2 (GGUF) | `ggufScript` bounded 16 KiB header read | `_queueGguf` → `ggufProcess` → `_finishGguf` → `_applyGguf` / `_applyGgufDraft` / `_applyGgufToRunning` |
 | 3 (Probes) | cgroup + GPU drivers | `serviceMemoryScript` / `serviceVramScript` → `_finishServiceMemory` / `_finishServiceVram` → `_deriveServiceTotal` |
 | 4 (Derivation) | pure computation from tiers 1-3 | `_mtpSplit`, `_percentLayersOnGPU/CPU`, `_weightBytes`, `_kvEstimateBytes`, `_estimateSplitFromProbes`, `_kvDtypeBits` |
-| 5 (Preset) | `models.ini` reader (planned: unresolved + service-stopped fallback) | `_parsePreset` (stub — not yet built) |
+| 5 (Preset) | `models.ini` bounded 16 KiB read (unresolved layer split + service-stopped list) | `modelsIniScript` → `presetProcess` → `_finishPreset` → `_parsePreset` / `_presetModels`, `_applyGgufPresetSplit` |
 | Display | `~` / `—` rendering, per-device totals | `sections/ModelsSection.qml llamaDetailBlock` |
 
 ---
@@ -400,6 +456,12 @@ Displays an itemized list of all local models recognized by the selected service
 - **GPU Layers / CPU Layers:** Per-device layer counts, weight GB, and percentage of the main stack on that device. A `(+N MTP ~X MB)` suffix appears when MTP draft layers are present.
 - **Context:** Context length with location indicator (`on GPU` or `on CPU`)
 - **KV Cache:** Estimated KV cache size with dtype info (e.g., `K f16 / V f16`) and location
+- **Quant / Params / Expected:** First row (`Quant: q4_k_m | 30.5B params | ~16.5
+  GB expected`), shown above Model Size whenever the quant (from the GGUF header's `general.file_type`,
+  Tier 2) or the param count (`meta.n_params`, Tier 1) is known. The quant and
+  params are exact — no `~`; only the trailing expected weight name (`n_params`
+  × `_bytesPerParam(ftype)`, Tier 4) is a `~` sanity check against the reported
+  file size. Each unknown shows `—`; the whole line is omitted when none are known.
 - **GPU Total / CPU Total:** Combined weight + co-located KV cache per device (shown when applicable)
 
 When the preset sets no explicit `--n-gpu-layers`, layer counts and percentages fall back to a `~` estimate derived from measured per-PID VRAM (Tier 3 → Tier 4), and show "—" only when even that is unavailable; the weight GB follows the same split (exact layer-ratio when known, otherwise the measured "~" VRAM/DRAM footprint). The KV cache size is always an upper-bound "~" estimate from the model's GGUF header.

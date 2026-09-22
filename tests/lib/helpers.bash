@@ -14,6 +14,7 @@ CR="$(lconst configScript)"
 CW="$(lconst createConfigScript)"
 UBODY="$(lconst llamaUnitBody)"
 GG="$(lconst ggufScript)"          # no-load GGUF header read
+MI="$(lconst modelsIniScript)"     # bounded models.ini preset read (Tier 5)
 UL="$(lconst unloadScriptLlama)"   # POST /models/unload
 SL="$(lconst slotsScriptLlama)"    # GET /slots?model=<id>
 

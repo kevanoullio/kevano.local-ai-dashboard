@@ -118,9 +118,10 @@ string constants. `extract_constants.sh`:
    `.cache/consts/<name>.txt`.
 
 Dumped constants: `llamaEnvDefault`, `llamaUnitBody`, `provisionLlamaScript`,
-`createEnvScript`, `configScript`, `createConfigScript`, `userUnitDir`. Every
-bats test reads these files via `lconst()`/`fab()`, so a change to `Service.qml`
-propagates automatically — there is nothing to hand-synchronize.
+`createEnvScript`, `configScript`, `createConfigScript`, `ggufScript`,
+`modelsIniScript`, `unloadScriptLlama`, `slotsScriptLlama`, `userUnitDir`.
+Every bats test reads these files via `lconst()`/`fab()`, so a change to
+`Service.qml` propagates automatically — there is nothing to hand-synchronize.
 
 ## Phase 2 — QML unit tests (`lib/run_qml_harness.sh` + `lib/asserts.js` + `unit_tests/`)
 

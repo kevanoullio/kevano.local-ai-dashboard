@@ -117,6 +117,28 @@ run_e2e_phase() {
     HOME="$E2E/home" PATH="$E2E/bin:$PATH" __mocklog="$E2E/mocklog" || true
   bash "$LIB/gen_assert_bats.sh" "$CACHE/generated/e2e/e2e_dashboard_confirm_wiring.bats" "$CACHE/run-e2e_dashboard_confirm_wiring.log" "e2e_dashboard_confirm_wiring"
 
+  setup_e2e
+  bash "$LIB/run_qml_harness.sh" "$T/e2e_tests/e2e_model_meta.qml" "$E2E/plugin/Service.qml" \
+    HOME="$E2E/home" PATH="$E2E/bin:$PATH" __mocklog="$E2E/mocklog" || true
+  bash "$LIB/gen_assert_bats.sh" "$CACHE/generated/e2e/e2e_model_meta.bats" "$CACHE/run-e2e_model_meta.log" "e2e_model_meta"
+
+  # Tier 5: models.ini preset reader — stopped list (Consumer A) + running
+  # fit=on exact split (Consumer B). The fixture is real bytes the harness reads
+  # over FileView and feeds through the bounded _onPresetLine/_finishPreset path.
+  setup_e2e
+  cat > "$E2E/plugin/models.ini" <<'EOF'
+[*]
+fit = on
+n-gpu-layers = all
+
+[/m/fit-model.gguf]
+model = /m/fit-model.gguf
+ctx-size = 131072
+EOF
+  bash "$LIB/run_qml_harness.sh" "$T/e2e_tests/e2e_preset.qml" "$E2E/plugin/Service.qml" \
+    HOME="$E2E/home" PATH="$E2E/bin:$PATH" __mocklog="$E2E/mocklog" || true
+  bash "$LIB/gen_assert_bats.sh" "$CACHE/generated/e2e/e2e_preset.bats" "$CACHE/run-e2e_preset.log" "e2e_preset"
+
   # Dashboard↔service consent arc, pinned at source level (the live button drive
   # above already proves section→service propagation; this pins the Dashboard side).
   wlog="$CACHE/run-e2e_dashboard_wiring.log"
