@@ -24,7 +24,7 @@ Item {
     var names = [
       "llamaEnvDefault", "llamaUnitBody", "provisionLlamaScript",
       "createEnvScript", "configScript", "createConfigScript",
-      "ggufScript", "unloadScriptLlama", "slotsScriptLlama"
+      "ggufScript", "modelsIniScript", "unloadScriptLlama", "slotsScriptLlama"
     ]
     for (var i = 0; i < names.length; i++) {
       console.log(">>>DUMP:" + names[i] + "<<<")

@@ -50,7 +50,12 @@ elif [[ "$url" == */v1/models* ]]; then
   # GET /v1/models → return a minimal loaded-model response for e2e tests.
   # fit-model is loaded with `fit = on`: its resolved args carry no explicit
   # --n-gpu-layers, so the layer split must come from the probe fallback.
-  echo '{"data":[{"id":"test-model","aliases":[],"tags":[],"object":"model","owned_by":"llamacpp","created":1700000000,"status":{"value":"loaded","processor":"CPU"},"meta":{"size":"1073741824","n_ctx":"131072"}},{"id":"fit-model","aliases":[],"tags":[],"object":"model","owned_by":"llamacpp","created":1700000000,"status":{"value":"loaded","processor":"CPU","args":["/usr/bin/llama-server","--model","/m/fit-model.gguf","--ctx-size","131072","--cache-type-k","q8_0","--cache-type-v","q8_0"]},"meta":{"size":"9200000000","n_ctx":"131072"}}]}'
+  # test-model carries n_params (the real llama.cpp meta block serves only
+  # vocab_type/n_vocab/n_ctx_train/n_embd/n_params/size — no ftype/quant key,
+  # and no ftype for the "—" fallback stays covered the same way). The quant
+  # is provided to e2e by the GGUF header path (general.file_type, Tier 2),
+  # not by the API.
+  echo '{"data":[{"id":"test-model","aliases":[],"tags":[],"object":"model","owned_by":"llamacpp","created":1700000000,"status":{"value":"loaded","processor":"CPU"},"meta":{"size":"1073741824","n_ctx":"131072","n_params":"30500000000"}},{"id":"fit-model","aliases":[],"tags":[],"object":"model","owned_by":"llamacpp","created":1700000000,"status":{"value":"loaded","processor":"CPU","args":["/usr/bin/llama-server","--model","/m/fit-model.gguf","--ctx-size","131072","--cache-type-k","q8_0","--cache-type-v","q8_0"]},"meta":{"size":"9200000000","n_ctx":"131072"}}]}'
 else
   # Default: 404.
   echo '{"error":"not found"}' >&2

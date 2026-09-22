@@ -49,6 +49,15 @@ Item {
   property string configHost: "127.0.0.1"
   property int configPort: 0
   property string configApiKey: ""
+  // llama.cpp only: LLAMA_MODELS_PRESET resolved from the env file. The on-disk
+  // value is an absolute path — the "$HOME/..." default token is expanded at
+  // env-write time (systemd does no var expansion inside env files). Written by
+  // _parseConfigBuffer; empty until a valid config with the key has been read.
+  property string configPresetPath: ""
+
+  // Tier 5: normalized models.ini preset path from the loaded config. Empty
+  // string = no preset → both Tier-5 consumers no-op (return to lower tiers).
+  readonly property string presetPath: configPresetPath
 
   // Strict config validation (Phase 1). configValid is false when any field in
   // the config file is malformed/unsafe; configWarning is the short human reason
@@ -364,14 +373,18 @@ elif command -v rocm-smi >/dev/null 2>&1; then
 
    // Bounded no-load GGUF header read (llama.cpp). $1 = .gguf path, $2 = cap.
    // Reads ONLY the first 16 KiB (the metadata KV section precedes the tensor
-   // table) and pulls the arch id plus the u32 keys needed for totalLayers +
-   // the KV-cache estimate. No weights are read, nothing is mmap'd past the
-   // prefix, and no model is loaded. Emits a first-line marker (GGUF-OK /
-   // GGUF-NO) then `key=value` lines. Refuses symlinks / special files.
+   // table) and pulls the arch id plus the u32 keys needed for totalLayers,
+   // the KV-cache estimate, and the quantization (general.file_type → ftype).
+   // No weights are read, nothing is mmap'd past the prefix, and no model is
+   // loaded. Emits a first-line marker (GGUF-OK / GGUF-NO) then `key=value`
+   // lines. Refuses symlinks / special files.
    readonly property string ggufScript: `
 f="$1";
 if [ ! -e "$f" ] || [ -L "$f" ] || [ ! -f "$f" ]; then echo GGUF-NO; exit 0; fi;
 sz=$(stat -c %s -- "$f" 2>/dev/null);
+{
+# Pass 1: bounded 16 KiB read for the early scalar kwargs (hyperparameters sit
+# in the first few hundred bytes; the vocab/blob metadata comes much later).
 head -c 16384 -- "$f" | od -A n -t x1 -v | awk -v SZ="$sz" '
 BEGIN { for (i = 0; i < 256; i++) HEXVAL[sprintf("%02x", i)] = i; for (i = 32; i < 127; i++) { c = sprintf("%c", i); ORD[c] = i; HEXC[sprintf("%02x", i)] = c } }
 function hexof(s,  n, i, out) { out = ""; for (i = 1; i <= length(s); i++) out = out sprintf("%02x", ORD[substr(s, i, 1)]); return out }
@@ -408,7 +421,52 @@ END {
     print NM[i] "=" u32le(kb + length(KS[i]) + 4)
   }
   if (SZ ~ /^[0-9]+$/) print "size=" SZ
-}' | head -c $2`
+}';
+# Pass 2: general.file_type is a scalar AFTER the (often MB-sized) tokenizer/
+# vocab metadata, so it is beyond any small head cap in real files. Stream the
+# file in fixed blocks (bounded, memory-flat) and print the value on first hit.
+off=16384; cap=33554432; found=0;
+while [ "$off" -lt "$cap" ] && [ "$found" -eq 0 ]; do
+  chunk=$(dd if="$f" bs=4194304 skip=$((off / 4194304)) count=1 2>/dev/null | od -A n -t x1 -v | awk '
+BEGIN { for (i = 0; i < 256; i++) HEXVAL[sprintf("%02x", i)] = i; for (i = 32; i < 127; i++) { c = sprintf("%c", i); ORD[c] = i; HEXC[sprintf("%02x", i)] = c } }
+function hexof(s,  n, i, out) { out = ""; for (i = 1; i <= length(s); i++) out = out sprintf("%02x", ORD[substr(s, i, 1)]); return out }
+function byteat(off) { return HEXVAL[substr(H, off * 2 + 1, 2)] }
+function u32le(off) { return byteat(off) + byteat(off + 1) * 256 + byteat(off + 2) * 65536 + byteat(off + 3) * 16777216 }
+function u64lehex(v,  i, out) { out = ""; for (i = 0; i < 8; i++) out = out sprintf("%02x", int(v / (256 ^ i)) % 256); return out }
+{ buf = buf $0 }
+END {
+  gsub(/[ \t\r]/, "", buf)
+  H = buf
+  p = index(H, u64lehex(17) hexof("general.file_type"))
+  if (p) {
+    kb = int((p - 1) / 2) + 8
+    if (u32le(kb + 17) == 4) print u32le(kb + 17 + 4)
+  }
+}');
+  if [ -n "$chunk" ]; then echo "file_type=$chunk"; found=1; fi
+  off=$((off + 4194304))
+done
+} | head -c "$2"`
+
+   // Tier-5 models.ini preset reader (llama.cpp). $1 = preset path, $2 = cap.
+   // Bounded read: at most $2 bytes in and $2 bytes out. Emits normalized
+   // `[section]` and `key=value` lines (comments/blanks dropped); sections are
+   // keyed by the model file path ([/abs/model.gguf]) plus the reserved [*]
+   // globals block — so the charset keeps `/`, `.`, `-`, `_` (paths) and `*`
+   // (globals). The caller's `_parseIniLines` re-reads this exact normalized
+   // form. Refuses symlinks / special files / missing files (emits nothing →
+   // both Tier-5 consumers no-op back to the lower tiers).
+   readonly property int modelsIniCap: 16384
+   readonly property string modelsIniScript: `
+f="$1";
+if [ ! -e "$f" ] || [ -L "$f" ] || [ ! -f "$f" ]; then exit 0; fi;
+head -c "$2" -- "$f" 2>/dev/null | awk '
+/^[[:space:]]*\\[/ { sec = $0; gsub(/[^a-zA-Z0-9_.\/\*-]/, "", sec); print "[" sec "]"; next }
+/^[[:space:]]*[;#]/ { next }
+/=/{ pos = index($0, "="); k = substr($0, 1, pos - 1); v = substr($0, pos + 1);
+     gsub(/[ \t\r]/, "", k); gsub(/^[ \t]+|[ \t\r]+$/, "", v);
+     if (k != "") print k "=" v; next }
+' | head -c "$2"`
 
    // Start/stop actions. Ollama runs on the SYSTEM unit, so it goes through
    // pkexec — that IS the polkit consent gate, and stays as-is. llama.cpp stop
@@ -649,6 +707,112 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
      }
    }
 
+    // llama.cpp ftype enum → human label. Table verified against the installed
+    // llama.h (build 10729); the value arrives via the GGUF header's
+    // `general.file_type` (Tier 2; the llama.cpp /v1/models meta block sends no
+    // ftype key) — so this one table is the single mapping. Compact k-quant
+    // labels match the file's actual quantization. Unknown / unsupported enum
+    // → -1 (display "—").
+    function _ftypeLabel(ftype) {
+      var s = parseInt(ftype, 10)
+      if (!isFinite(s)) return -1
+      switch (s) {
+        case 0:  return "f32"
+        case 1:  return "f16"
+        case 2:  return "q4_0"
+        case 3:  return "q4_1"
+        case 7:  return "q8_0"
+        case 8:  return "q5_0"
+        case 9:  return "q5_1"
+        case 10: return "q2_k"
+        case 11: return "q3_k_s"
+        case 12: return "q3_k_m"
+        case 13: return "q3_k_l"
+        case 14: return "q4_k_s"
+        case 15: return "q4_k_m"
+        case 16: return "q5_k_s"
+        case 17: return "q5_k_m"
+        case 18: return "q6_k"
+        case 19: return "iq2_xxs"
+        case 20: return "iq2_xs"
+        case 21: return "q2_k_s"
+        case 22: return "iq3_xs"
+        case 23: return "iq3_xxs"
+        case 24: return "iq1_s"
+        case 25: return "iq4_nl"
+        case 26: return "iq3_s"
+        case 27: return "iq3_m"
+        case 28: return "iq2_s"
+        case 29: return "iq2_m"
+        case 30: return "iq4_xs"
+        case 31: return "iq1_m"
+        case 32: return "bf16"
+        case 36: return "tq1_0"
+        case 37: return "tq2_0"
+        case 38: return "mxfp4_moe"
+        case 39: return "nvfp4"
+        default: return -1
+      }
+    }
+
+    // Bare integer count → compact count string: "N.B" (≥1e9), "N.M" (≥1e6),
+    // else the raw number. Unknown / negative → -1 (display "—"). Kept pure so
+    // the params/vocab formatting is unit-testable without a render pass.
+    function _formatCount(n) {
+      var x = parseInt(n, 10)
+      if (!isFinite(x) || x < 0) return -1
+      if (x >= 1e9) return (x / 1e9).toFixed(1) + "B"
+      if (x >= 1e6) return (x / 1e6).toFixed(1) + "M"
+      return String(x)
+    }
+
+    // Approximate per-parameter weight size (bytes) for a gguf ftype. These are
+    // the block-accounted averages (the commonly published GGML figures, rounded
+    // to 3 decimals) used ONLY to derive the "~N GB expected" sanity cross-check
+    // against the reported file size — never for exact accounting. f32/f16/bf16
+    // are exact; quantized values include block scales overhead. Unknown → -1.
+    function _bytesPerParam(ftype) {
+      var s = parseInt(ftype, 10)
+      if (!isFinite(s)) return -1
+      switch (s) {
+        case 0:  return 4.0    // f32
+        case 1:  return 2.0    // f16
+        case 2:  return 0.5625 // q4_0
+        case 3:  return 0.6875 // q4_1
+        case 7:  return 1.0625 // q8_0
+        case 8:  return 0.6875 // q5_0
+        case 9:  return 0.8125 // q5_1
+        case 10: return 0.357  // q2_k
+        case 11: return 0.417  // q3_k_s
+        case 12: return 0.437  // q3_k_m
+        case 13: return 0.466  // q3_k_l
+        case 14: return 0.489  // q4_k_s
+        case 15: return 0.541  // q4_k_m
+        case 16: return 0.623  // q5_k_s
+        case 17: return 0.695  // q5_k_m
+        case 18: return 0.822  // q6_k
+        case 19: return 0.21   // iq2_xxs
+        case 20: return 0.283  // iq2_xs
+        case 21: return 0.357  // q2_k_s
+        case 22: return 0.377  // iq3_xs
+        case 23: return 0.301  // iq3_xxs
+        case 24: return 0.191  // iq1_s
+        case 25: return 0.563  // iq4_nl
+        case 26: return 0.77   // iq3_s
+        case 27: return 0.849  // iq3_m
+        case 28: return 0.653  // iq2_s
+        case 29: return 0.776  // iq2_m
+        case 30: return 0.544  // iq4_xs
+        case 31: return 0.199  // iq1_m
+        case 32: return 2.0    // bf16
+        case 36: return 0.265  // tq1_0 (ternary, ~2.1 bits/param)
+        case 37: return 0.495  // tq2_0 (ternary, ~4.0 bits/param)
+        case 38: return 0.5    // mxfp4_moe
+        case 39: return 0.5    // nvfp4
+        default: return -1
+      }
+    }
+
     // KV-cache byte estimate (upper bound). layers = the full-attention
     // (KV-holding) layer count — round(mainLayers / full_attention_interval) for
     // hybrid models, falling back to the main/total block count — NOT raw
@@ -669,16 +833,120 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
    // GPU/CPU weight bytes for display. Prefer the exact layer-ratio split when the
    // offload count is known; otherwise fall back to the measured per-device footprint
    // (an estimate — measured VRAM/DRAM can include KV cache). Unknown → -1 ("—").
+   // Compatibility wrapper over the resolver path (its unit tests keep the
+   // positional signature) — the per-field Tier ladder lives in
+   // _resolveFieldSources/_resolveWeights below.
     function _weightBytes(sizeBytes, gpu, cpu, total, vramBytes, memBytes) {
-      var out = [-1, -1]
-      if (sizeBytes > 0 && total > 0 && gpu >= 0 && cpu >= 0) {
-        out[0] = Math.round(sizeBytes * gpu / total)
-        out[1] = Math.round(sizeBytes * cpu / total)
+      var split = (gpu >= 0 && cpu >= 0)
+        ? { tier: 1, value: { mainGpu: gpu, mainCpu: cpu }, marker: "" }
+        : { tier: null, value: null, marker: "\u2014" }
+      var w = _resolveWeights(
+        { sizeBytes: sizeBytes, totalLayers: total }, split,
+        { vramBytes: vramBytes, memBytes: memBytes, presetSection: null })
+      return [w.gpu, w.cpu]
+    }
+
+    // Split out of _weightBytes so it consumes an ALREADY-resolved split (the
+    // output of _resolveFieldSources): the exact layer-ratio split when the
+    // resolved split carries concrete layer counts, otherwise the measured
+    // per-device footprint (an estimate — measured VRAM/DRAM can include KV
+    // cache). The marker is the split's marker when the ratio path wins,
+    // "~" when the measured footprint answered, "—" when nothing answered.
+    function _resolveWeights(entry, gpuSplit, p) {
+      var e = entry || {}
+      p = p || {}
+      var out = { gpu: -1, cpu: -1, gpuMarker: "\u2014", cpuMarker: "\u2014" }
+      var total = (isFinite(e.totalLayers) && e.totalLayers > 0) ? e.totalLayers : -1
+      var split = (gpuSplit && gpuSplit.value
+        && gpuSplit.value.mainGpu != null && gpuSplit.value.mainCpu != null)
+        ? gpuSplit.value : null
+      if (e.sizeBytes > 0 && total > 0 && split) {
+        out.gpu = Math.round(e.sizeBytes * split.mainGpu / total)
+        out.cpu = Math.round(e.sizeBytes * split.mainCpu / total)
+        var mark = (gpuSplit && gpuSplit.marker === "~") ? "~" : ""
+        if (out.gpu >= 0) out.gpuMarker = mark
+        if (out.cpu >= 0) out.cpuMarker = mark
       } else {
-        if (vramBytes >= 0) out[0] = vramBytes   // ≈ measured GPU footprint
-        if (memBytes  >= 0) out[1] = memBytes    // ≈ measured DRAM working set
+        if (p.vramBytes >= 0) { out.gpu = p.vramBytes; out.gpuMarker = "~" }  // ≈ measured GPU footprint
+        if (p.memBytes  >= 0) { out.cpu = p.memBytes;  out.cpuMarker = "~" }  // ≈ measured DRAM working set
       }
       return out
+    }
+
+    // Single source of precedence for the per-field Tier ladder (golden rule #4
+    // in the README): every field below is tagged exactly once with the Tier
+    // that won (1=API, 2=GGUF, 3=probe, 4=derivation, 5=preset) and the render
+    // marker ("", "~", "—"). The display layer and callers consume this instead
+    // of re-deriving precedence, so "Tier 5 beats Tier 3", "Tier 1 beats Tier
+    // 5", and the `~`-when-any-input-was-`~` rule are unit-testable in one
+    // place. entry = a loaded-model entry; p = { vramBytes, memBytes,
+    // presetSection } (all optional). Pure — never throws, never probes.
+    function _resolveFieldSources(entry, p) {
+      var e = entry || {}
+      p = p || {}
+      var r = {}
+      // Quant row (items 1-2): params = Tier-1 meta.n_params (exact), quant =
+      // Tier-2 GGUF general.file_type (exact), expected weight = Tier-4
+      // n_params × _bytesPerParam(ftype) (the only `~` on that row).
+      r.params = e.nParams >= 0
+        ? { tier: 1, value: e.nParams, marker: "" }
+        : { tier: null, value: -1, marker: "\u2014" }
+      r.quant = e.ftype >= 0
+        ? { tier: 2, value: e.ftype, marker: "" }
+        : { tier: null, value: -1, marker: "\u2014" }
+      var expected = -1
+      if (e.ftype >= 0 && e.nParams >= 0) {
+        var ebpp = _bytesPerParam(e.ftype)
+        if (ebpp > 0) expected = Math.round(e.nParams * ebpp)
+      }
+      r.expectedWeight = expected >= 0
+        ? { tier: 4, value: expected, marker: "~" }
+        : { tier: null, value: -1, marker: "\u2014" }
+      // Total layers: Tier-2 GGUF block_count (exact).
+      r.totalLayers = e.totalLayers >= 0
+        ? { tier: 2, value: e.totalLayers, marker: "" }
+        : { tier: null, value: -1, marker: "\u2014" }
+      // GPU/CPU split: Tier 1 (api) -> Tier 5 (preset) -> Tier 3 (probe) -> "—".
+      // A stored api/preset split is authoritative; a stored probe split and an
+      // unresolved entry both take the live Tier-3 estimate so a fresh VRAM
+      // reading renders without waiting for the next /v1/models poll.
+      var ngl = String(e.ngl == null ? "" : e.ngl).trim()
+      if (ngl !== "" && e.mainGpu !== null) {
+        r.gpuSplit = { tier: e._gpuSplitSource === "probe" ? 3
+                     : e._gpuSplitSource === "preset" ? 5 : 1,
+                       value: { mainGpu: e.mainGpu, mainCpu: e.mainCpu },
+                       marker: e._gpuSplitSource === "probe" ? "~" : "" }
+      } else if (p.presetSection && _isPresetSplitToken(p.presetSection["n-gpu-layers"])) {
+        r.gpuSplit = { tier: 5, value: null, marker: "" }   // resolved in _applyGguf
+      } else if (p.vramBytes >= 0) {
+        var est = _estimateSplitFromProbes(
+          e.sizeBytes > 0 ? e.sizeBytes : 0,
+          e.totalLayers, p.vramBytes)
+        r.gpuSplit = est
+          ? { tier: 3,
+              value: { mainGpu: est.gpuLayers, mainCpu: est.cpuLayers, ctxOn: est.ctxOn },
+              marker: "~" }
+          : { tier: null, value: null, marker: "\u2014" }
+      } else {
+        r.gpuSplit = { tier: null, value: null, marker: "\u2014" }
+      }
+      // Weights follow the split; the marker stays "~" whenever any input was "~".
+      r.weightBytes = _resolveWeights(e, r.gpuSplit, p)
+      // KV cache stays a Tier-4 GGUF upper-bound (~) until item 5 lands
+      // measured, per-model values from /metrics.
+      r.kvBytes = e.kvCacheBytes >= 0
+        ? { tier: 4, value: e.kvCacheBytes, marker: "~" }
+        : { tier: null, value: -1, marker: "\u2014" }
+      r.kvDtype = { tier: 1, value: { k: e.cacheK, v: e.cacheV }, marker: "" }
+      return r
+    }
+
+    // models.ini n-gpu-layers tokens that _applyGgufPresetSplit actually
+    // resolves (all / an integer). `auto` and empty values do NOT answer, so the
+    // resolver tags Tier 5 only when a real split can come from the preset.
+    function _isPresetSplitToken(v) {
+      var s = String(v == null ? "" : v).trim()
+      return s !== "" && /^(all|[0-9]+)$/.test(s)
     }
 
     // Estimate GPU/CPU layer split from measured VRAM when ngl is unknown.
@@ -707,10 +975,216 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
       return { gpuLayers: gpuLayers, cpuLayers: cpuLayers, ctxOn: ctxOn }
     }
 
-    // Tier-5 preset fallback: bounded INI parser for the models.ini preset file.
+    // ── Tier 5: bounded models.ini preset reader ──────────────────────
+    // Single-flight read of the llama.cpp models.ini preset (only ever parsed
+    // once per session), mirroring the ggufProcess scaffold. Results feed two
+    // consumers: the service-stopped available list (Consumer A) and the
+    // global-default layer split for loaded models the API left unset
+    // (Consumer B, inside _applyGguf). Never throws; unknown/missing preset →
+    // null and both consumers fall through to the lower tiers.
+
+    property var _presetCache: null                // parsed INI or null (single read)
+    property string _presetPath: ""                // path being read (single-flight)
+    property string _presetBuffer: ""
+    readonly property int _presetBufferMax: 16384
+
+    // models.ini section keys are the model FILE paths ([/abs/model.gguf]) plus
+    // the reserved [*] globals block. Mirror the awk charset exactly so the path
+    // survives normalization and `*` is never dropped from the globals key.
+    function _iniSectionKey(raw) {
+      return String(raw == null ? "" : raw).replace(/[^a-zA-Z0-9_.\/*-]/g, "")
+    }
+
+    // Pure parser over the script's normalized output (or raw text in tests):
+    // section markers → objects (key `*` holds [*] globals), `key=value` lines
+    // merged into the current section. Comments/blanks dropped. Known-var
+    // expansion is limited to a leading `$HOME/` token (the env writer already
+    // expanded it, but a hand-edited preset may keep it).
+    function _parseIniLines(buffer) {
+      var out = {}
+      var cur = null
+      var lines = String(buffer || "").split("\n")
+      for (var i = 0; i < lines.length; i++) {
+        var line = String(lines[i]).trim()
+        if (line === "") continue
+        if (line.charAt(0) === ";" || line.charAt(0) === "#") continue
+        if (line.charAt(0) === "[") {
+          var end = line.lastIndexOf("]")
+          if (end <= 1) continue
+          var key = _iniSectionKey(line.substring(1, end))
+          if (key === "") continue
+          if (!out[key]) out[key] = {}
+          cur = out[key]
+          continue
+        }
+        var eq = line.indexOf("=")
+        if (eq <= 0) continue
+        var k = _iniSectionKey(line.substring(0, eq))
+        if (k === "") continue
+        var v = line.substring(eq + 1).trim()
+        if (v.length >= 2) {
+          var lq = v.charAt(0)
+          if ((lq === "\"" || lq === "'") && v.charAt(v.length - 1) === lq) {
+            v = v.substring(1, v.length - 1)
+          }
+        }
+        var home = Quickshell.env("HOME")
+        if (home && v.indexOf("$HOME/") === 0) v = home + v.substring(5)
+        if (cur) cur[k] = v
+      }
+      return out
+    }
+
+    // Returns the parsed preset object or null. Callers must have started the
+    // bounded read via _queuePreset(path): _finishPreset() populates the cache
+    // on read completion, so a same-refresh re-read resolves synchronously.
     function _parsePreset(path) {
-      // This would be called via a new Process that reads the preset file.
-      // Returns parsed INI data for matching against loaded model paths.
+      if (_presetCache !== null) return _presetCache
+      _queuePreset(path)
+      return _presetCache
+    }
+
+    function _onPresetLine(line) {
+      var s = String(line || "")
+      if (_presetBuffer.length + s.length + 1 <= _presetBufferMax) _presetBuffer += s + "\n"
+    }
+
+    // Start the preset read (single-flight like _queueGguf; a read already in
+    // flight or a cached result is left alone and the caller re-checks on the
+    // next refresh). Empty path (no preset configured) is a permanent no-op.
+    function _queuePreset(path) {
+      if (path === "") return
+      if (_presetCache !== null) return
+      if (_presetPath !== "" || presetProcess.running) return
+      _presetPath = path
+      _presetBuffer = ""
+      launch(presetProcess, presetWatchdog)
+    }
+
+    function _finishPreset() {
+      var raw = _presetBuffer.trim()
+      _presetBuffer = ""
+      _presetPath = ""
+      try {
+        _presetCache = _parseIniLines(raw)
+      } catch (e) {
+        _presetCache = null
+      }
+      if (_presetCache !== null) {
+        _applyPresetToRunning()
+        // Consumer A: service stopped, the preset is the only model list source.
+        if (!root.running) models = _presetModels()
+      }
+    }
+
+    // Service-stopped available list (Consumer A): every non-[*] section
+    // carrying a `model =` key becomes an entry named after the file's basename;
+    // the section's (or [*]'s) `n-gpu-layers` is shown as its preset intent.
+    // Bounded by maxModels; unknown preset → empty list (the panel just shows
+    // "no models").
+    function _presetModels() {
+      var preset = _presetCache
+      if (!preset || typeof preset !== "object") return []
+      var out = []
+      var globals = preset["*"]
+      var keys = Object.keys(preset)
+      for (var i = 0; i < keys.length && out.length < maxModels; i++) {
+        if (keys[i] === "*") continue
+        var sec = preset[keys[i]]
+        if (!sec || typeof sec !== "object") continue
+        var model = sec["model"]
+        if (model === undefined || String(model).trim() === "") continue
+        var ngl = sec["n-gpu-layers"]
+        if ((ngl === undefined || String(ngl).trim() === "") && globals) {
+          ngl = globals["n-gpu-layers"]
+        }
+        var nglStr = (ngl === undefined) ? "" : String(ngl).trim()
+        var segments = String(model).split("/")
+        var base = segments[segments.length - 1] || String(model)
+        out.push({
+          name: truncate(base || "Unknown model", 128),
+          id: truncate(String(model), 128),
+          size: "",
+          modified: "",
+          isCloud: false,
+          preset: true,
+          presetIntent: nglStr !== ""
+            ? "preset intent: " + nglStr + " GPU layers"
+            : "in preset",
+          presetPath: String(model)
+        })
+      }
+      return out
+    }
+
+    // Consumer B: resolve the layer split from the preset when the API left ngl
+    // unset (global-default presets such as `fit = on` never surface in
+    // status.args). Exact section (by model file path) wins over [*] globals.
+    // Only validated tokens (all/N/auto) apply; a resolved value lands on the
+    // entry as exact (source "preset", same tier as "api") in the display.
+    function _applyGgufPresetSplit(entry) {
+      if (!entry || entry.modelPath === "" || entry.mainGpu !== null) return false
+      if (entry.ngl !== "" && entry.ngl !== "auto") return false
+      var preset = _parsePreset(root.presetPath)
+      if (!preset || typeof preset !== "object") return false
+      var sec = preset[_iniSectionKey(entry.modelPath)]
+      var nglVal = (sec && sec["n-gpu-layers"] !== undefined)
+        ? sec["n-gpu-layers"]
+        : (preset["*"] ? preset["*"]["n-gpu-layers"] : "")
+      var s = String(nglVal == null ? "" : nglVal).trim()
+      if (s === "" || !/^(all|[0-9]+|auto)$/.test(s)) return false
+      var mtp = (isFinite(entry.mtpLayers) && entry.mtpLayers > 0) ? entry.mtpLayers : 0
+      var total = (isFinite(entry.totalLayers) && entry.totalLayers > 0)
+        ? entry.totalLayers
+        : (isFinite(entry.mainLayers) && entry.mainLayers > 0 ? entry.mainLayers + mtp : -1)
+      var split = _mtpSplit(s, total, mtp)
+      if (split.mainGpu === null) return false
+      entry.mainGpu = split.mainGpu
+      entry.mainCpu = split.mainCpu
+      entry._gpuSplitSource = "preset"
+      entry.ngl = s   // resolve the intent for display
+      return true
+    }
+
+    // Effective preset section for a loaded entry: the model's own section
+    // (keyed by model FILE path) merged over the [*] globals, so reading
+    // `n-gpu-layers` matches _applyGgufPresetSplit semantics (section wins,
+    // globals fall back). null when no preset is cached and when neither the
+    // section nor a globals block exists.
+    function _presetSectionFor(entry) {
+      var preset = _parsePreset(root.presetPath)
+      if (!preset || typeof preset !== "object") return null
+      var key = (entry && entry.modelPath) ? _iniSectionKey(entry.modelPath) : ""
+      var merged = {}
+      var globals = preset["*"]
+      if (globals && typeof globals === "object") {
+        var gks = Object.keys(globals)
+        for (var gi = 0; gi < gks.length; gi++) merged[gks[gi]] = globals[gks[gi]]
+      }
+      var sec = (key !== "" && preset[key]) ? preset[key] : null
+      if (sec && typeof sec === "object") {
+        var sks = Object.keys(sec)
+        for (var si = 0; si < sks.length; si++) merged[sks[si]] = sec[sks[si]]
+      }
+      return Object.keys(merged).length > 0 ? merged : null
+    }
+
+    // A preset that landed AFTER entries were resolved re-runs the cached-GGUF
+    // derivation so entries waiting on a mainGpu can pick up the preset split
+    // without waiting for the next refresh cycle to re-fire their own read.
+    function _applyPresetToRunning() {
+      var arr = runningModels || []
+      var changed = false
+      for (var i = 0; i < arr.length; i++) {
+        var e = arr[i]
+        if (!e || e.modelPath === "") continue
+        var g = _ggufCache[e.modelPath]
+        if (g === undefined) continue
+        var before = e.mainGpu
+        _applyGguf(e, g)
+        if (e.mainGpu !== before) changed = true
+      }
+      if (changed) runningModels = arr.slice()
     }
 
     // Resolve GGUF-dependent fields for each entry, returning a NEW array so the
@@ -1015,6 +1489,14 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
       serviceVramBytes = -1
       serviceTotalBytes = -1
       _resetIdleTracking()
+      // Tier 5 Consumer A: llama.cpp stopped, no API answers — the models.ini
+      // preset is the only model list source (sections + their configured
+      // intent). Queues the single-flight read; _finishPreset republishes the
+      // list when it lands.
+      if (backend === "llama.cpp") {
+        _queuePreset(root.presetPath)
+        models = _presetModels()
+      }
     }
   }
 
@@ -1095,6 +1577,14 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
           // is meta.n_ctx (loaded only). Keep a `context` string for compat.
           var ctxLen = parseInt(meta.n_ctx, 10)
           if (!isFinite(ctxLen) || ctxLen < 0) ctxLen = -1
+          // n_params (bare param count) is the Tier-1 exact field the llama.cpp
+          // /v1/models meta block actually serves (n_vocab/n_ctx_train exist too
+          // but are informational and unused here). The gguf ftype is NOT in the
+          // API (upstream confirmed) — it lands via _applyGguf from the GGUF
+          // header (Tier 2). Coerced to -1 when not finite/negative so the
+          // display layer's num()/"—" keeps working.
+          var nParams = parseInt(meta.n_params, 10)
+          if (!isFinite(nParams) || nParams < 0) nParams = -1
           var parsed = _parseLlamaArgs(m.status.args)
           _psModels.push({
             name: truncate(pathParts[pathParts.length - 1] || "Unknown model", 128),
@@ -1104,6 +1594,10 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
             processor: truncate(m.status.processor || m.status.backend || "CPU", 32),
             context: ctxLen > 0 ? String(ctxLen) : "",
             contextLen: ctxLen,
+            // ftype = gguf ftype enum (-1 = unknown, "—"); filled by _applyGguf
+            // from the GGUF header's general.file_type (Tier 2), not the API.
+            ftype: -1,
+            nParams: nParams,    // total params (excl. b-tensors), Tier 1
             modelPath: parsed.model,
             ngl: parsed.ngl,
             draftPath: parsed.draftPath,
@@ -1179,6 +1673,11 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
   function _applyGguf(entry, g) {
     var total = (g.bc > 0) ? g.bc : -1
     entry.totalLayers = total
+    // Quantization (gguf ftype enum → _ftypeLabel): filled from the header's
+    // general.file_type (Tier 2) only when the API hasn't answered (the
+    // llama.cpp /v1/models meta block sends no ftype, so the API never beats
+    // this in practice; the guard keeps the ladder ordering honest).
+    if (entry.ftype < 0 && isFinite(g.ft) && g.ft >= 0) entry.ftype = g.ft
     var npl = (isFinite(g.npl) && g.npl > 0) ? Math.round(g.npl) : 0
     if (entry.draftPath !== "") {
       // Separate draft: the base stack is plain main layers; the MTP count,
@@ -1201,6 +1700,10 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
       entry.mtpGpu = splitAll.mtpGpu
       entry.mtpCpu = splitAll.mtpCpu
     }
+    // Tier 5: when the API left ngl unset, resolve the split from the models.ini
+    // preset before falling back to the measured-VRAM estimate (Tier 3). A
+    // resolved value is EXACT (source "preset", tier above "probe").
+    _applyGgufPresetSplit(entry)
     // Fallback: when ngl is unknown and _mtpSplit returned nulls,
     // estimate from measured VRAM (Tier 3).
     if (entry.mainGpu === null && entry.ngl === "") {
@@ -1214,7 +1717,7 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
         entry.mainCpu = probe.cpuLayers
         entry._gpuSplitSource = "probe"
       }
-    } else {
+    } else if (entry._gpuSplitSource !== "preset" && entry._gpuSplitSource !== "probe") {
       entry._gpuSplitSource = "api"
     }
     var ctx = (isFinite(entry.contextLen) && entry.contextLen > 0) ? entry.contextLen : -1
@@ -1269,7 +1772,7 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
     _ggufBuffer = ""
     var path = _ggufPath
     _ggufPath = ""
-    var bc = -1, hc = -1, hckv = -1, embd = -1, npl = -1, fai = -1, sz = -1, ok = false
+    var bc = -1, hc = -1, hckv = -1, embd = -1, npl = -1, fai = -1, sz = -1, ft = -1, ok = false
     var lines = raw.split("\n")
     for (var i = 0; i < lines.length; i++) {
       var line = String(lines[i]).trim()
@@ -1285,10 +1788,11 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
       else if (key === "nextn_predict_layers") npl = isFinite(val) ? val : -1
       else if (key === "full_attention_interval") fai = isFinite(val) ? val : -1
       else if (key === "size") sz = isFinite(val) ? val : -1
+      else if (key === "file_type") ft = isFinite(val) ? val : -1
     }
     // Only cache a confirmed GGUF header with a usable layer count.
     if (!ok || bc < 0 || path === "") return
-    _ggufCache[path] = { bc: bc, hc: hc, hckv: hckv, embd: embd, npl: npl, fai: fai, sz: sz }
+    _ggufCache[path] = { bc: bc, hc: hc, hckv: hckv, embd: embd, npl: npl, fai: fai, sz: sz, ft: ft }
     _applyGgufToRunning(path, _ggufCache[path])
   }
 
@@ -1500,6 +2004,7 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
       configHost = "127.0.0.1"
       configPort = 0
       configApiKey = ""
+      configPresetPath = ""
       unloadInactivitySec = 0
       configValid = true
       configWarning = truncate("Refusing to read config: " + root.configPath + " is a symlink or special file.", 256)
@@ -1509,6 +2014,7 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
       configHost = "127.0.0.1"
       configPort = 0
       configApiKey = ""
+      configPresetPath = ""
       unloadInactivitySec = 0
       configValid = true
       configWarning = ""
@@ -1520,6 +2026,7 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
     var port = -1  // -1 = never set in the file = use the backend default port
     var apiKey = ""
     var unloadSec = 0  // 0 = auto-unload disabled (absent key stays disabled)
+    var presetFile = ""  // llama.cpp LLAMA_MODELS_PRESET (empty = no preset)
     var violations = []
     if (backend === "llama.cpp") {
       var envLines = body.split("\n")
@@ -1548,6 +2055,7 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
           if (!validateExtraArgs(val)) violations.push("LLAMA_EXTRA_ARGS contains unsafe characters")
         } else if (key === "LLAMA_MODELS_PRESET") {
           if (!isValidPresetPath(val)) violations.push("LLAMA_MODELS_PRESET is not a safe absolute path")
+          else presetFile = val
         } else if (key === "LLAMA_UNLOAD_INACTIVITY_SEC") {
           if (val !== "") {
             if (/^[0-9]+$/.test(val)) {
@@ -1598,6 +2106,7 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
       configHost = "127.0.0.1"
       configPort = 0
       configApiKey = ""
+      configPresetPath = ""
       unloadInactivitySec = 0
       configValid = false
       configWarning = truncate("Invalid " + root.backendDisplayName + " config: " + violations.join("; ") + ".", 256)
@@ -1606,6 +2115,7 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
     configHost = host
     configPort = port
     configApiKey = apiKey
+    configPresetPath = presetFile
     unloadInactivitySec = unloadSec
     configValid = true
     configWarning = ""
@@ -1852,6 +2362,24 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
       if (exitCode === 0) _finishGguf()
       else _ggufBuffer = ""
       _ggufPath = ""
+    }
+  }
+
+  // llama.cpp → bounded models.ini preset read (Tier 5). $1 = preset path,
+  // $2 = cap. Reads at most 16 KiB, refuses symlinks/special files; consumes
+  // the normalized [section]/key=value stream into _presetCache (single read).
+  Process {
+    id: presetProcess
+    running: false
+    command: ["timeout", "-k", "2", "" + processTimeoutSec,
+              "bash", "-c", root.modelsIniScript, "dash",
+              root._presetPath, "" + root.modelsIniCap]
+    stdout: SplitParser { onRead: function(line) { root._onPresetLine(line) } }
+    onExited: function(exitCode) {
+      presetWatchdog.stop()
+      if (exitCode === 0) _finishPreset()
+      else _presetBuffer = ""
+      _presetPath = ""
     }
   }
 
@@ -2129,6 +2657,13 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
     interval: watchdogMs
     repeat: false
     onTriggered: reap(ggufProcess, ggufWatchdog)
+  }
+
+  Timer {
+    id: presetWatchdog
+    interval: watchdogMs
+    repeat: false
+    onTriggered: reap(presetProcess, presetWatchdog)
   }
 
   Timer {

@@ -69,9 +69,11 @@ Item {
     return " (+" + Math.round(n) + " MTP ~" + root.service.formatMB(Math.round(sz * n / t)) + ")"
   }
 
-  // Render a llama.cpp loaded-model detail block in the seven-line layout:
-  // Model Size / GPU Layers / CPU Layers / Context / KV Cache / GPU Total /
-  // CPU Total. Values arrive on `modelData` (see Service.qml _finishJsonModels);
+  // Render a llama.cpp loaded-model detail block: Model Size / GPU Layers /
+  // CPU Layers / Context / KV Cache / Quant (+params +expected weight) /
+  // GPU Total / CPU Total (the Quant line appears when the quant from the GGUF
+  // header — Tier 2 — or the exact meta.n_params — Tier 1 — is known). Values
+  // arrive on `modelData` (see Service.qml _finishJsonModels/_applyGguf);
   // GGUF-dependent fields resolve asynchronously and start at -1/null, so every
   // line degrades to "—" until they land. Returns a multi-line, sanitize()-ed
   // string.
@@ -83,25 +85,31 @@ Item {
     var main = num(m.mainLayers)
     var mtp = num(m.mtpLayers)
     var mtpSize = num(m.mtpSizeBytes)
-    var gpu = num(m.mainGpu)
-    var cpu = num(m.mainCpu)
     var mtpGpu = num(m.mtpGpu)
     var mtpCpu = num(m.mtpCpu)
     var ctxLen = num(m.contextLen)
     var sizeBytes = num(m.sizeBytes)
     var draftSize = num(m.draftSizeBytes)
 
-    // Split source: "api" = explicit --n-gpu-layers from the resolved CLI,
-    // "probe" = Tier-3 estimate derived from measured per-PID VRAM.
-    var splitSource = m._gpuSplitSource || "unknown"
-    // Tier-3 live estimate (measured VRAM ÷ model size): re-derived here so a
-    // VRAM reading that lands after the GGUF header still shows without
-    // waiting for the next /v1/models poll. null = nothing to derive from.
-    var estProbe = (total > 0) ? s._estimateSplitFromProbes(sizeBytes, total, s.serviceVramBytes) : null
+    // Single source of precedence: Service.qml's _resolveFieldSources tags every
+    // field with its winning Tier (1=API / 2=GGUF / 3=probe / 4=derivation /
+    // 5=preset) and its render marker ("", "~", "—") exactly once, so the
+    // decisions below consume resolved values instead of re-deriving the ladder.
+    // A VRAM reading that lands after the GGUF header still shows as a live
+    // Tier-3 estimate (via the resolver's gpuSplit) without waiting for the
+    // next /v1/models poll — same as the old inline estProbe.
+    var r = s._resolveFieldSources(m, {
+      vramBytes: s.serviceVramBytes,
+      memBytes: s.serviceMemoryBytes,
+      presetSection: s._presetSectionFor(m)
+    })
+    var gpuSplit = r.gpuSplit
+    var gpu = gpuSplit.value ? num(gpuSplit.value.mainGpu) : -1
+    var cpu = gpuSplit.value ? num(gpuSplit.value.mainCpu) : -1
 
     function gb(b) { return b >= 0 ? s.formatGB(b) : "\u2014" }
     function nn(n) { return n >= 0 ? String(n) : "\u2014" }
-    function nnP(n) { return n >= 0 ? (splitSource === "probe" ? "~" : "") + String(n) : "\u2014" }
+    function nnP(n) { return n >= 0 ? (gpuSplit.marker === "~" ? "~" : "") + String(n) : "\u2014" }
     function comma(n) {
       var d = String(Math.round(n))
       var out = ""
@@ -112,33 +120,17 @@ Item {
       return out
     }
 
-    // Per-device weight bytes: the exact layer-ratio split of the base weights
-    // when the offload count is known from the API, plus the MTP share when its
-    // placement is known; then the probe ratio estimate; otherwise the measured
-    // per-device footprint (an estimate — measured VRAM/DRAM can include KV
-    // cache). Unknown → -1 ("—").
-    var gpuExact = (gpu >= 0 && splitSource === "api" && sizeBytes > 0 && total > 0)
-    var cpuExact = (cpu >= 0 && splitSource === "api" && sizeBytes > 0 && total > 0)
-    var gpuW = -1
-    if (gpuExact) {
-      gpuW = Math.round(sizeBytes * gpu / total)
-      if (mtp > 0 && mtpGpu >= 0 && mtpSize > 0) gpuW += Math.round(mtpSize * mtpGpu / mtp)
-    } else if (estProbe !== null && estProbe.gpuLayers >= 0 && sizeBytes > 0) {
-      gpuW = Math.round(sizeBytes * estProbe.gpuLayers / total)
-    } else if (s.serviceVramBytes >= 0) {
-      gpuW = s.serviceVramBytes   // ≈ measured GPU footprint
-    }
-    var cpuW = -1
-    if (cpuExact) {
-      cpuW = Math.round(sizeBytes * cpu / total)
-      if (mtp > 0 && mtpCpu >= 0 && mtpSize > 0) cpuW += Math.round(mtpSize * mtpCpu / mtp)
-    } else if (estProbe !== null && estProbe.cpuLayers >= 0 && sizeBytes > 0) {
-      cpuW = Math.round(sizeBytes * estProbe.cpuLayers / total)
-    } else if (s.serviceMemoryBytes >= 0) {
-      cpuW = s.serviceMemoryBytes   // ≈ measured DRAM working set
-    }
-    var gpuEst = !gpuExact || (mtp > 0 && (mtpGpu < 0 || mtpSize < 0))
-    var cpuEst = !cpuExact || (mtp > 0 && (mtpCpu < 0 || mtpSize < 0))
+    // Per-device weight bytes: from the resolver (exact layer-ratio split when
+    // the split is exact, otherwise the measured per-device footprint), plus the
+    // MTP share when its placement is known. Unknown → -1 ("—").
+    // `exact` mirrors the old gpuExact/cpuExact: an exact (api/preset) split.
+    var exact = (gpuSplit.marker === "" && gpu >= 0 && cpu >= 0 && sizeBytes > 0 && total > 0)
+    var gpuW = r.weightBytes.gpu
+    if (exact && mtp > 0 && mtpGpu >= 0 && mtpSize > 0) gpuW += Math.round(mtpSize * mtpGpu / mtp)
+    var cpuW = r.weightBytes.cpu
+    if (exact && mtp > 0 && mtpCpu >= 0 && mtpSize > 0) cpuW += Math.round(mtpSize * mtpCpu / mtp)
+    var gpuEst = r.weightBytes.gpuMarker === "~" || (exact && mtp > 0 && (mtpGpu < 0 || mtpSize < 0))
+    var cpuEst = r.weightBytes.cpuMarker === "~" || (exact && mtp > 0 && (mtpCpu < 0 || mtpSize < 0))
 
     function gbWg(b) { return b >= 0 ? (gpuEst ? "~" : "") + s.formatGB(b) : "\u2014" }
     function gbWc(b) { return b >= 0 ? (cpuEst ? "~" : "") + s.formatGB(b) : "\u2014" }
@@ -149,12 +141,7 @@ Item {
     if (main > 0 && gpu >= 0 && cpu >= 0) {
       pGpu = s._percentLayersOnGPU(gpu, main)
       pCpu = s._percentLayersOnCPU(cpu, main)
-      pctEst = (splitSource === "probe")
-    } else if (estProbe !== null && main > 0) {
-      // Tier-3 fallback: estimate percentage from measured VRAM.
-      pGpu = Math.round(estProbe.gpuLayers / main * 100)
-      pCpu = 100 - pGpu
-      pctEst = true
+      pctEst = (gpuSplit.marker === "~")
     }
 
     // Where the context/KV cache lives: pinned to CPU with --no-kv-offload, on
@@ -162,13 +149,27 @@ Item {
     // estimate, otherwise all-CPU. "" = unknown.
     var ctxOn = ""
     if (m.noKvOffload === true) ctxOn = "CPU"
-    else if (gpu > 0 && splitSource !== "probe") ctxOn = "GPU"
-    else if (estProbe !== null && estProbe.ctxOn !== "") ctxOn = estProbe.ctxOn
+    else if (gpu > 0 && gpuSplit.marker === "") ctxOn = "GPU"
+    else if (gpuSplit.value && gpuSplit.value.ctxOn !== undefined && gpuSplit.value.ctxOn !== "") ctxOn = gpuSplit.value.ctxOn
     else if (main > 0 && cpu >= main) ctxOn = "CPU"
 
     var kvBytes = num(m.kvCacheBytes)
 
     var lines = []
+    // Quant label (gguf ftype enum from the GGUF header's general.file_type —
+    // Tier 2, exact), param count (meta.n_params — Tier 1, exact), and the
+    // derived expected weight size (~n_params × bytes-per-param — the only `~`
+    // on this line, a sanity cross-check against the reported file size).
+    // Each unknown renders "—"; the line is dropped when both quant and params
+    // are unknown. Rendered first, above Model Size.
+    if (r.params.value >= 0 || r.quant.value >= 0) {
+      var qLabel = (r.quant.value >= 0) ? s._ftypeLabel(r.quant.value) : -1
+      var pCount  = (r.params.value >= 0) ? s._formatCount(r.params.value) : -1
+      var q = (typeof qLabel === "string") ? qLabel : "\u2014"
+      var p = (typeof pCount  === "string") ? pCount  : "\u2014"
+      lines.push("Quant: " + q + " | " + p + " params"
+        + (r.expectedWeight.value >= 0 ? " | ~" + s.formatGB(r.expectedWeight.value) + " expected" : ""))
+    }
     // Model Size shows the main-stack layer count; the MTP suffix renders only
     // when MTP layers are present (non-MTP models unchanged). The byte total is
     // base + draft file size for separate-draft models.
@@ -412,7 +413,8 @@ Item {
                     var parts = []
                     if (modelData.isCloud) parts.push("Cloud")
                     else if (modelData.size) parts.push("Model size: " + String(modelData.size))
-                    if (modelData.modified) parts.push("Downloaded: " + String(modelData.modified))
+                    if (modelData.presetIntent) parts.push(String(modelData.presetIntent))
+                    else if (modelData.modified) parts.push("Downloaded: " + String(modelData.modified))
                     return root.service.sanitize(parts.join(" | "))
                   }
                   visible: text !== ""
