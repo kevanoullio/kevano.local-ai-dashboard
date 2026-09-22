@@ -6,6 +6,13 @@ It provides a unified interface for various local backends—including `ollama` 
 
 This project is an extended derivative work based on `omarchy-ollama-status` by LinuxGamerUK.
 
+> **For contributors and AI tooling:** this README is the authoritative contract for
+> modifying the plugin — no separate `AGENTS.md` is maintained. It covers the
+> [Source Ladder](#model-information-retrieval--source-ladder) (field precedence and
+> anti-patterns), the [Testing contract](#testing), [Development Conventions](#development-conventions),
+> and the [Contributing](#contributing) branch flow. Keep all guidance consolidated;
+> never contradict it.
+
 ---
 
 ## Plugin Identification
@@ -83,6 +90,56 @@ BATS files) and is git-ignored — it is regenerated on every run. `scratch/`
 contains local discovery notes from development and is also git-ignored; both
 directories can be safely deleted without affecting the plugin.
 
+**Contract:** every new source or field must (1) extend the Source Ladder matrix
+and this README (the [anti-pattern list](#anti-patterns-do-not-reintroduce)
+included), and (2) ship tests following the existing patterns:
+
+- Pure derivation helpers → unit harness `tests/unit_tests/tst_derivation.qml`.
+- GGUF / file parsing → generated fixture `tests/integration_tests/gguf_header.bats`
+  (the `gen_gguf` python fixture is the single source of truth for the binary layout).
+- Scripts embedded in `Service.qml` are dumped at run time
+  (`tests/lib/extract_constants.sh`) — edit only the QML constant, never a duplicate.
+
+---
+
+## Contributing
+
+Public changes are welcome. This repository uses a **staging → main** release
+pipeline; `main` is the production branch and the repository's default (it is
+also what `omarchy plugin add` / `git clone` pull, so unreleased work never
+reaches installers). The flow:
+
+1. **PR to `main`:** fork from `main` and open a pull request against `main`
+   (not `staging`), so the diff is clean relative to production. Describe the
+   change, and run `bash tests/run_all.sh` before submitting.
+2. **Maintainer review & integration:** accepted PRs are **retargeted to
+   `staging`** before merging — `staging` merges only via a pull request and is
+   where all post-merge testing happens. If staging has conflicting unreleased
+   work, the change may instead be integrated through an internal PR based on
+   the current `staging`.
+3. **Release:** once staging is stable, a local `git release` fast-forward
+   merges `staging` into `main`, tags the new version (`vX.Y.Z`), and pushes
+   both `main` and the tag. `main` never advances except by that fast-forward.
+
+Branch roles:
+
+- **`main`** — production / default. What installers receive. Fast-forward only.
+- **`staging`** — integration / release-candidate mirror of `main` plus
+  unreleased changes. PR-only merges.
+
+---
+
+## Development Conventions
+
+Rules for anyone (human or agent) modifying the code:
+
+- **QML + JS only** (no TypeScript).
+- **Embedded bash scripts are constants with positional args only** — user data
+  is never concatenated into them; API keys travel only in the child process
+  environment or curl stdin (`curl -K -`), never in argv or on disk.
+- **Every probe is bounded:** `timeout -k 2 N` + `head -c` output caps (`cap*`
+  constants) + a QML watchdog timer.
+
 ---
 
 ## Features & Architecture
@@ -103,8 +160,9 @@ fixed precedence ladder** across five tiers. The engine's own API is always
 preferred; the model file comes second; measured probes fill in runtime state;
 derivation computes final values; and the preset serves as a last-resort
 fallback. This section is the ground truth for where each number comes from and
-whether it is exact, measured, or an estimate — the same contract is condensed
-for tooling in [AGENTS.md](AGENTS.md).
+whether it is exact, measured, or an estimate — the source of every value, how it
+is resolved in code, and the rules for extending it are all documented in this
+README (no separate tooling file is maintained).
 
 ### Tier precedence
 
@@ -271,6 +329,17 @@ API answers). That reader is planned, not yet built.
   value (Tier 5). The measured-VRAM estimate (~, Tier 3) is used **only when
   neither Tier 1 nor Tier 5 provides `--n-gpu-layers`**, always from a per-PID
   reading, rounded to whole layers. When even that is unavailable, render `—`.
+
+### Where each tier lives in the code
+
+| Tier | Source | Code (Service.qml unless noted) |
+|---|---|---|
+| 1 (API) | `/v1/models`, `/slots` | `_finishJsonModels`, `_parseLlamaArgs`, `_finishSlots` |
+| 2 (GGUF) | `ggufScript` bounded 16 KiB header read | `_queueGguf` → `ggufProcess` → `_finishGguf` → `_applyGguf` / `_applyGgufDraft` / `_applyGgufToRunning` |
+| 3 (Probes) | cgroup + GPU drivers | `serviceMemoryScript` / `serviceVramScript` → `_finishServiceMemory` / `_finishServiceVram` → `_deriveServiceTotal` |
+| 4 (Derivation) | pure computation from tiers 1-3 | `_mtpSplit`, `_percentLayersOnGPU/CPU`, `_weightBytes`, `_kvEstimateBytes`, `_estimateSplitFromProbes`, `_kvDtypeBits` |
+| 5 (Preset) | `models.ini` reader (planned: unresolved + service-stopped fallback) | `_parsePreset` (stub — not yet built) |
+| Display | `~` / `—` rendering, per-device totals | `sections/ModelsSection.qml llamaDetailBlock` |
 
 ---
 
