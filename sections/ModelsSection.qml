@@ -55,25 +55,12 @@ Item {
     return root.service.sanitize(parts.join(" | "))
   }
 
-  // "(+N MTP ~X MB)" suffix for a layer line: the MTP layers sitting on this
-  // device (nOnDevice of mtpTotalLayers), sized proportionally to the MTP
-  // weight size so a partial split prints its share. "" when there are no MTP
-  // layers on this device or the size is unknown (non-MTP models unchanged).
-  function _mtpParen(nOnDevice, mtpTotalLayers, mtpSizeBytes) {
-    var n = Number(nOnDevice)
-    var t = Number(mtpTotalLayers)
-    var sz = Number(mtpSizeBytes)
-    if (!isFinite(n) || n <= 0) return ""
-    if (!isFinite(t) || t <= 0) return ""
-    if (!isFinite(sz) || sz < 0) return ""
-    return " (+" + Math.round(n) + " MTP ~" + root.service.formatMB(Math.round(sz * n / t)) + ")"
-  }
-
   // Render a llama.cpp loaded-model detail block: Model Size / GPU Layers /
-  // CPU Layers / Context / KV Cache / Quant (+params +expected weight) /
-  // GPU Total / CPU Total (the Quant line appears when the quant from the GGUF
-  // header — Tier 2 — or the exact meta.n_params — Tier 1 — is known). Values
-  // arrive on `modelData` (see Service.qml _finishJsonModels/_applyGguf);
+  // CPU Layers / Draft (only when MTP layers are present) / Context / KV Cache
+  // / Quant (+params +expected weight) / GPU Total / CPU Total (the Quant line
+  // appears when the quant from the GGUF header — Tier 2 — or the exact
+  // meta.n_params — Tier 1 — is known). Values arrive on `modelData` (see
+  // Service.qml _finishJsonModels/_applyGguf);
   // GGUF-dependent fields resolve asynchronously and start at -1/null, so every
   // line degrades to "—" until they land. Returns a multi-line, sanitize()-ed
   // string.
@@ -120,21 +107,22 @@ Item {
       return out
     }
 
-    // Per-device weight bytes: from the resolver (exact layer-ratio split when
-    // the split is exact, otherwise the measured per-device footprint), plus the
-    // MTP share when its placement is known. Unknown → -1 ("—").
-    // `exact` mirrors the old gpuExact/cpuExact: an exact (api/preset) split.
-    var exact = (gpuSplit.marker === "" && gpu >= 0 && cpu >= 0 && sizeBytes > 0 && total > 0)
-    var gpuW = r.weightBytes.gpu
-    if (exact && mtp > 0 && mtpGpu >= 0 && mtpSize > 0) gpuW += Math.round(mtpSize * mtpGpu / mtp)
-    var cpuW = r.weightBytes.cpu
-    if (exact && mtp > 0 && mtpCpu >= 0 && mtpSize > 0) cpuW += Math.round(mtpSize * mtpCpu / mtp)
-    var gpuEst = r.weightBytes.gpuMarker === "~" || (exact && mtp > 0 && (mtpGpu < 0 || mtpSize < 0))
-    var cpuEst = r.weightBytes.cpuMarker === "~" || (exact && mtp > 0 && (mtpCpu < 0 || mtpSize < 0))
+    // Core-only per-device weight bytes — what the layer lines show.
+    var coreGpuW = r.weightBytes.gpu
+    var coreCpuW = r.weightBytes.cpu
+    // Combined per-device weights (core + draft/MTP share) — what the totals show.
+    var gpuW = coreGpuW
+    if (coreGpuW >= 0 && mtp > 0 && mtpGpu >= 0 && mtpSize > 0)
+      gpuW += Math.round(mtpSize * mtpGpu / mtp)
+    var cpuW = coreCpuW
+    if (coreCpuW >= 0 && mtp > 0 && mtpCpu >= 0 && mtpSize > 0)
+      cpuW += Math.round(mtpSize * mtpCpu / mtp)
+    var gpuEst = r.weightBytes.gpuMarker === "~"
+    var cpuEst = r.weightBytes.cpuMarker === "~"
 
     function gbWg(b) { return b >= 0 ? (gpuEst ? "~" : "") + s.formatGB(b) : "\u2014" }
     function gbWc(b) { return b >= 0 ? (cpuEst ? "~" : "") + s.formatGB(b) : "\u2014" }
-    // Percent of the MAIN stack on each device; MTP is its own parenthetical.
+    // Percent of the MAIN stack on each device; MTP/draft get their own Draft row.
     var pGpu = -1
     var pCpu = -1
     var pctEst = false
@@ -170,17 +158,35 @@ Item {
       lines.push("Quant: " + q + " | " + p + " params"
         + (r.expectedWeight.value >= 0 ? " | ~" + s.formatGB(r.expectedWeight.value) + " expected" : ""))
     }
-    // Model Size shows the main-stack layer count; the MTP suffix renders only
-    // when MTP layers are present (non-MTP models unchanged). The byte total is
-    // base + draft file size for separate-draft models.
-    var totalSize = (sizeBytes >= 0) ? sizeBytes + (draftSize > 0 ? draftSize : 0) : -1
-    var sizeLine = "Model Size: " + nn((main >= 0) ? main : total) + " layers" + root._mtpParen(mtp, mtp, mtpSize)
-    sizeLine += " | " + gb(totalSize)
-    lines.push(sizeLine)
+    // Model Size shows the main-stack layer count and CORE-only bytes (base
+    // minus built-in MTP; base file for separate draft) so it doesn't overlap
+    // the Draft row below.
+    var coreSize = -1
+    if (sizeBytes >= 0) {
+      if (draftSize > 0)                       coreSize = sizeBytes                       // separate draft: base file is pure main
+      else if (mtp > 0 && mtpSize > 0)        coreSize = Math.max(0, sizeBytes - mtpSize) // built-in MTP in one file
+      else                                    coreSize = sizeBytes
+    }
+    lines.push("Model Size: " + nn((main >= 0) ? main : total) + " layers | " + gb(coreSize))
     var pctGpu = pGpu >= 0 ? (pctEst ? "~" : "") + pGpu + "%" : "\u2014"
     var pctCpu = pCpu >= 0 ? (pctEst ? "~" : "") + pCpu + "%" : "\u2014"
-    lines.push("GPU Layers: " + nnP(gpu) + root._mtpParen(mtpGpu, mtp, mtpSize) + " | " + gbWg(gpuW) + " | " + pctGpu)
-    lines.push("CPU Layers: " + nnP(cpu) + root._mtpParen(mtpCpu, mtp, mtpSize) + " | " + gbWc(cpuW) + " | " + pctCpu)
+    lines.push("GPU Layers: " + nnP(gpu) + " | " + gbWg(coreGpuW) + " | " + pctGpu)
+    lines.push("CPU Layers: " + nnP(cpu) + " | " + gbWc(coreCpuW) + " | " + pctCpu)
+    if (mtp > 0) {
+      var spec  = String(m.specType || "").trim()
+      var dType = (spec !== "") ? spec : "mtp"
+      var dSize = (mtpSize > 0) ? mtpSize : ((draftSize > 0) ? draftSize : -1)
+      var dOn   = ""
+      if (mtpGpu >= 0 && mtpCpu >= 0) {
+        if (mtpGpu >= mtp && mtpCpu === 0)       dOn = "on GPU"
+        else if (mtpCpu >= mtp && mtpGpu === 0) dOn = "on CPU"
+        else if (mtpGpu > 0 && mtpCpu > 0)      dOn = "on GPU/CPU"
+        else if (mtpGpu > 0)                    dOn = "on GPU"
+        else if (mtpCpu > 0)                   dOn = "on CPU"
+      }
+      var dLayers = (mtp === 1) ? "1 layer" : mtp + " layers"
+      lines.push("Draft: " + dType + " | " + dLayers + " | " + gb(dSize) + (dOn !== "" ? " " + dOn : ""))
+    }
     var ctxLine = "Context: " + (ctxLen >= 0 ? comma(ctxLen) + " tok" : "\u2014")
     if (ctxOn !== "") ctxLine += " on " + ctxOn
     lines.push(ctxLine)
@@ -190,12 +196,16 @@ Item {
     }
     if (ctxOn !== "") kvLine += " on " + ctxOn
     lines.push(kvLine)
-    // Weights-on-device + KV when the cache is colocated there; "—" otherwise.
+    // Per-device totals: the combined weights always show when known (including
+    // 0.0 GB for a fully-empty-but-known device), and KV is added only when the
+    // cache is colocated on that device. A split model therefore shows its CPU
+    // weight bytes even though the KV cache is on GPU.
     var gpuTotal = -1
-    if (gpuW >= 0 && kvBytes >= 0 && ctxOn === "GPU") gpuTotal = gpuW + kvBytes
+    if (gpuW >= 0) { gpuTotal = gpuW; if (kvBytes > 0 && ctxOn === "GPU") gpuTotal += kvBytes }
     lines.push("GPU Total: " + (gpuTotal >= 0 ? "~" + s.formatGB(gpuTotal) : "\u2014"))
+
     var cpuTotal = -1
-    if (cpuW >= 0 && kvBytes >= 0 && ctxOn === "CPU") cpuTotal = cpuW + kvBytes
+    if (cpuW >= 0) { cpuTotal = cpuW; if (kvBytes > 0 && ctxOn === "CPU") cpuTotal += kvBytes }
     lines.push("CPU Total: " + (cpuTotal >= 0 ? "~" + s.formatGB(cpuTotal) : "\u2014"))
 
     return s.sanitize(lines.join("\n"))
