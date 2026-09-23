@@ -139,6 +139,14 @@ EOF
     HOME="$E2E/home" PATH="$E2E/bin:$PATH" __mocklog="$E2E/mocklog" || true
   bash "$LIB/gen_assert_bats.sh" "$CACHE/generated/e2e/e2e_preset.bats" "$CACHE/run-e2e_preset.log" "e2e_preset"
 
+  # MTP/draft detail block: built-in MTP (real _finishGguf fold), separate
+  # --model-draft, and the split-totals fix — CPU Total shows its weight bytes
+  # even when the KV cache is colocated on GPU.
+  setup_e2e
+  bash "$LIB/run_qml_harness.sh" "$T/e2e_tests/e2e_mtp_draft.qml" "$E2E/plugin/Service.qml" \
+    HOME="$E2E/home" PATH="$E2E/bin:$PATH" __mocklog="$E2E/mocklog" || true
+  bash "$LIB/gen_assert_bats.sh" "$CACHE/generated/e2e/e2e_mtp_draft.bats" "$CACHE/run-e2e_mtp_draft.log" "e2e_mtp_draft"
+
   # Dashboard↔service consent arc, pinned at source level (the live button drive
   # above already proves section→service propagation; this pins the Dashboard side).
   wlog="$CACHE/run-e2e_dashboard_wiring.log"
