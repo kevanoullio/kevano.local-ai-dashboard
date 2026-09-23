@@ -180,9 +180,6 @@ Item {
     A.check("rs/params-marker", rr.params.marker, "")
     A.check("rs/quant-tier", rr.quant.tier, 2)
     A.check("rs/quant-value", rr.quant.value, 15)
-    A.check("rs/expected-tier", rr.expectedWeight.tier, 4)
-    A.check("rs/expected-value", rr.expectedWeight.value, Math.round(1000 * s._bytesPerParam(15)))
-    A.check("rs/expected-marker", rr.expectedWeight.marker, "~")
     A.check("rs/layers-tier", rr.totalLayers.tier, 2)
     A.check("rs/layers-value", rr.totalLayers.value, 65)
     A.check("rs/kv-tier", rr.kvBytes.tier, 4)
@@ -195,7 +192,6 @@ Item {
     rr = s._resolveFieldSources({}, {})
     A.ok("rs/empty-split-tier-null", rr.gpuSplit.tier === null)
     A.check("rs/empty-params", rr.params.value, -1)
-    A.check("rs/empty-expected", rr.expectedWeight.value, -1)
     A.check("rs/empty-weights", rr.weightBytes.gpu, -1)
 
     // _presetSectionFor: [*] globals merged, section wins on explicit keys,
@@ -365,17 +361,6 @@ Item {
     s._finishGguf()
     A.check("gguf/header-file-type-parsed", s._ggufCache["/m/qwen3-30b.gguf"].ft, 15)
     A.check("gguf/entry-ftype-from-header", s.runningModels[0].ftype, 15)
-
-    // ── _bytesPerParam: theoretical weight bytes per param for expected-size ─
-    A.check("bpp/q4_k_m", s._bytesPerParam(15), 0.541)
-    A.check("bpp/f16", s._bytesPerParam(1), 2.0)
-    A.check("bpp/q8_0", s._bytesPerParam(7), 1.0625)
-    A.check("bpp/bf16", s._bytesPerParam(32), 2.0)
-    A.check("bpp/string", s._bytesPerParam("15"), 0.541)
-    A.check("bpp/unknown", s._bytesPerParam(6), -1)
-    A.check("bpp/gap", s._bytesPerParam(33), -1)
-    A.check("bpp/nan", s._bytesPerParam(NaN), -1)
-    A.check("bpp/null", s._bytesPerParam(null), -1)
 
     // ── Tier 5: models.ini preset reader ────────────────────────────────
     // _iniSectionKey mirrors the script's charset exactly: model FILE paths

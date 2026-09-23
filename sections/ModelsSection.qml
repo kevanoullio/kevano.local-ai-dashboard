@@ -57,7 +57,7 @@ Item {
 
   // Render a llama.cpp loaded-model detail block: Model Size / GPU Layers /
   // CPU Layers / Draft (only when MTP layers are present) / Context / KV Cache
-  // / Quant (+params +expected weight) / GPU Total / CPU Total (the Quant line
+   // / Quant (+params) / GPU Total / CPU Total (the Quant line
   // appears when the quant from the GGUF header — Tier 2 — or the exact
   // meta.n_params — Tier 1 — is known). Values arrive on `modelData` (see
   // Service.qml _finishJsonModels/_applyGguf);
@@ -145,18 +145,15 @@ Item {
 
     var lines = []
     // Quant label (gguf ftype enum from the GGUF header's general.file_type —
-    // Tier 2, exact), param count (meta.n_params — Tier 1, exact), and the
-    // derived expected weight size (~n_params × bytes-per-param — the only `~`
-    // on this line, a sanity cross-check against the reported file size).
-    // Each unknown renders "—"; the line is dropped when both quant and params
-    // are unknown. Rendered first, above Model Size.
+    // Tier 2, exact) and param count (meta.n_params — Tier 1, exact). Each
+    // unknown renders "—"; the line is dropped when both quant and params are
+    // unknown. Rendered first, above Model Size.
     if (r.params.value >= 0 || r.quant.value >= 0) {
       var qLabel = (r.quant.value >= 0) ? s._ftypeLabel(r.quant.value) : -1
       var pCount  = (r.params.value >= 0) ? s._formatCount(r.params.value) : -1
       var q = (typeof qLabel === "string") ? qLabel : "\u2014"
       var p = (typeof pCount  === "string") ? pCount  : "\u2014"
-      lines.push("Quant: " + q + " | " + p + " params"
-        + (r.expectedWeight.value >= 0 ? " | ~" + s.formatGB(r.expectedWeight.value) + " expected" : ""))
+      lines.push("Quant: " + q + " | " + p + " params")
     }
     // Model Size shows the main-stack layer count and CORE-only bytes (base
     // minus built-in MTP; base file for separate draft) so it doesn't overlap
