@@ -2,13 +2,13 @@ import QtQuick
 import Quickshell
 import "asserts.js" as A
 
-// E2E: the Quant / params / expected-weight detail line. llama.cpp's /v1/models
+// E2E: the Quant / params detail line. llama.cpp's /v1/models
 // meta block serves n_params but NOT the quant (upstream), so the harness feeds
 // the real Service the mock-fixture response (tests/lib/mocks/curl), then drives
 // the quant through the real GGUF header path (general.file_type, Tier 2): the
 // header is buffered and _finishGguf() folds file_type into the running entry.
 // The rendered real ModelsSection.llamaDetailBlock() must show the exact line
-// "Quant: q4_k_m | 30.5B params | ~<expected> expected" — no `~` on quant/params,
+// "Quant: q4_k_m | 30.5B params" — no `~` on quant/params,
 // and no Quant line at all when neither quant nor params is known.
 Item {
   id: root
@@ -71,16 +71,12 @@ Item {
     var d1 = sec.llamaDetailBlock(testEntry)
     var d2 = sec.llamaDetailBlock(s.runningModels[1])
 
-    var expBytes = Math.round(testEntry.nParams * s._bytesPerParam(testEntry.ftype))
-    var wantLine = "Quant: q4_k_m | 30.5B params | ~" + s.formatGB(expBytes) + " expected"
+    var wantLine = "Quant: q4_k_m | 30.5B params"
     A.ok("meta-e2e/quant-line-exact", quantLineOf(d1) === wantLine)
     A.ok("meta-e2e/quant-line-present", quantLineOf(d1) !== "")
     // The Quant row is rendered FIRST, above the Model Size row.
     A.ok("meta-e2e/quant-first-line", String(d1).split("\n")[0].indexOf("Quant:") === 0)
     A.ok("meta-e2e/size-below-quant", String(d1).split("\n")[1].indexOf("Model Size:") === 0)
-    // Only the expected-weight segment carries the estimate marker.
-    var stripped = quantLineOf(d1).split("| ~")[0]
-    A.ok("meta-e2e/quant-params-no-tilde", stripped.indexOf("~") === -1)
     // fit-model: no n_params and never got a header → whole line omitted.
     A.ok("meta-e2e/unknown-omits-quant", quantLineOf(d2) === "")
 

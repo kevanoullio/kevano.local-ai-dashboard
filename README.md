@@ -221,7 +221,6 @@ chain through — matching `_applyGgufPresetSplit` semantics. The entry's
 | Context length | `meta.n_ctx` | — | — | — | — | exact |
 | Total layers | — | `block_count` | — | — | — | exact |
 | Main / MTP layers | — | `block_count` + `nextn_predict_layers` + `full_attention_interval` | — | — | — | exact |
-| Expected weight size | — | — | — | `n_params` × `_bytesPerParam(ftype)` | — | ~ |
 | GPU/CPU layer split | `--n-gpu-layers` in `status.args` | — | estimated from VRAM/~ | derived from above | explicit preset value | exact / ~ / — |
 | Layer % on GPU/CPU | — | — | — | split ÷ total | — | exact / ~ / — |
 | Weight GB per device | — | — | — | size × split ratio | — | exact / ~ / — |
@@ -253,7 +252,6 @@ cache-type-v = q4_0
 - Size: Tier 1 → `meta.size` = 3.8 GB (exact)
 - Quant: Tier 2 → GGUF `general.file_type` → `iq3_s` (exact)
 - Params: Tier 1 → `meta.n_params` = 27.6B (exact)
-- Expected weight: Tier 4 → 27.6B × 0.77 = ~19.8 GB (~)
 - Context: Tier 1 → `meta.n_ctx` = 131072 (exact)
 - Total layers: Tier 2 → GGUF `block_count` = 65 (exact)
 - GPU/CPU split: Tier 1 → `status.args` contains `--n-gpu-layers all` → gpu=65, cpu=0 (exact)
@@ -268,7 +266,7 @@ cache-type-v = q4_0
 
 **Displayed:**
 ```
-Quant: iq3_s | 27.6B params | ~19.8 GB expected
+Quant: iq3_s | 27.6B params
 Model Size: 65 layers | 3.8 GB
 GPU Layers: 65 | 3.8 GB | 100%
 CPU Layers: 0 | 0.0 GB | 0%
@@ -299,7 +297,6 @@ ctx-size = 262144
 - Size: Tier 1 → `meta.size` = 9.2 GB (exact)
 - Quant: Tier 2 → GGUF `general.file_type` → `iq4_xs` (exact)
 - Params: Tier 1 → `meta.n_params` = 30.5B (exact)
-- Expected weight: Tier 4 → 30.5B × 0.544 = ~15.5 GB (~)
 - Context: Tier 1 → `meta.n_ctx` = 262144 (exact)
 - Total layers: Tier 2 → GGUF `block_count` = 80 (exact)
 - GPU/CPU split: Tier 1 → `status.args` has NO `--n-gpu-layers` (not set explicitly)
@@ -316,7 +313,7 @@ ctx-size = 262144
 
 **Displayed:**
 ```
-Quant: iq4_xs | 30.5B params | ~15.5 GB expected
+Quant: iq4_xs | 30.5B params
 Model Size: 80 layers | 9.2 GB
 GPU Layers: ~65 | ~7.5 GB | ~81%
 CPU Layers: ~15 | ~1.7 GB | ~19%
@@ -456,12 +453,10 @@ Displays an itemized list of all local models recognized by the selected service
 - **GPU Layers / CPU Layers:** Per-device layer counts, weight GB, and percentage of the main stack on that device. A `(+N MTP ~X MB)` suffix appears when MTP draft layers are present.
 - **Context:** Context length with location indicator (`on GPU` or `on CPU`)
 - **KV Cache:** Estimated KV cache size with dtype info (e.g., `K f16 / V f16`) and location
-- **Quant / Params / Expected:** First row (`Quant: q4_k_m | 30.5B params | ~16.5
-  GB expected`), shown above Model Size whenever the quant (from the GGUF header's `general.file_type`,
-  Tier 2) or the param count (`meta.n_params`, Tier 1) is known. The quant and
-  params are exact — no `~`; only the trailing expected weight name (`n_params`
-  × `_bytesPerParam(ftype)`, Tier 4) is a `~` sanity check against the reported
-  file size. Each unknown shows `—`; the whole line is omitted when none are known.
+- **Quant / Params:** First row (`Quant: q4_k_m | 30.5B params`), shown above Model
+   Size whenever the quant (from the GGUF header's `general.file_type`, Tier 2) or
+   the param count (`meta.n_params`, Tier 1) is known. Both are exact — no `~`.
+   Each unknown shows `—`; the whole line is omitted when none are known.
 - **GPU Total / CPU Total:** Combined weight + co-located KV cache per device (shown when applicable)
 
 When the preset sets no explicit `--n-gpu-layers`, layer counts and percentages fall back to a `~` estimate derived from measured per-PID VRAM (Tier 3 → Tier 4), and show "—" only when even that is unavailable; the weight GB follows the same split (exact layer-ratio when known, otherwise the measured "~" VRAM/DRAM footprint). The KV cache size is always an upper-bound "~" estimate from the model's GGUF header.

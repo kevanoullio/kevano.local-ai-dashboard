@@ -766,53 +766,6 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
       return String(x)
     }
 
-    // Approximate per-parameter weight size (bytes) for a gguf ftype. These are
-    // the block-accounted averages (the commonly published GGML figures, rounded
-    // to 3 decimals) used ONLY to derive the "~N GB expected" sanity cross-check
-    // against the reported file size — never for exact accounting. f32/f16/bf16
-    // are exact; quantized values include block scales overhead. Unknown → -1.
-    function _bytesPerParam(ftype) {
-      var s = parseInt(ftype, 10)
-      if (!isFinite(s)) return -1
-      switch (s) {
-        case 0:  return 4.0    // f32
-        case 1:  return 2.0    // f16
-        case 2:  return 0.5625 // q4_0
-        case 3:  return 0.6875 // q4_1
-        case 7:  return 1.0625 // q8_0
-        case 8:  return 0.6875 // q5_0
-        case 9:  return 0.8125 // q5_1
-        case 10: return 0.357  // q2_k
-        case 11: return 0.417  // q3_k_s
-        case 12: return 0.437  // q3_k_m
-        case 13: return 0.466  // q3_k_l
-        case 14: return 0.489  // q4_k_s
-        case 15: return 0.541  // q4_k_m
-        case 16: return 0.623  // q5_k_s
-        case 17: return 0.695  // q5_k_m
-        case 18: return 0.822  // q6_k
-        case 19: return 0.21   // iq2_xxs
-        case 20: return 0.283  // iq2_xs
-        case 21: return 0.357  // q2_k_s
-        case 22: return 0.377  // iq3_xs
-        case 23: return 0.301  // iq3_xxs
-        case 24: return 0.191  // iq1_s
-        case 25: return 0.563  // iq4_nl
-        case 26: return 0.77   // iq3_s
-        case 27: return 0.849  // iq3_m
-        case 28: return 0.653  // iq2_s
-        case 29: return 0.776  // iq2_m
-        case 30: return 0.544  // iq4_xs
-        case 31: return 0.199  // iq1_m
-        case 32: return 2.0    // bf16
-        case 36: return 0.265  // tq1_0 (ternary, ~2.1 bits/param)
-        case 37: return 0.495  // tq2_0 (ternary, ~4.0 bits/param)
-        case 38: return 0.5    // mxfp4_moe
-        case 39: return 0.5    // nvfp4
-        default: return -1
-      }
-    }
-
     // KV-cache byte estimate (upper bound). layers = the full-attention
     // (KV-holding) layer count — round(mainLayers / full_attention_interval) for
     // hybrid models, falling back to the main/total block count — NOT raw
@@ -885,22 +838,13 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
       var e = entry || {}
       p = p || {}
       var r = {}
-      // Quant row (items 1-2): params = Tier-1 meta.n_params (exact), quant =
-      // Tier-2 GGUF general.file_type (exact), expected weight = Tier-4
-      // n_params × _bytesPerParam(ftype) (the only `~` on that row).
+      // Quant row: params = Tier-1 meta.n_params (exact), quant = Tier-2 GGUF
+      // general.file_type (exact).
       r.params = e.nParams >= 0
         ? { tier: 1, value: e.nParams, marker: "" }
         : { tier: null, value: -1, marker: "\u2014" }
       r.quant = e.ftype >= 0
         ? { tier: 2, value: e.ftype, marker: "" }
-        : { tier: null, value: -1, marker: "\u2014" }
-      var expected = -1
-      if (e.ftype >= 0 && e.nParams >= 0) {
-        var ebpp = _bytesPerParam(e.ftype)
-        if (ebpp > 0) expected = Math.round(e.nParams * ebpp)
-      }
-      r.expectedWeight = expected >= 0
-        ? { tier: 4, value: expected, marker: "~" }
         : { tier: null, value: -1, marker: "\u2014" }
       // Total layers: Tier-2 GGUF block_count (exact).
       r.totalLayers = e.totalLayers >= 0
