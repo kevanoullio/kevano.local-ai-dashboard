@@ -1,5 +1,7 @@
 # omarchy-local-ai-dashboard
 
+![alt="Local AI Dashboard preview image"](./local-ai-dashboard-preview.png)
+
 Monitor and control local AI model services like ollama and llama.cpp from the Omarchy bar. Start and stop systemd background services, view available models with current status, monitor CPU/GPU/DRAM/VRAM usage, stream debug output via a new terminal session, and open config files directly in nvim.
 
 It provides a unified interface for various local backends—including `ollama` and `llama-server`—allowing you to inspect models, adjust service setups, stream terminal logs, and enforce single-service resource isolation. Support for `vLLM` is a planned feature.
@@ -78,6 +80,7 @@ bash tests/run_all.sh
 ```
 
 Individual phases:
+
 - **Unit tests** (`tests/run_unit_tests.sh`) — 6 Quickshell harnesses (~135 assertions) covering config parsing, defaults, exit-code maps, provisioning state, security contracts, and input validators.
 - **Integration tests** (`tests/run_integration_tests.sh`) — 29 BATS tests exercising the embedded bash scripts (config reader/writer, env writer, provision create flows, rollback/unsafe matrices) against mocked `systemctl` and `systemd-analyze`.
 - **End-to-end tests** (`tests/run_e2e_tests.sh`) — 3 sandbox harnesses covering llama.cpp full lifecycle, rollback on start failure, and Dashboard→section signal wiring.
@@ -248,6 +251,7 @@ cache-type-v = q4_0
 ```
 
 **Resolution:**
+
 - Name: Tier 1 → `m.id` from `/v1/models`
 - Size: Tier 1 → `meta.size` = 3.8 GB (exact)
 - Quant: Tier 2 → GGUF `general.file_type` → `iq3_s` (exact)
@@ -265,6 +269,7 @@ cache-type-v = q4_0
 - CPU Total: Tier 4 → 0 GB (KV on GPU, so N/A)
 
 **Displayed:**
+
 ```
 Quant: iq3_s | 27.6B params
 Model Size: 65 layers | 3.8 GB
@@ -293,6 +298,7 @@ ctx-size = 262144
 ```
 
 **Resolution:**
+
 - Name: Tier 1 → `m.id` from `/v1/models`
 - Size: Tier 1 → `meta.size` = 9.2 GB (exact)
 - Quant: Tier 2 → GGUF `general.file_type` → `iq4_xs` (exact)
@@ -312,6 +318,7 @@ ctx-size = 262144
 - CPU Total: Tier 4 → — (KV on GPU, so N/A)
 
 **Displayed:**
+
 ```
 Quant: iq4_xs | 30.5B params
 Model Size: 80 layers | 9.2 GB
