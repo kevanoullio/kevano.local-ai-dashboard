@@ -132,16 +132,25 @@ Item {
       pctEst = (gpuSplit.marker === "~")
     }
 
-    // Where the context/KV cache lives: pinned to CPU with --no-kv-offload, on
-    // the GPU when any layer is offloaded (exact split), from the probe
-    // estimate, otherwise all-CPU. "" = unknown.
-    var ctxOn = ""
-    if (m.noKvOffload === true) ctxOn = "CPU"
-    else if (gpu > 0 && gpuSplit.marker === "") ctxOn = "GPU"
-    else if (gpuSplit.value && gpuSplit.value.ctxOn !== undefined && gpuSplit.value.ctxOn !== "") ctxOn = gpuSplit.value.ctxOn
-    else if (main > 0 && cpu >= main) ctxOn = "CPU"
-
-    var kvBytes = num(m.kvCacheBytes)
+    // Where the context/KV cache lives. `_kvPlacement` (Service.qml) is the only
+    // decider: `--no-kv-offload` and a zero offload count are exact, and the rest
+    // is a measurement — a KV-sized anonymous host block proves the cache is in
+    // RAM, and its absence from host RAM plus the presence of device memory
+    // proves it is on the device. Being offloaded does NOT mean the cache is on
+    // the GPU (llama.cpp's `--fit` drops it to host RAM when weights + KV no
+    // longer fit, which is exactly the Gemma4 case here), and neither does
+    // EVERY layer being offloaded — that is the same failure on a fully
+    // offloaded stack. "" = unknown: the Context and KV lines then omit the
+    // device and neither device total claims the cache.
+    var kv = r.kvBytes
+    var kvBytes = num(kv.value)
+    var ctxOn = s._kvPlacement(m.noKvOffload === true, gpu, main, kvBytes, {
+      memBytes: s.serviceMemoryBytes,
+      vramBytes: s.serviceVramBytes,
+      // Both service probes read the whole cgroup: with more than one model
+      // loaded neither reading belongs to this model alone.
+      sole: (s.runningModels.length === 1)
+    })
 
     var lines = []
     // Quant label (gguf ftype enum from the GGUF header's general.file_type —
@@ -187,7 +196,8 @@ Item {
     var ctxLine = "Context: " + (ctxLen >= 0 ? comma(ctxLen) + " tok" : "\u2014")
     if (ctxOn !== "") ctxLine += " on " + ctxOn
     lines.push(ctxLine)
-    var kvLine = "KV Cache: " + (kvBytes > 0 ? "~" + s.formatGB(kvBytes) : "\u2014")
+    var kvLine = "KV Cache: " + (kvBytes > 0
+      ? (kv.marker === "~" ? "~" : "") + s.formatGB(kvBytes) : "\u2014")
     if (m.cacheK !== "" || m.cacheV !== "") {
       kvLine += " (K " + (m.cacheK !== "" ? m.cacheK : "f16") + " / V " + (m.cacheV !== "" ? m.cacheV : "f16") + ")"
     }

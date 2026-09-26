@@ -352,9 +352,20 @@ exit 63`
 
   readonly property string serviceMemoryScript: `
 set -o pipefail;
+pid=$(systemctl --user show $1 --property=MainPID --value 2>/dev/null);
 cg=$(systemctl --user show $1 --property=ControlGroup --value 2>/dev/null);
+# systemd's ControlGroup can come back empty (transient scope, D-Bus hiccup).
+# Ask the kernel which cgroup the instance itself is in before giving up, so the
+# spawned per-model worker is still measured directly: memory.stat is
+# hierarchical, so one cgroup covers the router and every worker it forks.
+if [ -z "$cg" ] && [ -n "$pid" ] && [ -r "/proc/$pid/cgroup" ]; then
+  cg=$(awk -F: '$1=="0"{print $3; exit}' "/proc/$pid/cgroup" 2>/dev/null);
+fi;
 out="";
 [ -n "$cg" ] && [ -r "/sys/fs/cgroup$cg/memory.stat" ] && out=$(awk '$1=="anon"{a=$2}$1=="shmem"{s=$2}END{print (a+0)+(s+0)}' "/sys/fs/cgroup$cg/memory.stat" 2>/dev/null);
+# Last resort only, and the reason it must stay last: MemoryCurrent also counts
+# reclaimable file cache — the mmap'd .gguf is ~13 GiB of it — so it reports an
+# RSS-sized footprint that double-counts weight pages already on the GPU.
 [ -z "$out" ] && out=$(systemctl --user show $1 --property=MemoryCurrent --value 2>/dev/null);
 [ -n "$out" ] || out=0;
 echo "$out" | head -c $2`
@@ -383,19 +394,27 @@ f="$1";
 if [ ! -e "$f" ] || [ -L "$f" ] || [ ! -f "$f" ]; then echo GGUF-NO; exit 0; fi;
 sz=$(stat -c %s -- "$f" 2>/dev/null);
 {
-# Pass 1: bounded 16 KiB read for the early scalar kwargs (hyperparameters sit
-# in the first few hundred bytes; the vocab/blob metadata comes much later).
+# Pass 1: bounded 16 KiB read for the early hyperparameters (scalar u32 OR
+# per-layer arrays; hyperparameters sit in the first few hundred bytes while the
+# vocab/blob metadata comes much later). Arrays are emitted as key=a:v1,v2,...
+# with a count==block_count trust guard (recurrent_layers is a sparse index list
+# so it accepts count <= block_count, dropping any out-of-range entries).
+# Element types: u32/i32 (4 B), u64/i64 (8 B), bool (1 B). head_count_kv is an
+# i32 array in gemma4, a u32 array elsewhere — only reading u32/bool silently
+# dropped it and fell the KV estimate back to head_count (8x too large).
 head -c 16384 -- "$f" | od -A n -t x1 -v | awk -v SZ="$sz" '
 BEGIN { for (i = 0; i < 256; i++) HEXVAL[sprintf("%02x", i)] = i; for (i = 32; i < 127; i++) { c = sprintf("%c", i); ORD[c] = i; HEXC[sprintf("%02x", i)] = c } }
 function hexof(s,  n, i, out) { out = ""; for (i = 1; i <= length(s); i++) out = out sprintf("%02x", ORD[substr(s, i, 1)]); return out }
 function unhex(h,  n, i, out) { out = ""; for (i = 1; i + 1 <= length(h); i += 2) out = out HEXC[substr(h, i, 2)]; return out }
 function byteat(off) { return HEXVAL[substr(H, off * 2 + 1, 2)] }
 function u32le(off) { return byteat(off) + byteat(off + 1) * 256 + byteat(off + 2) * 65536 + byteat(off + 3) * 16777216 }
+function u64le(off,  i, out) { out = 0; for (i = 0; i < 8; i++) out = out + byteat(off + i) * (256 ^ i); return out }
 function u64lehex(v,  i, out) { out = ""; for (i = 0; i < 8; i++) out = out sprintf("%02x", int(v / (256 ^ i)) % 256); return out }
 { buf = buf $0 }
 END {
   gsub(/[ \t\r]/, "", buf)
   H = buf
+  blen = int(length(H) / 2)
   if (substr(H, 1, 8) != "47475546") { print "GGUF-NO"; exit }
   pa = index(H, u64lehex(20) hexof("general.architecture"))
   if (pa == 0) { print "GGUF-NO"; exit }
@@ -406,19 +425,58 @@ END {
   arch = unhex(substr(H, (pb + 40) * 2 + 1, klen * 2))
   print "GGUF-OK"
   print "arch=" arch
-  n = 6
-  KS[0] = arch ".block_count";              NM[0] = "block_count"
-  KS[1] = arch ".attention.head_count";    NM[1] = "head_count"
-  KS[2] = arch ".attention.head_count_kv"; NM[2] = "head_count_kv"
-  KS[3] = arch ".embedding_length";        NM[3] = "embedding_length"
-  KS[4] = arch ".nextn_predict_layers";    NM[4] = "nextn_predict_layers"
-  KS[5] = arch ".full_attention_interval"; NM[5] = "full_attention_interval"
+  n = 16
+  KS[0] = arch ".block_count";                  NM[0] = "block_count"
+  KS[1] = arch ".attention.head_count";         NM[1] = "head_count"
+  KS[2] = arch ".attention.head_count_kv";      NM[2] = "head_count_kv"
+  KS[3] = arch ".embedding_length";             NM[3] = "embedding_length"
+  KS[4] = arch ".nextn_predict_layers";         NM[4] = "nextn_predict_layers"
+  KS[5] = arch ".full_attention_interval";      NM[5] = "full_attention_interval"
+  KS[6] = arch ".attention.key_length";         NM[6] = "key_length"
+  KS[7] = arch ".attention.value_length";       NM[7] = "value_length"
+  KS[8] = arch ".attention.key_length_swa";     NM[8] = "key_length_swa"
+  KS[9] = arch ".attention.value_length_swa";   NM[9] = "value_length_swa"
+  KS[10] = arch ".attention.sliding_window";    NM[10] = "sliding_window"
+  KS[11] = arch ".attention.shared_kv_layers";  NM[11] = "shared_kv_layers"
+  KS[12] = arch ".attention.sliding_window_pattern"; NM[12] = "sliding_window_pattern"
+  KS[13] = arch ".attention.recurrent_layers";  NM[13] = "recurrent_layers"
+  KS[14] = arch ".attention.kv_lora_rank";      NM[14] = "kv_lora_rank"
+  KS[15] = arch ".attention.rope.dimension_count"; NM[15] = "rope_dimension_count"
+  SP["recurrent_layers"] = 1
   for (i = 0; i < n; i++) {
     p = index(H, u64lehex(length(KS[i])) hexof(KS[i]))
     if (p == 0) continue
     kb = int((p - 1) / 2) + 8
-    if (u32le(kb + length(KS[i])) != 4) continue
-    print NM[i] "=" u32le(kb + length(KS[i]) + 4)
+    klen2 = length(KS[i])
+    vt = u32le(kb + klen2)
+    if (vt == 4) {
+      v = u32le(kb + klen2 + 4)
+      print NM[i] "=" v
+      if (NM[i] == "block_count" && v > 0) BC = v
+    } else if (vt == 9) {
+      et = u32le(kb + klen2 + 4)
+      cnt = u64le(kb + klen2 + 8)
+      if (et == 4 || et == 5) esz = 4
+      else if (et == 10 || et == 11) esz = 8
+      else if (et == 7) esz = 1
+      else continue
+      if (kb + klen2 + 16 + cnt * esz > blen) continue
+      if (SP[NM[i]] == 1) { if (cnt == 0 || cnt > BC) continue }
+      else if (cnt != BC) continue
+      line = NM[i] "=a:"
+      nv = 0
+      for (j = 0; j < cnt; j++) {
+        eo = kb + klen2 + 16 + j * esz
+        if (esz == 8) v = u64le(eo)
+        else if (esz == 4) v = u32le(eo)
+        else v = byteat(eo)
+        if (SP[NM[i]] == 1 && !(v < BC)) continue
+        if (nv > 0) line = line ","
+        line = line v
+        nv++
+      }
+      if (nv > 0) print line
+    }
   }
   if (SZ ~ /^[0-9]+$/) print "size=" SZ
 }';
@@ -553,6 +611,26 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
   readonly property int watchdogMs: 12000          // backup watchdog for regular commands
   readonly property int startWatchdogMs: 20000     // backup watchdog for start
 
+  // ── Tier 3.5: engine KV accounting probe ─────────────────────────
+  // llama.cpp already reports the exact KV allocation for the context it
+  // builds (bytes, per-cache layer count, cache dtypes, compute-buffer
+  // reserve) in its own startup log — for EVERY architecture, including the
+  // ones whose GGUF files carry no SWA pattern and the ones that only the
+  // engine's source knows the layout of. The probe replays the running
+  // worker's own KV-relevant flags against `llama-cli` with `-ngl 0`
+  // (weights stay off the device, cache size is device-independent), so the
+  // dashboard reads the engine's own numbers instead of modelling
+  // architectures here. Results are cached per flag signature, so this costs
+  // one short run per model+context, not one per refresh.
+  //   kvProbe: "auto" (default) | "off" — "off" restores the header-only
+  //   derivation for users who would rather never see a short llama-cli run.
+  readonly property string kvProbe: String(setting("kvProbe", "auto")).trim().toLowerCase() === "off" ? "off" : "auto"
+  readonly property string kvProbeBinary: String(setting("kvProbeBinary", "llama-cli")).trim() === ""
+    ? "llama-cli" : String(setting("kvProbeBinary", "llama-cli")).trim()
+  readonly property int kvProbeTimeoutSec: intSetting("kvProbeTimeoutSec", 45, 10, 300)
+  readonly property int kvProbeWatchdogMs: (kvProbeTimeoutSec + 5) * 1000
+  readonly property int capKvProbe: 262144    // probe log TEXT we keep, in chars (256 KiB)
+
   // ── Output caps at the OS pipe level ──────────────────────────────
   // Every command is piped through `head -c N` so the producer cannot
   // force unbounded allocation in SplitParser's internal line buffer.
@@ -569,9 +647,35 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
   readonly property int capConfig: 2048    // config file read output
   readonly property int capServiceMemory: 64  // memory.stat anon+shmem sum (bytes)
   readonly property int capServiceVram: 64    // nvidia-smi/rocm-smi per-PID value
-    readonly property int capGguf: 512          // GGUF header marker + arch + 6 key=value lines
-   readonly property int capSlots: 8192        // /slots?model=<id> first-slot state
+    readonly property int capGguf: 2048         // GGUF header marker + arch + all key=value/scalar lines
+    readonly property int capSlots: 8192        // /slots?model=<id> first-slot state
    readonly property int capUnload: 512        // unload response body + http_code
+
+  // Engine KV accounting probe. $1 = llama-cli path, $2 = model bytes,
+  // $3 = KV-estimate bytes (0 when the header gave nothing), rest = argv.
+  // Unattended-safety comes from a PRE-FLIGHT GATE, not from a resource limit:
+  // the probe mmaps the model and allocates the context's cache, so a request
+  // larger than free RAM is refused before the engine starts (exit 98 = "skipped,
+  // no room", which the caller records as no answer and the header derivation
+  // answers instead) rather than being attempted and left to the OOM killer.
+  // `ulimit -v` was the obvious tool here and is exactly wrong: it caps VIRTUAL
+  // address space, which llama.cpp's GPU backends reserve far beyond its working
+  // set — measured here, `ulimit -v 19.5G` made the very same 14.2 GB gemma-4
+  // load die with "mmap failed: Cannot allocate memory" while 40 GiB sat free,
+  // and it passed instantly when uncapped. The gate is sized for the model plus
+  // twice the cache plus 2 GiB of slack, and requires 85% of MemAvailable.
+  readonly property string kvProbeScript: `
+set -o pipefail;
+cli="$1"; mbytes="$2"; kbytes="$3"; shift 3;
+want=$(( mbytes + 2 * kbytes + 2147483648 ));
+avail=$(awk '/^MemAvailable:/ { print $2 * 1024 }' /proc/meminfo 2>/dev/null);
+case "$avail" in ''|*[!0-9]*) avail=0 ;; esac;
+if [ "$avail" -gt 0 ] && [ "$want" -gt "$avail" ] && [ "$want" -gt "$(( avail * 85 / 100 ))" ]; then
+  printf 'kvprobe: skipped, need %d MiB, %d MiB available\\n' $(( want / 1048576 )) $(( avail / 1048576 )) >&2;
+  exit 98;
+fi;
+exec "$cli" "$@"`
+
 
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined
@@ -628,7 +732,7 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
    // with `--models-preset`/`--model-draft`, and `--n-gpu-layers` never with
    // `--n-gpu-layers-draft`. Both `flag value` and `flag=value` forms are handled.
    function _parseLlamaArgs(args) {
-      var out = { model: "", ngl: "", draftPath: "", nglDraft: "", specType: "", cacheK: "", cacheV: "", noKvOffload: false }
+      var out = { model: "", ngl: "", draftPath: "", nglDraft: "", specType: "", cacheK: "", cacheV: "", noKvOffload: false, ubatch: 512, parallel: 1, swaFull: false, noKvUnified: false }
      if (!args || typeof args.length !== "number") return out
      for (var i = 0; i < args.length; i++) {
        var a = String(args[i] == null ? "" : args[i])
@@ -645,7 +749,15 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
         else if (flag === "--cache-type-v") { out.cacheV = next(); consume() }
         else if (flag === "--spec-type") { out.specType = next(); consume() }
         else if (flag === "--no-kv-offload") { out.noKvOffload = true }
+        // Server-side values that change the KV-cache allocation law. Defaults
+        // (512 / 1 / off / unified) match llama.cpp for externally-run servers.
+        else if (flag === "--ubatch" || flag === "-ub") { out.ubatch = parseInt(next(), 10); consume() }
+        else if (flag === "--parallel" || flag === "-np") { out.parallel = parseInt(next(), 10); consume() }
+        else if (flag === "--swa-full") { out.swaFull = true }
+        else if (flag === "-kvu" || flag === "--no-kv-unified") { out.noKvUnified = true }
      }
+     if (!isFinite(out.ubatch) || out.ubatch <= 0) out.ubatch = 512
+     if (!isFinite(out.parallel) || out.parallel <= 0) out.parallel = 1
      return out
    }
 
@@ -783,12 +895,221 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
       return Math.round(bytes)
     }
 
-   // GPU/CPU weight bytes for display. Prefer the exact layer-ratio split when the
-   // offload count is known; otherwise fall back to the measured per-device footprint
-   // (an estimate — measured VRAM/DRAM can include KV cache). Unknown → -1 ("—").
-   // Compatibility wrapper over the resolver path (its unit tests keep the
-   // positional signature) — the per-field Tier ladder lives in
-   // _resolveFieldSources/_resolveWeights below.
+    // Per-arch default SWA period: deliberately NOT modelled here. llama.cpp
+    // resolves a missing pattern key from constants in its own architecture
+    // source (load_swa_pattern), and a GGUF file only carries the pattern when
+    // its converter happened to write it — `add_sliding_window_pattern` is not
+    // called by the reference converter at all. A table copied from that
+    // source is a snapshot of one upstream commit and wrong for every
+    // architecture it misses (and stale the day upstream changes it), so the
+    // header path below treats a missing pattern as unknown → null → "—", and
+    // the engine probe (Tier 3.5) answers instead. It knows every layout
+    // because it IS the layout's owner.
+
+    // Cell count for one KV layer (llama.cpp allocation law). Full-attention and
+    // --swa-full layers hold ctx cells; SWA layers hold min(ctx, sliding_window
+    // × (unified? parallel : 1) + ubatch) padded up to 256. Unknown → -1.
+    function _kvCellsForType(isSwa, ctx, swaWindow, ubatch, swaFull, kvUnified, parallel) {
+      if (!isFinite(ctx) || ctx <= 0) return -1
+      if (!isSwa || swaFull) return ctx
+      if (!isFinite(swaWindow) || swaWindow <= 0) return -1
+      var u = (isFinite(ubatch) && ubatch > 0) ? Math.round(ubatch) : 0
+      var p = (kvUnified && isFinite(parallel) && parallel > 0) ? Math.round(parallel) : 1
+      var cells = Math.min(ctx, swaWindow * p + u)
+      return Math.ceil(cells / 256) * 256
+    }
+
+    // Layer indices whose KV cache is reused / not stored: recurrent_layers
+    // (sparse index set) wins; otherwise the full_attention_interval fallback
+    // marks every non-(N-th) layer recurrent (qwen35/qwen33n semantics).
+    function _recurrentSet(g, m, fai) {
+      var set = {}
+      if (g.recurrentArr && typeof g.recurrentArr.length === "number" && g.recurrentArr.length > 0) {
+        for (var i = 0; i < g.recurrentArr.length; i++) {
+          var idx = parseInt(g.recurrentArr[i], 10)
+          if (isFinite(idx) && idx >= 0 && idx < m) set[idx] = true
+        }
+      } else if (fai > 1) {
+        for (var il = 0; il < m; il++) if ((il + 1) % fai !== 0) set[il] = true
+      }
+      return set
+    }
+
+    // Per-layer KV spec from the header: [{kvHeads, kLen, vLen, cells}] or null
+    // when any counted layer is unsized (unknown → "—"). kLen/vLen are the FULL
+    // per-layer row lengths (kvHeads × head dim); MLA layers are K-only with the
+    // row = kv_lora_rank + rope.dimension_count. shared_kv_layers tail layers
+    // reuse earlier KV and are skipped; recurrent layers carry no context KV.
+    function _buildKvLayers(g, mainLayers, ctx, args) {
+      if (!g || !isFinite(ctx) || ctx <= 0) return null
+      var m = (isFinite(mainLayers) && mainLayers > 0) ? Math.round(mainLayers)
+            : ((isFinite(g.bc) && g.bc > 0) ? Math.round(g.bc) : -1)
+      if (m <= 0) return null
+      var a = args || {}
+      var ubatch = (isFinite(a.ubatch) && a.ubatch > 0) ? Math.round(a.ubatch) : 512
+      var parallel = (isFinite(a.parallel) && a.parallel > 0) ? Math.round(a.parallel) : 1
+      var swaFull = a.swaFull === true
+      var kvUnified = a.kvUnified !== false
+      var hc = (g.hc > 0) ? g.hc : -1
+      var hckvScalar = (g.hckv > 0) ? g.hckv : -1
+      var embd = (g.embd > 0) ? g.embd : -1
+      var headK = (hc > 0 && embd > 0) ? embd / hc : -1
+      var kl = (g.kl > 0) ? g.kl : -1
+      var vl = (g.vl > 0) ? g.vl : -1
+      var klswa = (g.klswa > 0) ? g.klswa : -1
+      var vlswa = (g.vlswa > 0) ? g.vlswa : -1
+      var swaWindow = (g.swa > 0) ? g.swa : -1
+      var sharedKv = (g.sharedKv > 0) ? g.sharedKv : 0
+      var kvLoraRank = (g.kvLoraRank > 0) ? g.kvLoraRank : -1
+      var ropeDim = (g.ropeDim > 0) ? g.ropeDim : -1
+      var fai = (isFinite(g.fai) && g.fai > 1) ? Math.round(g.fai) : -1
+
+      function hkFor(swa) {
+        if (swa) { if (klswa > 0) return klswa; if (kl > 0) return kl; return headK }
+        if (kl > 0) return kl
+        if (klswa > 0) return klswa
+        return headK
+      }
+      function hvFor(swa, hkDim) {
+        if (swa) { if (vlswa > 0) return vlswa; return hkDim }
+        if (vl > 0) return vl
+        return hkDim
+      }
+      function kvHeadsFor(il) {
+        var kv = -1
+        if (g.hckvArr && typeof g.hckvArr.length === "number" && il < g.hckvArr.length) {
+          var e = parseInt(g.hckvArr[il], 10)
+          if (isFinite(e) && e > 0) kv = e
+        }
+        if (!(kv > 0)) kv = hckvScalar > 0 ? hckvScalar : (hc > 0 ? hc : -1)
+        return kv
+      }
+      var layers = []
+      // MLA (DeepSeek-style): K-only, dense full-ctx, per-layer row = lora + rope.
+      if (kvLoraRank > 0) {
+        if (!(ropeDim > 0)) return null
+        for (var ilM = 0; ilM < m; ilM++) {
+          if (sharedKv > 0 && ilM >= m - sharedKv) continue
+          layers.push({ kvHeads: 1, kLen: kvLoraRank + ropeDim, vLen: 0, hasV: false, cells: ctx })
+        }
+        return layers.length ? { layers: layers, parallel: parallel, kvUnified: kvUnified } : null
+      }
+      // Layer type: an explicit pattern array (written by some converters), an
+      // explicit scalar period, or an explicit "no SWA" declaration
+      // (attention.sliding_window == 0, which every llama.cpp source that reads
+      // that key treats as KV_TYPE_NONE). None of those → the layout comes from
+      // the engine's own source rather than the file → unknown (null), so the
+      // caller falls back to the engine probe instead of guessing. A merely
+      // ABSENT sliding_window is not such a declaration (llama4 builds an SWA
+      // cache even then), so it deliberately does not answer here.
+      var pattern = null, period = -1
+      if (g.swaPatternArr && typeof g.swaPatternArr.length === "number" && g.swaPatternArr.length > 0) {
+        pattern = g.swaPatternArr
+      } else if (isFinite(g.swaPattern) && g.swaPattern > 0) {
+        period = Math.round(g.swaPattern)
+      } else if (g.swa === 0) {
+        period = -1                     // declared dense: every layer full-size
+      } else {
+        return null
+      }
+      var recurrent = _recurrentSet(g, m, fai)
+      for (var il = 0; il < m; il++) {
+        if (recurrent[il] === true) continue
+        if (sharedKv > 0 && il >= m - sharedKv) continue
+        var swa = pattern
+          ? (il < pattern.length ? (parseInt(pattern[il], 10) > 0 || pattern[il] === true) : true)
+          : (period > 0 ? (il + 1) % period !== 0 : false)
+        var kv = kvHeadsFor(il)
+        var hk = hkFor(swa)
+        var hv = hvFor(swa, hk)
+        if (!(kv > 0) || !(hk > 0) || !(hv > 0)) return null
+        var cells = _kvCellsForType(swa, ctx, swaWindow, ubatch, swaFull, kvUnified, parallel)
+        if (!(cells > 0)) return null
+        layers.push({ kvHeads: kv, kLen: kv * hk, vLen: kv * hv, hasV: true, cells: cells })
+      }
+      return layers.length ? { layers: layers, parallel: parallel, kvUnified: kvUnified } : null
+    }
+
+    // Architecture-aware per-layer KV sum (Tier 4). Any unknown input → -1
+    // (display "—"), mirroring the _kvEstimateBytes guards above.
+    function _kvEstimateBytesArch(spec, kBits, vBits) {
+      if (!spec || !spec.layers || !spec.layers.length) return -1
+      if (!isFinite(kBits) || kBits < 0 || !isFinite(vBits) || vBits < 0) return -1
+      var mult = (spec.kvUnified !== false) ? 1 : ((isFinite(spec.parallel) && spec.parallel > 0) ? Math.round(spec.parallel) : 1)
+      var bytes = 0
+      for (var i = 0; i < spec.layers.length; i++) {
+        var L = spec.layers[i]
+        if (!isFinite(L.cells) || L.cells <= 0) return -1
+        if (!isFinite(L.kLen) || L.kLen <= 0) return -1
+        if (L.hasV !== false && (!isFinite(L.vLen) || L.vLen <= 0)) return -1
+        var kb = L.kLen * kBits / 8
+        var vb = (L.hasV === false) ? 0 : L.vLen * vBits / 8
+        var layerBytes = (kb + vb) * L.cells * mult
+        if (!isFinite(layerBytes) || layerBytes <= 0) return -1
+        bytes += layerBytes
+      }
+      if (!isFinite(bytes) || bytes <= 0) return -1
+      return Math.round(bytes)
+    }
+
+    // Where the KV cache — and the context it holds — physically lives:
+    // "GPU", "CPU" or "" (unknown, caller keeps its own fallback).
+    //
+    // Every branch is either a direct statement from the configuration or a
+    // measured fact, never a model of the engine's placement heuristic:
+    //   noKvOffload  Tier 1, exact — --no-kv-offload pins the cache to host RAM.
+    //   gpuLayers===0 Tier 1, exact — a stack with no layer on the device has no
+    //                            cache there either.
+    //   a fully offloaded stack (gpuLayers >= mainLayers) is deliberately NOT a
+    //   branch: it looks like the mirror of gpuLayers===0, but the running
+    //   gemma-4-26b-a4b-qat worker here has all 30 layers on the device with its
+    //   2,879 MiB cache in host RAM, because llama.cpp sizes the KV buffer
+    //   against its own fit budget rather than following the layer buffers. Only
+    //   a measurement can place that cache, so partial and total offload both
+    //   fall through to the branches below.
+    //   memBytes >= kvBytes
+    //               Direct measurement. The cache is one contiguous allocation
+    //               that lives either in a device buffer or in anonymous host
+    //               memory (llama.cpp maps model weights with CPU_Mapped and the
+    //               KV cache with plain CPU buffers, so a KV-sized anon+shmem
+    //               block can only be the cache). Finding one proves host RAM.
+    //   vramBytes > 0
+    //               The cache is in no host block that big, and the service does
+    //               hold device memory, so it is on the device. Proved by
+    //               exhaustion over those two possibilities — deliberately NOT
+    //               by comparing free VRAM against kv+fit-target, which needs
+    //               llama.cpp's internal fit budget (larger and version-specific
+    //               than any --fit-target we can read) and misreports models it
+    //               deliberately kept on the host.
+    //   sole=false     Multi-model router: the DRAM/VRAM readings are the whole
+    //               cgroup's, so neither measurement can be attributed to this
+    //               model and only the exact branches above may answer.
+    // Pure: any missing input → "" (unknown), never throws.
+    function _kvPlacement(noKvOffload, gpuLayers, mainLayers, kvBytes, p) {
+      if (noKvOffload === true) return "CPU"
+      var g = Number(gpuLayers)
+      var main = Number(mainLayers)
+      if (isFinite(main) && main > 0 && isFinite(g) && g === 0) return "CPU"
+      var kv = Number(kvBytes)
+      if (!(isFinite(kv) && kv > 0)) return ""
+      p = p || {}
+      if (p.sole === false) return ""
+      var mem = Number(p.memBytes)
+      if (isFinite(mem) && mem >= 0) {
+        if (mem >= kv) return "CPU"
+        var v = Number(p.vramBytes)
+        if (isFinite(v) && v > 0) return "GPU"
+        return "CPU"                     // no device context: the cache is in RAM
+      }
+      return ""
+    }
+
+    // GPU/CPU weight bytes for display. Prefer the exact layer-ratio split when the
+    // offload count is known; otherwise fall back to the measured per-device footprint
+    // (an estimate — measured VRAM/DRAM can include KV cache). Unknown → -1 ("—").
+    // Compatibility wrapper over the resolver path (its unit tests keep the
+    // positional signature) — the per-field Tier ladder lives in
+    // _resolveFieldSources/_resolveWeights below.
     function _weightBytes(sizeBytes, gpu, cpu, total, vramBytes, memBytes) {
       var split = (gpu >= 0 && cpu >= 0)
         ? { tier: 1, value: { mainGpu: gpu, mainCpu: cpu }, marker: "" }
@@ -863,12 +1184,15 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
       } else if (p.presetSection && _isPresetSplitToken(p.presetSection["n-gpu-layers"])) {
         r.gpuSplit = { tier: 5, value: null, marker: "" }   // resolved in _applyGguf
       } else if (p.vramBytes >= 0) {
+        var kv = _resolveKvBytes(e)
+        var on = _kvPlacement(e.noKvOffload === true, e.mainGpu, e.mainLayers, kv.value, p)
         var est = _estimateSplitFromProbes(
           e.sizeBytes > 0 ? e.sizeBytes : 0,
-          e.totalLayers, p.vramBytes)
+          e.totalLayers, p.vramBytes,
+          on === "GPU" ? kv.value : 0, e.computeBytes)
         r.gpuSplit = est
           ? { tier: 3,
-              value: { mainGpu: est.gpuLayers, mainCpu: est.cpuLayers, ctxOn: est.ctxOn },
+              value: { mainGpu: est.gpuLayers, mainCpu: est.cpuLayers },
               marker: "~" }
           : { tier: null, value: null, marker: "\u2014" }
       } else {
@@ -876,11 +1200,9 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
       }
       // Weights follow the split; the marker stays "~" whenever any input was "~".
       r.weightBytes = _resolveWeights(e, r.gpuSplit, p)
-      // KV cache stays a Tier-4 GGUF upper-bound (~) until item 5 lands
-      // measured, per-model values from /metrics.
-      r.kvBytes = e.kvCacheBytes >= 0
-        ? { tier: 4, value: e.kvCacheBytes, marker: "~" }
-        : { tier: null, value: -1, marker: "\u2014" }
+      // KV cache: Tier 3.5 when llama.cpp's own accounting answered (exact, no
+      // marker), else the Tier-4 header derivation ("~"), else "\u2014".
+      r.kvBytes = _resolveKvBytes(e)
       r.kvDtype = { tier: 1, value: { k: e.cacheK, v: e.cacheV }, marker: "" }
       return r
     }
@@ -893,30 +1215,27 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
       return s !== "" && /^(all|[0-9]+)$/.test(s)
     }
 
-    // Estimate GPU/CPU layer split from measured VRAM when ngl is unknown.
-    // Uses per-PID VRAM measurement (Tier 3) + model size (Tier 1/2) to derive
-    // an approximate number of layers on GPU. Always returns ~ estimate.
-    // Returns { gpuLayers, cpuLayers, ctxOn } or null when measurements unavailable.
-    function _estimateSplitFromProbes(sizeBytes, totalLayers, vramBytes) {
-      if (sizeBytes <= 0 || !isFinite(totalLayers) || totalLayers <= 0) return null
-      if (vramBytes < 0) return null
-      // VRAM ≈ weight_on_gpu + kv_cache_on_gpu. Subtract estimated KV to isolate weights.
-      var kvEstimate = _kvEstimateBytes(
-        Math.round(totalLayers / 4),   // rough: ~25% layers on GPU for hybrid
-        8192,                          // assumed working context
-        8,                             // head_count_kv default
-        64,                            // head_dim default
-        16, _kvDtypeBits("")           // f16 default
-      )
-      var weightOnGpu = vramBytes - (kvEstimate > 0 ? kvEstimate : 0)
+    // Estimate GPU/CPU layer split from measured device memory when ngl is
+    // unknown. Built only from measured quantities: the service's per-PID VRAM
+    // minus whatever of it the probe has already attributed to the KV cache
+    // and to the compute-graph reserve, scaled by the model's real file size.
+    // No assumed layer ratio, context length, head count or head dimension —
+    // those were the inputs that made a wrong number look plausible. Always an
+    // estimate ("~"); the clamp to [0, total] is the only guesswork left, and it
+    // can only ever understate the GPU because an unaccounted device buffer
+    // inflates the weight share. Returns { gpuLayers, cpuLayers } or null when
+    // no measurement can carry it.
+    function _estimateSplitFromProbes(sizeBytes, totalLayers, vramBytes, kvOnGpuBytes, computeBytes) {
+      if (!(sizeBytes > 0)) return null
+      if (!isFinite(totalLayers) || totalLayers <= 0) return null
+      if (!(vramBytes >= 0)) return null
+      var weightOnGpu = vramBytes
+      if (kvOnGpuBytes > 0) weightOnGpu -= kvOnGpuBytes
+      if (computeBytes > 0) weightOnGpu -= computeBytes
       if (weightOnGpu <= 0) return null
-      // gpu_layers ≈ round(weight_on_gpu / total_size * total_layers)
       var gpuLayers = Math.round(weightOnGpu / sizeBytes * totalLayers)
       gpuLayers = Math.max(0, Math.min(gpuLayers, totalLayers))
-      var cpuLayers = totalLayers - gpuLayers
-      // Context placement: if VRAM > 0 and weights on GPU, KV likely on GPU too.
-      var ctxOn = (gpuLayers > 0) ? "GPU" : "CPU"
-      return { gpuLayers: gpuLayers, cpuLayers: cpuLayers, ctxOn: ctxOn }
+      return { gpuLayers: gpuLayers, cpuLayers: totalLayers - gpuLayers }
     }
 
     // ── Tier 5: bounded models.ini preset reader ──────────────────────
@@ -1148,6 +1467,10 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
           if (cachedDraft !== undefined) _applyGgufDraft(e, cachedDraft)
           else _queueGguf(e.draftPath)
         }
+        // Tier 3.5: queue the engine's own KV accounting for this model. Runs off
+        // the API-reported flags (context size, cache dtypes, ubatch, parallel)
+        // because those, not the header, are what define the allocation.
+        _queueKvProbe(e)
       }
       return out
     }
@@ -1550,6 +1873,10 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
             cacheK: parsed.cacheK,
             cacheV: parsed.cacheV,
             noKvOffload: parsed.noKvOffload,
+            ubatch: parsed.ubatch,
+            parallel: parsed.parallel,
+            swaFull: parsed.swaFull === true,
+            noKvUnified: parsed.noKvUnified === true,
             _gpuSplitSource: "api",  // "api" | "probe" | "preset" | null
             totalLayers: -1,
             mainLayers: -1,
@@ -1560,7 +1887,10 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
             mainCpu: null,
             mtpGpu: 0,
             mtpCpu: 0,
-            kvCacheBytes: -1,
+            kvCacheBytes: -1,      // Tier 4: derived from the GGUF header
+            kvBytesExact: -1,      // Tier 3.5: llama.cpp's own accounting
+            kvLayersExact: -1,     //   ...including how many layers it cached
+            computeBytes: -1,      //   device graph reserve, same source
             until: "loaded"
           })
         }
@@ -1587,12 +1917,291 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
   // ── GGUF header read (llama.cpp): totalLayers + KV-cache inputs ──────
   // Bounded no-load read of the model file's own metadata. Results are cached
   // by path so a running model is re-resolved synchronously on every later
-  // refresh (no re-read). Unknown/unreadable → the entry keeps -1 ("—").
+  // ── Tier 3.5: engine KV accounting probe ─────────────────────────
+  // One short `llama-cli` run per (model, KV-flag signature) answers what no
+  // file header can: the exact KV allocation this engine actually builds for
+  // this architecture, at this context size, with these cache dtypes. llama.cpp
+  // prints it in its own startup log, so we read its numbers rather than
+  // re-deriving its architecture rules here:
+  //   llama_kv_cache: size = 2720.00 MiB (262144 cells, 5 layers, 1/1 seqs),
+  //                          K (q8_0): 1360.00 MiB, V (q8_0): 1360.00 MiB
+  //   llama_kv_cache:      CPU KV buffer size = 2720.00 MiB
+  //   sched_reserve:      CUDA0 compute buffer size = 1887.86 MiB
+  // The cache SIZE does not depend on the device, so the probe runs with -ngl 0
+  // (nothing touches the GPU); the per-line device tags it prints are the probe's
+  // own, never the running worker's, and are therefore not used for placement.
+  // Cache results per signature and never re-probe: one 3-second run per model,
+  // not one per refresh.
 
-  property var _ggufCache: ({})   // path -> {bc, hc, hckv, embd, npl, fai, sz}
+  property var _kvProbeCache: ({})      // signature -> result | false (tried, no answer)
+  property var _kvProbeQueue: []        // entries waiting; one probe runs at a time
+  property string _kvProbePath: ""      // model of the probe in flight
+  property string _kvProbeSignature: "" // its signature (keyed into _kvProbeCache)
+  property string _kvProbeBuffer: ""
+  property var _kvProbeArgvList: []     // full argv after the script's $1..$3
+  property real _kvProbeModelBytes: 0   // model size, for the address-space cap
+  property real _kvProbeKvGuess: 0      // best KV estimate, for the same cap
+  readonly property int _kvProbeBufferMax: 262144
+
+  function _kvProbeNum(v, fallback) {
+    var n = parseInt(String(v == null ? "" : v), 10)
+    return isFinite(n) && n >= 0 ? n : fallback
+  }
+
+  // Everything that can change the allocation the engine will build. Also the
+  // cache key, so a context-size or dtype change re-probes and nothing else does.
+  function _kvProbeSignatureFor(entry) {
+    var e = entry || {}
+    var path = String(e.modelPath || "")
+    if (path === "") return ""
+    return path + "|" + _kvProbeNum(e.contextLen, 0) + "|" + _kvProbeNum(e.ubatch, 512)
+      + "|" + _kvProbeNum(e.parallel, 1) + "|" + String(e.cacheK || "")
+      + "|" + String(e.cacheV || "") + "|" + (e.swaFull === true ? "1" : "0")
+      + "|" + (e.noKvUnified === true ? "1" : "0")
+  }
+
+  // Only the flags that can change the KV allocation. Deliberately omitted:
+  // the draft model (it has its own, smaller context), offload counts and
+  // fit/device settings (they change WHERE the cache lands, not its size — that
+  // is placement's question, answered by measurement), and every server flag
+  // (host/port/api-key/jinja/mmproj). Prompt and single-turn are needed to make
+  // the process build a context and exit instead of sitting in its REPL.
+  function _kvProbeArgv(entry) {
+    var e = entry || {}
+    var a = ["--verbose", "--no-warmup", "-st", "-n", "0", "-p", "x", "-ngl", "0"]
+    var ctx = _kvProbeNum(e.contextLen, 0)
+    if (ctx > 0) a.push("-c", String(ctx))
+    var ub = _kvProbeNum(e.ubatch, 0)
+    if (ub > 0) a.push("-b", String(ub), "-ub", String(ub))
+    var np = _kvProbeNum(e.parallel, 0)
+    if (np > 0) a.push("-np", String(np))
+    var ck = String(e.cacheK || ""), cv = String(e.cacheV || "")
+    if (ck !== "") a.push("--cache-type-k", ck)
+    if (cv !== "") a.push("--cache-type-v", cv)
+    if (e.swaFull === true) a.push("--swa-full")
+    if (e.noKvUnified === true) a.push("--no-kv-unified")
+    if (e.noKvOffload === true) a.push("--no-kv-offload")
+    return a
+  }
+
+  function _queueKvProbe(entry) {
+    if (kvProbe === "off") return
+    if (backend !== "llama.cpp") return
+    var sig = _kvProbeSignatureFor(entry)
+    if (sig === "") return
+    if (_kvProbeCache[sig] !== undefined) return          // known: exact or already failed
+    if (_kvProbeSignature === sig) return                 // already queued/running
+    for (var i = 0; i < _kvProbeQueue.length; i++)
+      if (_kvProbeSignatureFor(_kvProbeQueue[i]) === sig) return
+    var q = _kvProbeQueue.slice()
+    q.push(entry)
+    _kvProbeQueue = q
+    _pumpKvProbe()
+  }
+
+  function _pumpKvProbe() {
+    if (kvProbeProcess.running) return
+    if (_kvProbeQueue.length === 0) return
+    var q = _kvProbeQueue.slice()
+    var entry = q.shift()
+    _kvProbeQueue = q
+    var sig = _kvProbeSignatureFor(entry)
+    if (sig === "" || _kvProbeCache[sig] !== undefined) { _pumpKvProbe(); return }
+    _kvProbeSignature = sig
+    _kvProbePath = String(entry.modelPath || "")
+    _kvProbeArgvList = ["-m", _kvProbePath].concat(_kvProbeArgv(entry))
+    _kvProbeModelBytes = (Number(entry.sizeBytes) > 0) ? Number(entry.sizeBytes) : 0
+    _kvProbeKvGuess = (Number(entry.kvBytesExact) > 0) ? Number(entry.kvBytesExact)
+      : ((Number(entry.kvCacheBytes) > 0) ? Number(entry.kvCacheBytes) : 0)
+    _kvProbeBuffer = ""
+    launch(kvProbeProcess, kvProbeWatchdog)
+  }
+
+  // "llama_kv_cache: size = 2720.00 MiB (262144 cells,   5 layers,  1/1 seqs), K (q8_0): ..."
+  // The total is read first so a cache with no V (MLA) still parses; only it is
+  // used. Bytes are as precise as the log itself: llama.cpp prints MiB with two
+  // decimals, so each cache carries at most ~5 KiB of print rounding. That is a
+  // measurement of the engine's own allocation, not a derivation, so it keeps
+  // the exact (unmarked) rendering.
+  function _parseKvProbeLine(line) {
+    var s = String(line || "")
+    if (s.indexOf("llama_kv_cache:") < 0 && s.indexOf("sched_reserve:") < 0) return null
+    var m = /llama_kv_cache:\s+size\s*=\s*([0-9.]+)\s*MiB\s*\(\s*([0-9]+)\s*cells,\s*([0-9]+)\s*layers/
+    var hit = m.exec(s)
+    if (hit) {
+      var mib = parseFloat(hit[1])
+      if (isFinite(mib) && mib > 0) {
+        return { kind: "kv", bytes: Math.round(mib * 1048576),
+                 layers: parseInt(hit[3], 10) || 0 }
+      }
+      return null
+    }
+    // sched_reserve: <device> compute buffer size = <n> MiB — the graph reserve,
+    // so a VRAM split estimate can subtract a real number instead of assuming
+    // one. The device tag is kept because llama.cpp reserves on the host side
+    // too (measured on gemma-4-26b: `CUDA0 compute buffer size = 1887.86 MiB`
+    // alongside `CUDA_Host compute buffer size = 272.30 MiB`), and only the
+    // device one is subtracted from device memory — the caller drops CPU and
+    // *_Host tags, so a host reserve can never be charged to VRAM.
+    var c = /sched_reserve:\s+(\S+)\s+compute buffer size\s*=\s*([0-9.]+)\s*MiB/
+    var ch = c.exec(s)
+    if (ch) {
+      var cm = parseFloat(ch[2])
+      if (isFinite(cm) && cm > 0) {
+        return { kind: "compute", dev: ch[1], bytes: Math.round(cm * 1048576) }
+      }
+    }
+    return null
+  }
+
+  function _onKvProbeLine(line) {
+    var s = String(line || "")
+    // Buffering is for diagnostics only and stops at the cap; PARSING never
+    // does. A verbose gemma-4 run is ~224 KiB against a 256 KiB cap and prints
+    // the cache blocks twice, and an early `return` on overflow would have
+    // dropped the accounting lines along with the log text — turning a full
+    // answer into a silent partial one.
+    if (_kvProbeBuffer.length + s.length + 1 <= _kvProbeBufferMax) _kvProbeBuffer += s + "\n"
+    var rec = _parseKvProbeLine(s)
+    if (!rec) return
+    var acc = _kvProbeAcc
+    // Self-healing fold: these functions are contractually total (a surprising
+    // accumulator must never throw mid-probe), so a state missing the dedupe
+    // bookkeeping is repaired here rather than assumed.
+    if (!acc.blocks) acc.blocks = []
+    if (!acc.computeSeen) acc.computeSeen = []
+    if (!acc.compute) acc.compute = ({})
+    if (rec.kind === "kv") {
+      // llama.cpp logs each cache block TWICE (once as the context is being set
+      // up and once when it is populated): gemma-4-26b emits its 5-layer and
+      // 25-layer blocks once each, then both again verbatim. Summing every line
+      // would double the answer, so blocks are folded by identity — two blocks
+      // with the same byte total AND layer count are the same allocation logged
+      // twice, while genuinely distinct caches (e.g. a main + spec context)
+      // differ and both still count.
+      var key = rec.bytes + ":" + rec.layers
+      if (acc.blocks.indexOf(key) < 0) {
+        acc.blocks = acc.blocks.concat([key])
+        acc.kvBytes += rec.bytes
+        if (rec.layers > 0) acc.kvLayers += rec.layers
+      }
+    } else if (rec.kind === "compute") {
+      // Per device, de-duplicated by value (the same reserve is logged once at
+      // setup and again at teardown), and never counting a host-side reserve:
+      // `CPU` and `CUDA_Host` are RAM, and charging them to VRAM would make the
+      // split estimate under-count GPU layers.
+      var dev = String(rec.dev || "")
+      if (dev !== "CPU" && dev.indexOf("_Host") < 0) {
+        if (acc.computeSeen.indexOf(dev + ":" + rec.bytes) < 0) {
+          acc.computeSeen = acc.computeSeen.concat([dev + ":" + rec.bytes])
+          acc.compute[dev] = (acc.compute[dev] || 0) + rec.bytes
+        }
+      }
+    }
+  }
+
+  property var _kvProbeAcc: ({ kvBytes: 0, kvLayers: 0, computeBytes: -1, blocks: [], compute: ({}), computeSeen: [] })
+
+  // Exact KV bytes for the signature, or false when the probe could not answer
+  // (no llama-cli, allocation refused by the address-space cap, non-zero exit,
+  // watchdog). false is cached too, so a broken probe is not retried every
+  // refresh; the header derivation then answers instead.
+  // `ok` is the child's own verdict and is REQUIRED: llama.cpp allocates and
+  // logs its cache BEFORE it can fail — a model that will not fit the
+  // address-space cap still emits both `llama_kv_cache: size` lines and then
+  // exits 1 — so folding without the exit status would publish the accounting
+  // of a run that never served. The watchdog passes false, because a timeout
+  // says nothing about what the partial log contains.
+  function _finishKvProbe(ok) {
+    var sig = _kvProbeSignature
+    var acc = _kvProbeAcc
+    _kvProbeAcc = { kvBytes: 0, kvLayers: 0, computeBytes: -1, blocks: [], compute: ({}), computeSeen: [] }
+    _kvProbeSignature = ""
+    _kvProbePath = ""
+    _kvProbeArgvList = []
+    if (sig === "") { _pumpKvProbe(); return }
+    var res = null
+    if (ok === true && acc.kvBytes > 0) {
+      var compute = -1
+      for (var d in acc.compute) {
+        if (compute < 0) compute = 0
+        compute += acc.compute[d]
+      }
+      res = { kvBytes: acc.kvBytes, kvLayers: acc.kvLayers, computeBytes: compute }
+    }
+    _kvProbeCache[sig] = res === null ? false : res
+    _applyKvProbeResult(sig, res)
+    _pumpKvProbe()
+  }
+
+  function _applyKvProbeResult(sig, res) {
+    if (!res) return
+    var arr = runningModels || []
+    var changed = false
+    for (var i = 0; i < arr.length; i++) {
+      var e = arr[i]
+      if (!e || _kvProbeSignatureFor(e) !== sig) continue
+      e.kvBytesExact = res.kvBytes
+      e.kvLayersExact = res.kvLayers
+      e.computeBytes = res.computeBytes
+      // The exact cache size (and the device graph reserve) sharpen the
+      // measured split estimate, so recompute it now that they are known.
+      _applyProbeSplit(e, e.totalLayers)
+      changed = true
+    }
+    if (changed) runningModels = arr.slice()
+  }
+
+  // Tier 3: when the API and the preset both left ngl unknown, derive the layer
+  // split from measured device memory — the service's per-PID VRAM minus the
+  // part of it the KV cache is holding (only when placement is measured, not
+  // guessed) and the engine's compute-graph reserve. Re-run whenever a new
+  // measurement or a new engine accounting lands, so the estimate tightens
+  // instead of being frozen at whatever the first reading happened to be.
+  function _applyProbeSplit(entry, total) {
+    if (!entry) return
+    if (entry.ngl !== "") return
+    if (entry._gpuSplitSource === "preset") return
+    // A split we already own (Tier 3) may be refreshed; an API/preset one never.
+    if (entry.mainGpu !== null && entry._gpuSplitSource !== "probe") return
+    var kv = _resolveKvBytes(entry)
+    var on = _kvPlacement(entry.noKvOffload === true, entry.mainGpu, entry.mainLayers,
+                          kv.value, _placementMeasurements())
+    var probe = _estimateSplitFromProbes(
+      entry.sizeBytes > 0 ? entry.sizeBytes : 0, total, serviceVramBytes,
+      on === "GPU" ? kv.value : 0, entry.computeBytes)
+    if (probe) {
+      entry.mainGpu = probe.gpuLayers
+      entry.mainCpu = probe.cpuLayers
+      entry._gpuSplitSource = "probe"
+    }
+  }
+
+  // The machine readings placement may be decided from, plus whether they can
+  // be attributed to a single model at all. Both probes cover the whole service
+  // cgroup, so with more than one model loaded neither reading is this model's.
+  function _placementMeasurements() {
+    return { memBytes: serviceMemoryBytes, vramBytes: serviceVramBytes,
+             sole: (runningModels || []).length === 1 }
+  }
+
+  // KV size for an entry, with the tier that answered: Tier 3.5 (the engine's
+  // own accounting — exact, no marker) → Tier 4 (derivation from the header,
+  // "~") → nothing ("—"). Never a fabricated number.
+  function _resolveKvBytes(entry) {
+    var e = entry || {}
+    if (e.kvBytesExact > 0) return { tier: 3, value: e.kvBytesExact, marker: "" }
+    if (e.kvCacheBytes >= 0) return { tier: 4, value: e.kvCacheBytes, marker: "~" }
+    return { tier: null, value: -1, marker: "—" }
+  }
+
+  //  refresh (no re-read). Unknown/unreadable → the entry keeps -1 ("—").
+
+
+  property var _ggufCache: ({})   // path -> {bc, hc, hckv, hckvArr, kl, vl, ... arch}
   property string _ggufPath: ""   // path currently being read (single-flight)
   property string _ggufBuffer: ""
-  readonly property int _ggufBufferMax: 512
+  readonly property int _ggufBufferMax: 4096
 
   function _onGgufLine(line) {
     var s = String(line || "")
@@ -1648,36 +2257,23 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
     // preset before falling back to the measured-VRAM estimate (Tier 3). A
     // resolved value is EXACT (source "preset", tier above "probe").
     _applyGgufPresetSplit(entry)
-    // Fallback: when ngl is unknown and _mtpSplit returned nulls,
-    // estimate from measured VRAM (Tier 3).
-    if (entry.mainGpu === null && entry.ngl === "") {
-      var probe = _estimateSplitFromProbes(
-        entry.sizeBytes > 0 ? entry.sizeBytes : 0,
-        total,
-        serviceVramBytes
-      )
-      if (probe) {
-        entry.mainGpu = probe.gpuLayers
-        entry.mainCpu = probe.cpuLayers
-        entry._gpuSplitSource = "probe"
-      }
-    } else if (entry._gpuSplitSource !== "preset" && entry._gpuSplitSource !== "probe") {
-      entry._gpuSplitSource = "api"
-    }
     var ctx = (isFinite(entry.contextLen) && entry.contextLen > 0) ? entry.contextLen : -1
-    var hc = (g.hc > 0) ? g.hc : -1
-    // MHA models omit head_count_kv → KV heads == query heads.
-    var hckv = (g.hckv > 0) ? g.hckv : ((hc > 0) ? hc : -1)
-    var embd = (g.embd > 0) ? g.embd : -1
-    var headDim = (hc > 0 && embd > 0) ? embd / hc : -1
-    // Only full-attention layers store context-scaling KV (hybrid models keep
-    // a fixed recurrent state in the rest); no interval key → all main layers.
-    var fai = (isFinite(g.fai) && g.fai > 1) ? Math.round(g.fai) : -1
-    var kvLayers = entry.mainLayers
-    if (fai > 1 && entry.mainLayers > 0) kvLayers = Math.max(1, Math.round(entry.mainLayers / fai))
-    if (!isFinite(kvLayers) || kvLayers <= 0) kvLayers = total
-    entry.kvCacheBytes = _kvEstimateBytes(kvLayers, ctx, hckv, headDim,
-      _kvDtypeBits(entry.cacheK), _kvDtypeBits(entry.cacheV))
+    // Tier 4 BLOCK: per-layer KV allocation derived from the header (SWA /
+    // recurrent / shared / MLA). Unknown shape → -1, and the engine probe
+    // (Tier 3.5) is what answers for architectures whose files don't describe
+    // their own layout. _resolveKvBytes picks whichever of the two exists.
+    entry.kvCacheBytes = _kvEstimateBytesArch(_buildKvLayers(g, entry.mainLayers, ctx, {
+      ubatch: (isFinite(entry.ubatch) && entry.ubatch > 0) ? entry.ubatch : 512,
+      parallel: (isFinite(entry.parallel) && entry.parallel > 0) ? entry.parallel : 1,
+      swaFull: entry.swaFull === true,
+      kvUnified: entry.noKvUnified !== true
+    }), _kvDtypeBits(entry.cacheK), _kvDtypeBits(entry.cacheV))
+    // Fallback: when ngl is unknown and _mtpSplit returned nulls, estimate from
+    // measured device memory (Tier 3). Runs after the KV derivation because it
+    // subtracts whatever the cache is holding on the device.
+    _applyProbeSplit(entry, total)
+    if (entry._gpuSplitSource !== "preset" && entry._gpuSplitSource !== "probe")
+      entry._gpuSplitSource = "api"
   }
 
   // Fold the parsed DRAFT (MTP) model header into its running-model entry: the
@@ -1716,7 +2312,10 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
     _ggufBuffer = ""
     var path = _ggufPath
     _ggufPath = ""
-    var bc = -1, hc = -1, hckv = -1, embd = -1, npl = -1, fai = -1, sz = -1, ft = -1, ok = false
+    var arch = "", bc = -1, hc = -1, hckv = -1, hckvArr = null, embd = -1, npl = -1, fai = -1
+    var kl = -1, vl = -1, klswa = -1, vlswa = -1, swa = -1, sharedKv = -1
+    var swaPattern = -1, swaPatternArr = null, recurrentArr = null
+    var kvLoraRank = -1, ropeDim = -1, sz = -1, ft = -1, ok = false
     var lines = raw.split("\n")
     for (var i = 0; i < lines.length; i++) {
       var line = String(lines[i]).trim()
@@ -1724,19 +2323,50 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
       var eq = line.indexOf("=")
       if (eq <= 0) continue
       var key = line.substring(0, eq)
-      var val = parseInt(line.substring(eq + 1), 10)
-      if (key === "block_count") bc = isFinite(val) ? val : -1
+      var rest = line.substring(eq + 1)
+      // Arrays arrive as key=a:<v1>,<v2>,... (head_count_kv, sliding_window_
+      // pattern, recurrent_layers); everything else is a scalar.
+      if (rest.length > 1 && rest.charAt(0) === "a" && rest.charAt(1) === ":") {
+        var parts = rest.substring(2).split(",")
+        var arr = []
+        for (var p = 0; p < parts.length; p++) {
+          var av = parseInt(parts[p], 10)
+          if (isFinite(av)) arr.push(av)
+        }
+        if (key === "head_count_kv") hckvArr = arr
+        else if (key === "sliding_window_pattern") swaPatternArr = arr
+        else if (key === "recurrent_layers") recurrentArr = arr
+        continue
+      }
+      var val = parseInt(rest, 10)
+      if (key === "arch") arch = rest
+      else if (key === "block_count") bc = isFinite(val) ? val : -1
       else if (key === "head_count_kv") hckv = isFinite(val) ? val : -1
       else if (key === "head_count") hc = isFinite(val) ? val : -1
       else if (key === "embedding_length") embd = isFinite(val) ? val : -1
       else if (key === "nextn_predict_layers") npl = isFinite(val) ? val : -1
       else if (key === "full_attention_interval") fai = isFinite(val) ? val : -1
+      else if (key === "key_length") kl = isFinite(val) ? val : -1
+      else if (key === "value_length") vl = isFinite(val) ? val : -1
+      else if (key === "key_length_swa") klswa = isFinite(val) ? val : -1
+      else if (key === "value_length_swa") vlswa = isFinite(val) ? val : -1
+      else if (key === "sliding_window") swa = isFinite(val) ? val : -1
+      else if (key === "shared_kv_layers") sharedKv = isFinite(val) ? val : -1
+      else if (key === "sliding_window_pattern") swaPattern = isFinite(val) ? val : -1
+      else if (key === "kv_lora_rank") kvLoraRank = isFinite(val) ? val : -1
+      else if (key === "rope_dimension_count") ropeDim = isFinite(val) ? val : -1
       else if (key === "size") sz = isFinite(val) ? val : -1
       else if (key === "file_type") ft = isFinite(val) ? val : -1
     }
     // Only cache a confirmed GGUF header with a usable layer count.
     if (!ok || bc < 0 || path === "") return
-    _ggufCache[path] = { bc: bc, hc: hc, hckv: hckv, embd: embd, npl: npl, fai: fai, sz: sz, ft: ft }
+    _ggufCache[path] = {
+      arch: arch, bc: bc, hc: hc, hckv: hckv, hckvArr: hckvArr, embd: embd,
+      npl: npl, fai: fai, kl: kl, vl: vl, klswa: klswa, vlswa: vlswa,
+      swa: swa, sharedKv: sharedKv, swaPattern: swaPattern,
+      swaPatternArr: swaPatternArr, recurrentArr: recurrentArr,
+      kvLoraRank: kvLoraRank, ropeDim: ropeDim, sz: sz, ft: ft
+    }
     _applyGgufToRunning(path, _ggufCache[path])
   }
 
@@ -2251,10 +2881,13 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
   }
 
   // llama.cpp user service → current DRAM working set (bytes). Sums anon+shmem
-  // from the service cgroup's memory.stat: committed, non-reclaimable process
-  // memory. MemoryCurrent is avoided because it also counts reclaimable
-  // file/page cache (the mmap'd GGUF), which inflates the footprint and
-  // double-counts weight pages already held as anon or on the GPU.
+  // from the instance cgroup's memory.stat: committed, non-reclaimable process
+  // memory. The cgroup comes from systemd's ControlGroup, else from the
+  // instance's own /proc/<pid>/cgroup (the preset router's workers are in the
+  // same cgroup, and memory.stat is hierarchical, so the KV cache on the host
+  // is counted). MemoryCurrent is only a last resort because it also counts
+  // reclaimable file/page cache (the mmap'd GGUF), which inflates the
+  // footprint and double-counts weight pages already held as anon or on the GPU.
   Process {
     id: serviceMemoryProcess
     running: false
@@ -2287,6 +2920,39 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
       serviceVramWatchdog.stop()
       if (exitCode === 0) _finishServiceVram()
       else { _serviceVramBuffer = ""; serviceVramBytes = -1; _deriveServiceTotal() }
+    }
+  }
+
+  // llama.cpp → Tier 3.5 engine KV accounting probe. The model's own
+  // KV-relevant flags are replayed against `llama-cli` with -ngl 0 under an
+  // address-space cap (kvProbeScript), and llama.cpp's own log lines are parsed
+  // for the exact cache bytes, cache layer count and device graph reserve. The
+  // model path, every flag and every byte count travel as positional arguments
+  // — nothing is ever interpolated into the script — so an untrusted
+  // --model value cannot become shell. Never throws: any failure caches "no
+  // answer" for that signature and the header derivation answers instead.
+  Process {
+    id: kvProbeProcess
+    running: false
+    command: ["timeout", "-k", "2", "" + root.kvProbeTimeoutSec,
+              "bash", "-c", root.kvProbeScript, "dash",
+              root.kvProbeBinary,
+              "" + (root._kvProbeModelBytes > 0 ? root._kvProbeModelBytes : 0),
+              "" + (root._kvProbeKvGuess > 0 ? root._kvProbeKvGuess : 0)]
+      .concat(root._kvProbeArgvList)
+    stdout: SplitParser { onRead: function(line) { root._onKvProbeLine(line) } }
+    // llama.cpp logs EVERYTHING — including all of the llama_kv_cache and
+    // sched_reserve accounting — on stderr; its stdout carries only the prompt
+    // echo and the generated text (measured: 3,116 stderr lines, 32 stdout
+    // lines, 0 KV lines on stdout for gemma-4-26b). A stdout-only reader would
+    // therefore see nothing at all and the probe would silently never answer,
+    // so both channels feed the same fold.
+    stderr: SplitParser { onRead: function(line) { root._onKvProbeLine(line) } }
+    onExited: function(exitCode) {
+      kvProbeWatchdog.stop()
+      // The `timeout` wrapper exits 124 on expiry and 137 after SIGKILL; only a
+      // clean 0 means llama.cpp got through load, one turn and teardown.
+      _finishKvProbe(exitCode === 0)
     }
   }
 
@@ -2594,6 +3260,25 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
     interval: watchdogMs
     repeat: false
     onTriggered: reap(serviceVramProcess, serviceVramWatchdog)
+  }
+
+  // Backup watchdog for the KV probe. Longer than the probe's own `timeout`
+  // (which handles the process group) because the probe legitimately takes a
+  // few seconds to load a model and build a context.
+  Timer {
+    id: kvProbeWatchdog
+    interval: root.kvProbeWatchdogMs
+    repeat: false
+    // A probe that overran its timeout is answered as "no answer", not with
+    // whatever partial totals it managed to print: half a model's caches is a
+    // number that looks right and is wrong. Clearing the accumulator first makes
+    // _finishKvProbe cache `false` and hand the field back to the header
+    // derivation, and drains the queue so the next model still gets probed.
+    onTriggered: {
+      reap(kvProbeProcess, kvProbeWatchdog)
+      root._kvProbeAcc = { kvBytes: 0, kvLayers: 0, computeBytes: -1, blocks: [], compute: ({}), computeSeen: [] }
+      root._finishKvProbe(false)
+    }
   }
 
   Timer {
