@@ -113,9 +113,11 @@ Item {
     A.ok("mtp-e2e/draft-file-size", draftLine2.indexOf("Draft: mtp | 1 layer | " + s.formatGB(DRAFT_SIZE)) === 0)
     A.ok("mtp-e2e/draft-on-gpu", draftLine2.indexOf("on GPU") !== -1)
 
-    // 3. Split totals (the bug fix): the real _mtpSplit helper pins the
-    //    exact split, then a synthetic entry proves CPU Total shows its
-    //    weight bytes even though the KV cache is colocated on GPU.
+    // 3. Split totals (the bug fix): the real _mtpSplit helper pins the exact
+    //    split, then a synthetic entry proves CPU Total shows its weight bytes
+    //    even when the KV cache is not accounted to it. Two loaded models share
+    //    one cgroup, so neither cgroup reading belongs to this entry and the
+    //    cache is attributed to NO device until something can prove otherwise.
     var split3 = s._mtpSplit("30", 65, 1)
     A.check("mtp-e2e/split-mainGpu", split3.mainGpu, 30)
     A.check("mtp-e2e/split-mainCpu", split3.mainCpu, 34)
@@ -139,7 +141,41 @@ Item {
     var coreCpuW = Math.round(BASE_SIZE * 34 / 65)
     A.ok("mtp-e2e/split-cpu-total-not-empty", lineOf(d3, "CPU Total:").indexOf("CPU Total: \u2014") !== 0)
     A.check("mtp-e2e/split-cpu-total", lineOf(d3, "CPU Total:"), "CPU Total: ~" + s.formatGB(coreCpuW + DRAFT_SIZE))
-    A.check("mtp-e2e/split-gpu-total", lineOf(d3, "GPU Total:"), "GPU Total: ~" + s.formatGB(coreGpuW + KV))
+    A.check("mtp-e2e/split-gpu-total", lineOf(d3, "GPU Total:"), "GPU Total: ~" + s.formatGB(coreGpuW))
+    // ...and the lines say so instead of guessing a device.
+    A.check("mtp-e2e/split-context-unplaced", lineOf(d3, "Context:"), "Context: 131,072 tok")
+    A.ok("mtp-e2e/split-kv-unplaced", lineOf(d3, "KV Cache:").indexOf(" on ") === -1)
+
+    // 3b. Same weights, cache now attributable: --no-kv-offload pins it to host
+    //     RAM, so the CPU total must grow by exactly the cache and the GPU total
+    //     must not. This is the colocation case the original bug was about, now
+    //     reached through a fact instead of an assumption.
+    var e3b = {}
+    for (var k3 in e3) e3b[k3] = e3[k3]
+    e3b.noKvOffload = true
+    var d3b = sec.llamaDetailBlock(e3b)
+    A.check("mtp-e2e/split-kv-on-cpu", lineOf(d3b, "KV Cache:").indexOf(" on CPU") !== -1, true)
+    A.check("mtp-e2e/split-cpu-total-with-kv", lineOf(d3b, "CPU Total:"),
+      "CPU Total: ~" + s.formatGB(coreCpuW + DRAFT_SIZE + KV))
+    A.check("mtp-e2e/split-gpu-total-without-kv", lineOf(d3b, "GPU Total:"),
+      "GPU Total: ~" + s.formatGB(coreGpuW))
+
+    // 3c. Single loaded model + a cgroup reading that puts the cache on the
+    //     device: host anon (100 MB) is below the 200 MB cache, so no host block
+    //     can be holding it, and the service does hold device memory. The GPU
+    //     total grows by the cache, the CPU total does not.
+    s.runningModels = [e3]
+    s.serviceMemoryBytes = 100000000
+    s.serviceVramBytes = 8 * 1024 * 1024 * 1024
+    var d3c = sec.llamaDetailBlock(e3)
+    A.check("mtp-e2e/split-kv-on-gpu", lineOf(d3c, "KV Cache:").indexOf(" on GPU") !== -1, true)
+    A.check("mtp-e2e/split-gpu-total-with-kv", lineOf(d3c, "GPU Total:"),
+      "GPU Total: ~" + s.formatGB(coreGpuW + KV))
+    A.check("mtp-e2e/split-cpu-total-still-weights", lineOf(d3c, "CPU Total:"),
+      "CPU Total: ~" + s.formatGB(coreCpuW + DRAFT_SIZE))
+    s.serviceMemoryBytes = -1
+    s.serviceVramBytes = -1
+    s.runningModels = [s.runningModels[0], e3]
 
     A.finish()
   }

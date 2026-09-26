@@ -78,13 +78,298 @@ Item {
     A.check("kvest/unknown-kbits", s._kvEstimateBytes(1, 1024, 1, 64, -1, 8), -1)
     A.check("kvest/unknown-vbits", s._kvEstimateBytes(1, 1024, 1, 64, 8, -1), -1)
 
-    // ── _estimateSplitFromProbes: VRAM → layer estimate (~; null when unknown) ─
-    // VRAM is reduced by the rough KV-cache estimate before the weight ratio.
-    A.check("probe/empty-vram", s._estimateSplitFromProbes(100, 65, -1), null)
-    A.check("probe/no-size", s._estimateSplitFromProbes(0, 65, 2*1024*1024*1024), null)
-    A.check("probe/full-gpu", s._estimateSplitFromProbes(10*1024*1024*1024, 65, 9*1024*1024*1024), {gpuLayers: 57, cpuLayers: 8, ctxOn: "GPU"})
-    A.check("probe/full-cpu", s._estimateSplitFromProbes(10*1024*1024*1024, 65, 0), null)
-    A.check("probe/half-gpu", s._estimateSplitFromProbes(10*1024*1024*1024, 65, 5*1024*1024*1024), {gpuLayers: 31, cpuLayers: 34, ctxOn: "GPU"})
+    // ── Architecture-aware KV: _kvCellsForType / _buildKvLayers /
+    // _kvEstimateBytesArch (real per-architecture shapes, not a uniform product).
+    // All unknown inputs → null / -1 ("—"). ────────────────────────────────
+    // There is deliberately no per-architecture SWA-period table in the service:
+    // llama.cpp owns those constants in its own source and a copy goes stale the
+    // next time upstream changes a model, so a missing pattern key is answered
+    // by the engine probe (Tier 3.5) instead. Pinned here so re-adding one fails.
+    A.check("kvarch/no-arch-table", typeof s._swaPeriodFor, "undefined")
+    A.check("kvarch/no-arch-switch", /_swaPeriodFor|gemma3|gemma4|llama4|cohere2|gpt_oss|gemma3n/
+      .test(String(s.kvProbeScript)), false)
+
+    A.check("kvarch/cells-full", s._kvCellsForType(false, 262144, 1024, 512, false, true, 1), 262144)
+    A.check("kvarch/cells-swa", s._kvCellsForType(true, 262144, 1024, 512, false, true, 1), 1536)
+    A.check("kvarch/cells-swa-full", s._kvCellsForType(true, 262144, 1024, 512, true, true, 1), 262144)
+    A.check("kvarch/cells-pad256", s._kvCellsForType(true, 65536, 1000, 32, false, true, 1), 1280)
+    A.check("kvarch/cells-clamp", s._kvCellsForType(true, 2048, 1024, 512, false, true, 1), 1536)
+    A.check("kvarch/cells-unknown-window", s._kvCellsForType(true, 262144, -1, 512, false, true, 1), -1)
+    A.check("kvarch/cells-badctx", s._kvCellsForType(false, 0, 1024, 512, false, true, 1), -1)
+
+    // gemma4-26b-a4b real shape: 30 layers, pattern [swa×5, full], kvHeads 8/2,
+    // key_length 512 / key_length_swa 256 / sliding_window 1024 / ctx 262144.
+    // 5 full layers × 2×512×262144×4 + 25 SWA × 8×256×1536×4 = 5,683,281,920 B
+    var gm4Heads = [], gm4Pat = []
+    for (var g4i = 0; g4i < 30; g4i++) {
+      gm4Heads.push((g4i + 1) % 6 === 0 ? 2 : 8)
+      gm4Pat.push((g4i + 1) % 6 === 0 ? 0 : 1)
+    }
+    var ggemma4 = { arch: "gemma4", bc: 30, hc: 16, hckv: -1, hckvArr: gm4Heads,
+      embd: 2816, kl: 512, vl: 512, klswa: 256, vlswa: 256, swa: 1024,
+      swaPattern: -1, swaPatternArr: gm4Pat, recurrentArr: null, fai: -1,
+      sharedKv: -1, kvLoraRank: -1, ropeDim: -1 }
+    var sv4 = s._buildKvLayers(ggemma4, 30, 262144, { ubatch: 512, parallel: 1, swaFull: false, kvUnified: true })
+    A.ok("kvarch/gemma4-spec", sv4 !== null)
+    A.check("kvarch/gemma4-count", sv4.layers.length, 30)
+    A.check("kvarch/gemma4-first-full", sv4.layers[5].kvHeads, 2)
+    A.check("kvarch/gemma4-swa-cells", sv4.layers[0].cells, 1536)
+    A.check("kvarch/gemma4-full-cells", sv4.layers[5].cells, 262144)
+    A.check("kvarch/gemma4-bytes", s._kvEstimateBytesArch(sv4, 16, 16), 5683281920)
+    A.check("kvarch/gemma4-formatGB", s.formatGB(5683281920), "5.3 GB")
+    // q8_0 KV halves the bytes (8.5/16 per element).
+    A.check("kvarch/gemma4-q8", s._kvEstimateBytesArch(sv4, 8.5, 8.5), 3019243520)
+    // The deployed gemma-4-26b-a4b-qat args (ctx 262144, K/V q8_0, parallel 1,
+    // ubatch 512, no --swa-full, -kvu): 5 full layers × 544 MiB
+    // (2 heads × (512 K + 512 V) × 8.5/8 B × 262144 cells) + 25 SWA layers ×
+    // 6.375 MiB (8 heads × (256 K + 256 V) × 8.5/8 B × 1536 cells) = 2,879.375 MiB,
+    // byte-for-byte llama.cpp's own `llama_kv_cache: size =` line. The i32
+    // head_count_kv array (2 on the full layers) is what makes this 2.8 GiB
+    // instead of the 21.6 GB the head_count fallback produced.
+    var sv4u = s._buildKvLayers(ggemma4, 30, 262144,
+      { ubatch: 512, parallel: 1, swaFull: false, kvUnified: false })
+    A.check("kvarch/gemma4-deployed-bytes", s._kvEstimateBytesArch(sv4u, 8.5, 8.5), 3019243520)
+    A.check("kvarch/gemma4-deployed-mib", Math.round(3019243520 / 1048576 * 1000) / 1000, 2879.375)
+    A.check("kvarch/gemma4-deployed-formatGB", s.formatGB(3019243520), "2.8 GB")
+    // Drop the per-layer head_count_kv array AND the pattern array and the header
+    // no longer describes its own layer layout: head_count (16) on every layer
+    // would claim 21.56 GiB — the ~21.6 GB figure this whole path exists to
+    // avoid — so the derivation answers nothing and the engine probe does.
+    var g4NoArr = {}
+    for (var g4k in ggemma4) g4NoArr[g4k] = ggemma4[g4k]
+    g4NoArr.hckvArr = null
+    g4NoArr.swaPatternArr = null
+    A.check("kvarch/gemma4-no-pattern-unknown", s._buildKvLayers(g4NoArr, 30, 262144,
+      { ubatch: 512, parallel: 1, swaFull: false, kvUnified: false }), null)
+    A.check("kvarch/gemma4-no-pattern-bytes", s._kvEstimateBytesArch(
+      s._buildKvLayers(g4NoArr, 30, 262144,
+        { ubatch: 512, parallel: 1, swaFull: false, kvUnified: false }), 8.5, 8.5), -1)
+
+    // qwen35 hybrid: recurrent_layers array vs full_attention_interval fallback
+    // must count the SAME full layers (parity). headK = embd/n_head fallback.
+    // sliding_window 0 declares a dense cache, which is what keeps this test
+    // about layer SELECTION (which layers keep a context cache at all) instead of
+    // about SWA; without such a declaration the same fixture is unknown below.
+    var gqw = { arch: "qwen35", bc: 65, hc: 24, hckv: 4, hckvArr: null, embd: 5120,
+      kl: -1, vl: -1, klswa: -1, vlswa: -1, swa: 0, swaPattern: -1,
+      swaPatternArr: null, recurrentArr: null, fai: 4, sharedKv: -1,
+      kvLoraRank: -1, ropeDim: -1 }
+    var svF = s._buildKvLayers(gqw, 64, 96256, { ubatch: 512, parallel: 1, swaFull: false, kvUnified: true })
+    A.check("kvarch/qwen35-fai-count", svF.layers.length, 16)
+    var recIdx = []
+    for (var qs = 0; qs < 64; qs++) if ((qs + 1) % 4 !== 0) recIdx.push(qs)
+    var gqwR = { arch: "qwen35", bc: 65, hc: 24, hckv: 4, hckvArr: null, embd: 5120,
+      kl: -1, vl: -1, klswa: -1, vlswa: -1, swa: 0, swaPattern: -1,
+      swaPatternArr: null, recurrentArr: recIdx, fai: -1, sharedKv: -1,
+      kvLoraRank: -1, ropeDim: -1 }
+    var svR = s._buildKvLayers(gqwR, 64, 96256, { ubatch: 512, parallel: 1, swaFull: false, kvUnified: true })
+    A.check("kvarch/qwen35-array-count", svR.layers.length, 16)
+    A.check("kvarch/qwen35-parity", s._kvEstimateBytesArch(svR, 5.25, 4.5),
+      s._kvEstimateBytesArch(svF, 5.25, 4.5))
+    A.check("kvarch/qwen35-count-parity", svR.layers.length, svF.layers.length)
+    A.check("kvarch/qwen35-dense-bytes", s._kvEstimateBytesArch(svF, 5.25, 4.5),
+      s._kvEstimateBytes(16, 96256, 4, 5120 / 24, 5.25, 4.5))
+    // The same hybrid with no SWA declaration is unknown, not dense-by-default.
+    var gqwU = {}
+    for (var qw in gqw) gqwU[qw] = gqw[qw]
+    gqwU.swa = -1
+    A.check("kvarch/qwen35-undeclared-unknown", s._buildKvLayers(gqwU, 64, 96256,
+      { ubatch: 512, parallel: 1, swaFull: false, kvUnified: true }), null)
+
+    // shared_kv_layers: the tail layers reuse earlier KV → excluded from count.
+    var gsh = { arch: "llama", bc: 30, hc: 16, hckv: -1, hckvArr: null, embd: 2816,
+      kl: -1, vl: -1, klswa: -1, vlswa: -1, swa: 0, swaPattern: -1,
+      swaPatternArr: null, recurrentArr: null, fai: -1, sharedKv: 6,
+      kvLoraRank: -1, ropeDim: -1 }
+    var svSh = s._buildKvLayers(gsh, 30, 262144, { ubatch: 512, parallel: 1, swaFull: false, kvUnified: true })
+    A.check("kvarch/shared-count", svSh.layers.length, 24)
+    A.check("kvarch/shared-bytes", s._kvEstimateBytesArch(svSh, 16, 16),
+      s._kvEstimateBytes(24, 262144, 16, 2816 / 16, 16, 16))
+
+    // SWA declared (sliding_window > 0) but no pattern key: the PERIOD lives in
+    // llama.cpp's gemma3 source, not in the file, so the header path must not
+    // invent one (it used to hardcode 6) — the engine probe answers instead.
+    var gg3 = { arch: "gemma3", bc: 24, hc: 8, hckv: 4, hckvArr: null, embd: 1280,
+      kl: 256, vl: 256, klswa: 128, vlswa: 128, swa: 512, swaPattern: -1,
+      swaPatternArr: null, recurrentArr: null, fai: -1, sharedKv: -1,
+      kvLoraRank: -1, ropeDim: -1 }
+    A.check("kvarch/gemma3-swa-period-unknown", s._buildKvLayers(gg3, 24, 32768,
+      { ubatch: 512, parallel: 1, swaFull: false, kvUnified: true }), null)
+    // The same model with an explicit period in the file describes itself
+    // completely: every 6th layer full, the rest SWA at 128-wide rows.
+    var gg3p = {}
+    for (var g3k in gg3) gg3p[g3k] = gg3[g3k]
+    gg3p.swaPattern = 6
+    var svG3 = s._buildKvLayers(gg3p, 24, 32768, { ubatch: 512, parallel: 1, swaFull: false, kvUnified: true })
+    var fullG3 = 0
+    for (var g3i = 0; g3i < svG3.layers.length; g3i++) if (svG3.layers[g3i].cells === 32768) fullG3++
+    A.check("kvarch/gemma3-total", svG3.layers.length, 24)
+    A.check("kvarch/gemma3-full-count", fullG3, 4)
+    // attention.sliding_window == 0 is an explicit "no SWA" declaration that
+    // every llama.cpp source reading that key treats as KV_TYPE_NONE, so a
+    // dense model answers from the header alone.
+    var gdense = { arch: "llama", bc: 32, hc: 32, hckv: 8, hckvArr: null, embd: 4096,
+      kl: -1, vl: -1, klswa: -1, vlswa: -1, swa: 0, swaPattern: -1,
+      swaPatternArr: null, recurrentArr: null, fai: -1, sharedKv: -1,
+      kvLoraRank: -1, ropeDim: -1 }
+    var svDense = s._buildKvLayers(gdense, 32, 8192, { ubatch: 512, parallel: 1, swaFull: false, kvUnified: true })
+    A.check("kvarch/dense-declared-layers", svDense.layers.length, 32)
+    A.check("kvarch/dense-declared-cells", svDense.layers[0].cells, 8192)
+    A.check("kvarch/dense-declared-bytes", s._kvEstimateBytesArch(svDense, 16, 16),
+      s._kvEstimateBytes(32, 8192, 8, 4096 / 32, 16, 16))
+    // Absent sliding_window is NOT such a declaration: llama4 builds an SWA cache
+    // without one, so absence must stay unknown rather than reading as dense.
+    var gabs = {}
+    for (var gk in gdense) gabs[gk] = gdense[gk]
+    gabs.swa = -1
+    A.check("kvarch/absent-window-not-dense", s._buildKvLayers(gabs, 32, 8192,
+      { ubatch: 512, parallel: 1, swaFull: false, kvUnified: true }), null)
+
+    // key_length explicit wins over embd/n_head; absent key → old-formula parity.
+    var gkl = { arch: "llama", bc: 2, hc: 8, hckv: 4, hckvArr: null, embd: 2048,
+      kl: 512, vl: -1, klswa: -1, vlswa: -1, swa: 0, swaPattern: -1,
+      swaPatternArr: null, recurrentArr: null, fai: -1, sharedKv: -1,
+      kvLoraRank: -1, ropeDim: -1 }
+    var svKl = s._buildKvLayers(gkl, 2, 8192, { ubatch: 512, parallel: 1, swaFull: false, kvUnified: true })
+    A.check("kvarch/keylen-explicit", s._kvEstimateBytesArch(svKl, 16, 16), 134217728)
+    var gfk = { arch: "llama", bc: 2, hc: 8, hckv: 4, hckvArr: null, embd: 2048,
+      kl: -1, vl: -1, klswa: -1, vlswa: -1, swa: 0, swaPattern: -1,
+      swaPatternArr: null, recurrentArr: null, fai: -1, sharedKv: -1,
+      kvLoraRank: -1, ropeDim: -1 }
+    var svFk = s._buildKvLayers(gfk, 2, 8192, { ubatch: 512, parallel: 1, swaFull: false, kvUnified: true })
+    A.check("kvarch/keylen-fallback", s._kvEstimateBytesArch(svFk, 16, 16), 67108864)
+    A.check("kvarch/keylen-fallback-parity", s._kvEstimateBytesArch(svFk, 16, 16),
+      s._kvEstimateBytes(2, 8192, 4, 2048 / 8, 16, 16))
+
+    // MLA (DeepSeek-style): kv_lora_rank + rope dims K-only, dense full-ctx.
+    var gmla = { arch: "deepseek2", bc: 61, hc: 8, hckv: 8, hckvArr: null, embd: 2048,
+      kl: -1, vl: -1, klswa: -1, vlswa: -1, swa: -1, swaPattern: -1,
+      swaPatternArr: null, recurrentArr: null, fai: -1, sharedKv: -1,
+      kvLoraRank: 512, ropeDim: 64 }
+    var svMla = s._buildKvLayers(gmla, 61, 4096, { ubatch: 512, parallel: 1, swaFull: false, kvUnified: true })
+    A.ok("kvarch/mla-K-only", svMla.layers[0].hasV === false)
+    A.check("kvarch/mla-bytes", s._kvEstimateBytesArch(svMla, 16, 16), 287834112)
+
+    // Unknown shapes degrade to "—": -1 / null.
+    A.check("kvarch/unknown-shape", s._kvEstimateBytesArch(
+      s._buildKvLayers({ bc: 30, arch: "llama" }, 30, 262144,
+        { ubatch: 512, parallel: 1, swaFull: false, kvUnified: true }), 16, 16), -1)
+    A.check("kvarch/unknown-ctx", s._kvEstimateBytesArch(
+      s._buildKvLayers(ggemma4, 30, -1, { ubatch: 512, parallel: 1, swaFull: false, kvUnified: true }), 16, 16), -1)
+    A.check("kvarch/unknown-kbits", s._kvEstimateBytesArch(sv4, -1, 16), -1)
+    A.check("kvarch/unknown-vbits", s._kvEstimateBytesArch(sv4, 16, -1), -1)
+    A.check("kvarch/null-spec", s._kvEstimateBytesArch(null, 16, 16), -1)
+
+    // _finishGguf array-line parse: key=a:v1,v2,... → hckvArr/swaPatternArr.
+    s._ggufCache = ({})
+    s.runningModels = [{ modelPath: "/m/g5.gguf", draftPath: "", ngl: "all", contextLen: 262144,
+      sizeBytes: 0, cacheK: "", cacheV: "" }]
+    s._ggufPath = "/m/g5.gguf"
+    s._ggufBuffer = "GGUF-OK\narch=gemma4\nblock_count=2\nhead_count=16\nembedding_length=2816\n" +
+      "key_length=512\nkey_length_swa=256\nvalue_length=512\nvalue_length_swa=256\nsliding_window=1024\n" +
+      "sliding_window_pattern=a:1,1,1,1,1,0\nhead_count_kv=a:8,8,8,8,8,2\n"
+    s._finishGguf()
+    A.check("gguf/array-arch", s._ggufCache["/m/g5.gguf"].arch, "gemma4")
+    A.check("gguf/array-hckv-first", s._ggufCache["/m/g5.gguf"].hckvArr[0], 8)
+    A.check("gguf/array-hckv-last", s._ggufCache["/m/g5.gguf"].hckvArr[5], 2)
+    A.check("gguf/array-swa-pattern", s._ggufCache["/m/g5.gguf"].swaPatternArr[5], 0)
+    A.check("gguf/array-fold-kv", s.runningModels[0].kvCacheBytes, 25165824)
+
+    // Arg-parse flags: --ubatch/-ub, --parallel/-np, --swa-full, -kvu/--no-kv-unified.
+    var pf = s._parseLlamaArgs(["--ubatch", "320", "--parallel", "4", "--swa-full", "-kvu"])
+    A.check("args-kv/ubatch", pf.ubatch, 320)
+    A.check("args-kv/parallel", pf.parallel, 4)
+    A.check("args-kv/swaFull", pf.swaFull, true)
+    A.check("args-kv/noKvUnified", pf.noKvUnified, true)
+    var pfi = s._parseLlamaArgs(["-ub=320", "-np=2", "--no-kv-unified"])
+    A.check("args-kv/ubatch-inline", pfi.ubatch, 320)
+    A.check("args-kv/parallel-inline", pfi.parallel, 2)
+    A.check("args-kv/noKvUnified-long", pfi.noKvUnified, true)
+    var pfd = s._parseLlamaArgs([])
+    A.check("args-kv/default-ubatch", pfd.ubatch, 512)
+    A.check("args-kv/default-parallel", pfd.parallel, 1)
+    A.check("args-kv/default-swaFull", pfd.swaFull, false)
+    A.check("args-kv/default-noKvUnified", pfd.noKvUnified, false)
+
+    // ── _kvPlacement: where the KV cache actually lives ──────────────────────
+    // Only two things decide, and both are facts rather than a model of the
+    // engine's placement heuristic: the flags it was given, and where the bytes
+    // turned up. A KV-sized anonymous host block PROVES the cache is in RAM
+    // (llama.cpp maps weights with CPU_Mapped and the cache with plain CPU
+    // buffers, so a KV-sized anon+shmem block can only be the cache); its
+    // absence plus the presence of device memory PROVES the device by
+    // exhaustion. The old free-VRAM-vs-fit-target comparison needed llama.cpp's
+    // internal fit budget, which is version-specific and not readable — and it
+    // disagreed with the running worker on the very model this exists for.
+    // gemma-4-26b-a4b-qat as measured here: KV 3,019,243,520 B, service DRAM
+    // 3,070,361,600 B, service VRAM 13,144 MiB → CPU.
+    var KV4 = 3019243520
+    var VR4 = 13144 * 1048576
+    var MEM4 = 3070361600
+    var sole = { memBytes: MEM4, vramBytes: VR4, sole: true }
+    A.check("kvplace/no-kv-offload-cpu", s._kvPlacement(true, 30, 30, KV4, sole), "CPU")
+    A.check("kvplace/no-kv-offload-beats-measure", s._kvPlacement(true, 30, 30, -1, sole), "CPU")
+    A.check("kvplace/fit-dropped-cpu", s._kvPlacement(false, 30, 30, KV4, sole), "CPU")
+    A.check("kvplace/nothing-offloaded-cpu", s._kvPlacement(false, 0, 30, -1, sole), "CPU")
+    // A FULLY offloaded stack is not the mirror of -ngl 0 and must not be
+    // treated as one: the live gemma-4 worker runs all 30 layers on the device
+    // with its cache in host RAM, so "every layer is on the GPU" proves
+    // nothing about where the cache went.
+    A.check("kvplace/all-offloaded-not-proof", s._kvPlacement(false, 30, 30, KV4,
+      { memBytes: -1, vramBytes: VR4, sole: true }), "")
+    A.check("kvplace/all-offloaded-still-measured", s._kvPlacement(false, 30, 30, 2000000000,
+      { memBytes: 400000000, vramBytes: 5800000000, sole: true }), "GPU")
+    // A partial split is likewise not a measurement on its own.
+    A.check("kvplace/partial-needs-measurement", s._kvPlacement(false, 30, 64, KV4, sole), "CPU")
+    A.check("kvplace/partial-unknown-without-measurement", s._kvPlacement(false, 30, 64, KV4, {}), "")
+    // Cache on the device: host RAM holds far less than the cache, and the
+    // service does hold device memory.
+    A.check("kvplace/offloaded-gpu", s._kvPlacement(false, 65, 65, 2000000000,
+      { memBytes: 400000000, vramBytes: 5800000000, sole: true }), "GPU")
+    // Exactly at the boundary counts as host RAM (>=, not >): a cache that
+    // fills anon to the byte is a cache in RAM.
+    A.check("kvplace/host-boundary", s._kvPlacement(false, 30, 30, KV4,
+      { memBytes: KV4, vramBytes: VR4, sole: true }), "CPU")
+    A.check("kvplace/host-just-under", s._kvPlacement(false, 30, 30, KV4,
+      { memBytes: KV4 - 1, vramBytes: VR4, sole: true }), "GPU")
+    // No device context at all: the cache cannot be on a device, so it is RAM.
+    A.check("kvplace/no-device-context-cpu", s._kvPlacement(false, 30, 30, KV4,
+      { memBytes: 1000000, vramBytes: 0, sole: true }), "CPU")
+    // Multi-model router: both readings are the whole cgroup's, so neither can
+    // be attributed to this model. Only the flag branches may still answer.
+    A.check("kvplace/multi-model-unknown", s._kvPlacement(false, 30, 30, KV4,
+      { memBytes: MEM4, vramBytes: VR4, sole: false }), "")
+    A.check("kvplace/multi-model-still-exact", s._kvPlacement(true, 30, 30, KV4,
+      { memBytes: MEM4, vramBytes: VR4, sole: false }), "CPU")
+    // Unknowns must stay unknown ("" = the Context line just omits the device).
+    A.check("kvplace/unknown-kv", s._kvPlacement(false, 30, 30, -1, sole), "")
+    A.check("kvplace/unknown-dram", s._kvPlacement(false, 30, 30, KV4,
+      { memBytes: -1, vramBytes: VR4, sole: true }), "")
+    // The measurements answer even when the layer split didn't resolve.
+    A.check("kvplace/no-split-still-answers", s._kvPlacement(false, -1, -1, KV4, sole), "CPU")
+    A.check("kvplace/null-inputs", s._kvPlacement(null, null, null, null, null), "")
+
+    // ── _estimateSplitFromProbes: measured VRAM → layer estimate (~) ──────────
+    // Built only from measurements: the device footprint minus the cache when
+    // placement says the cache is there, minus the engine's compute-graph
+    // reserve, scaled by the model's real file size.
+    A.check("probe/empty-vram", s._estimateSplitFromProbes(100, 65, -1, 0, 0), null)
+    A.check("probe/no-size", s._estimateSplitFromProbes(0, 65, 2*1024*1024*1024, 0, 0), null)
+    A.check("probe/no-layers", s._estimateSplitFromProbes(10*1024*1024*1024, 0, 2*1024*1024*1024, 0, 0), null)
+    A.check("probe/full-gpu", s._estimateSplitFromProbes(10*1024*1024*1024, 65, 9*1024*1024*1024, 0, 0), {gpuLayers: 59, cpuLayers: 6})
+    // No weights left on the device once the cache is removed → nothing to
+    // split (returning null renders "—" instead of claiming 0 GPU layers).
+    A.check("probe/all-cache", s._estimateSplitFromProbes(10*1024*1024*1024, 65, 0, 0, 0), null)
+    A.check("probe/cache-exceeds-vram", s._estimateSplitFromProbes(10*1024*1024*1024, 65, 1024, 2048, 0), null)
+    A.check("probe/half-gpu", s._estimateSplitFromProbes(10*1024*1024*1024, 65, 5*1024*1024*1024, 0, 0), {gpuLayers: 33, cpuLayers: 32})
+    // Subtracting the measured cache and compute reserve tightens the estimate
+    // (fewer layers claimed than the raw footprint suggests) and clamps at 0.
+    A.check("probe/subtracts-cache", s._estimateSplitFromProbes(10*1024*1024*1024, 65,
+      5*1024*1024*1024, 1*1024*1024*1024, 0).gpuLayers, 26)
+    A.check("probe/subtracts-compute", s._estimateSplitFromProbes(10*1024*1024*1024, 65,
+      5*1024*1024*1024, 0, 1*1024*1024*1024).gpuLayers, 26)
+    A.check("probe/clamps-to-zero", s._estimateSplitFromProbes(10*1024*1024*1024, 65,
+      5*1024*1024*1024, 5*1024*1024*1024, 0), null)
 
     // ── _resolveRunningEntries: fresh reference + synchronous cached resolve ──
     s._ggufCache["/m/a.gguf"] = { bc: 65, hc: 24, hckv: 4, embd: 5120 }
@@ -95,7 +380,13 @@ Item {
     A.check("resolve/totalLayers", out[0].totalLayers, 65)
     A.check("resolve/mainGpu", out[0].mainGpu, 65)
     A.check("resolve/mainCpu", out[0].mainCpu, 0)
-    A.ok("resolve/kvCacheBytes", out[0].kvCacheBytes > 0)
+    A.check("resolve/kvCacheBytes-unknown", out[0].kvCacheBytes, -1)
+    // Tier 3.5 answers as soon as the engine has been asked.
+    out[0].kvBytesExact = 3019243520
+    var rk = s._resolveKvBytes(out[0])
+    A.check("resolve/kvBytes-exact-tier", rk.tier, 3)
+    A.check("resolve/kvBytes-exact-marker", rk.marker, "")
+    A.check("resolve/kvBytes-exact-value", rk.value, 3019243520)
 
     // ── _weightBytes: exact split / measured fallback / all unknown ───────────
     A.check("wbytes/split-known", s._weightBytes(100, 65, 0, 65, -1, -1), [100, 0])
@@ -137,8 +428,7 @@ Item {
       { vramBytes: 5*1024*1024*1024, presetSection: { "n-gpu-layers": "auto" } })
     A.check("rs/t5-auto-ignored-tier", rr.gpuSplit.tier, 3)
     A.check("rs/t5-auto-marker", rr.gpuSplit.marker, "~")
-    A.check("rs/t5-auto-value-gpu", rr.gpuSplit.value.mainGpu,
-      s._estimateSplitFromProbes(10*1024*1024*1024, 65, 5*1024*1024*1024).gpuLayers)
+    A.check("rs/t5-auto-value-gpu", rr.gpuSplit.value.mainGpu, 33)
 
     // Tier 3 live estimate: no API, no preset, VRAM available → the same
     // numbers _estimateSplitFromProbes yields, marked as an estimate.
@@ -146,9 +436,10 @@ Item {
       { vramBytes: 5*1024*1024*1024, memBytes: -1 })
     A.check("rs/t3-split-tier", rr.gpuSplit.tier, 3)
     A.check("rs/t3-split-marker", rr.gpuSplit.marker, "~")
-    A.check("rs/t3-split-gpu", rr.gpuSplit.value.mainGpu,
-      s._estimateSplitFromProbes(10*1024*1024*1024, 65, 5*1024*1024*1024).gpuLayers)
-    A.check("rs/t3-split-ctxOn", rr.gpuSplit.value.ctxOn, "GPU")
+    A.check("rs/t3-split-gpu", rr.gpuSplit.value.mainGpu, 33)
+    // Placement is decided from measurements, never inferred from the split:
+    // gpuSplit.value carries layer counts and nothing else.
+    A.check("rs/t3-split-no-ctxOn", rr.gpuSplit.value.ctxOn, undefined)
 
     // A STORED probe split is Tier 3 too the marker stays "~" through the
     // weight bytes (any `~` input keeps the line estimated).
@@ -239,8 +530,11 @@ Item {
     A.check("gguf/mainGpu", s.runningModels[0].mainGpu, 65)
     A.check("gguf/mainCpu", s.runningModels[0].mainCpu, 0)
     A.check("gguf/split-source-api", s.runningModels[0]._gpuSplitSource, "api")
-    A.ok("gguf/kvCacheBytes-est", s.runningModels[0].kvCacheBytes > 0)
-    A.check("gguf/kvCacheBytes-formula", s.runningModels[0].kvCacheBytes, s._kvEstimateBytes(65, 262144, 8, 5120 / 40, 16, 16))
+    // No pattern key and no sliding_window declaration: this header does not
+    // describe its own SWA layout, so the derivation answers nothing (the old
+    // head_count product claimed a dense cache that qwen3next does not build).
+    // The engine probe is what fills this in — see the Tier-3.5 block below.
+    A.check("gguf/kvCacheBytes-unknown", s.runningModels[0].kvCacheBytes, -1)
     // No MTP/interval keys → non-hybrid fallback: main = total, no MTP split.
     A.check("gguf/mainLayers-fallback", s.runningModels[0].mainLayers, 65)
     A.check("gguf/mtpLayers-fallback", s.runningModels[0].mtpLayers, 0)
@@ -273,7 +567,9 @@ Item {
     A.check("hybrid/mainLayers", s.runningModels[0].mainLayers, 64)
     A.check("hybrid/mtpLayers", s.runningModels[0].mtpLayers, 1)
     A.ok("hybrid/mtpSizeBytes", s.runningModels[0].mtpSizeBytes > 0)
-    A.check("hybrid/kvCacheBytes", s.runningModels[0].kvCacheBytes, s._kvEstimateBytes(16, 96256, 4, 5120 / 24, 5.25, 4.5))
+    // Same for the hybrid: the interval array says WHICH layers keep a context
+    // cache, not whether those layers slide, so the header alone cannot size it.
+    A.check("hybrid/kvCacheBytes", s.runningModels[0].kvCacheBytes, -1)
 
     // ── Integration: ngl unknown (fit = on) → probe fallback in _applyGguf ───
     s._ggufCache = ({})
@@ -493,6 +789,197 @@ Item {
     A.check("t5/finish-reapplied-mainGpu", s.runningModels[0].mainGpu, 80)
     A.check("t5/finish-reapplied-source", s.runningModels[0]._gpuSplitSource, "preset")
     A.ok("t5/finish-stop-republished", s.models.length === 2)
+
+    // ── Tier 3.5 engine KV accounting probe ────────────────────────────────
+    // llama.cpp prints the allocation it actually built; these are verbatim
+    // lines from `llama-cli --verbose -ngl 0` against the real gemma-4-26b-a4b
+    // at ctx 262144 / K=V q8_0, and the two caches (5 full + 25 SWA layers) are
+    // what sum to the 2,879.375 MiB the running worker holds.
+    A.ok("kvprobe/iswa-line", s._parseKvProbeLine("0.00.532.354 D llama_kv_cache: layer   5: dev = CPU") === null)
+    var pFull = s._parseKvProbeLine("0.00.546.246 I llama_kv_cache: size = 2720.00 MiB (262144 cells,   5 layers,  1/1 seqs), K (q8_0): 1360.00 MiB, V (q8_0): 1360.00 MiB")
+    A.check("kvprobe/full-bytes", pFull.bytes, Math.round(2720 * 1048576))
+    A.check("kvprobe/full-layers", pFull.layers, 5)
+    var pSwa = s._parseKvProbeLine("0.00.546.779 I llama_kv_cache: size =  159.38 MiB (  1536 cells,  25 layers,  1/1 seqs), K (q8_0):   79.69 MiB, V (q8_0):   79.69 MiB")
+    A.check("kvprobe/swa-bytes", pSwa.bytes, Math.round(159.38 * 1048576))
+    A.check("kvprobe/swa-layers", pSwa.layers, 25)
+    // Summed across the two allocations the probe reads llama.cpp's own
+    // 2,879.375 MiB (the header derivation's 3,019,243,520 B) up to the log's
+    // own two-decimal MiB printing, i.e. a few KiB.
+    var probeTotal = pFull.bytes + pSwa.bytes
+    A.ok("kvprobe/total-bytes", Math.abs(probeTotal - 3019243520) <= 8 * 1024)
+    // 2720.00 + 159.38 printed MiB = 2879.38 against a true 2879.375 MiB.
+    A.ok("kvprobe/total-mib", Math.abs(probeTotal / 1048576 - 2879.375) <= 0.01)
+    var pCompute = s._parseKvProbeLine("0.00.552.030 I sched_reserve:      CUDA0 compute buffer size =  1887.86 MiB")
+    A.check("kvprobe/compute-bytes", pCompute.bytes, Math.round(1887.86 * 1048576))
+    A.check("kvprobe/compute-kind", pCompute.kind, "compute")
+    // Not accounting lines: ignored rather than misread.
+    A.check("kvprobe/weight-line-ignored", s._parseKvProbeLine("0.01.057.051 I load_tensors:   CPU_Mapped model buffer size = 13573.86 MiB"), null)
+    A.check("kvprobe/host-buffer-ignored", s._parseKvProbeLine("0.00.546.243 I llama_kv_cache:        CPU KV buffer size =     0.00 MiB"), null)
+    A.check("kvprobe/garbage", s._parseKvProbeLine("not a line at all"), null)
+    A.check("kvprobe/empty", s._parseKvProbeLine(""), null)
+    A.check("kvprobe/null", s._parseKvProbeLine(null), null)
+    // A zero-size cache is not an answer (it would divide the display by zero).
+    A.check("kvprobe/zero-size", s._parseKvProbeLine("llama_kv_cache: size = 0.00 MiB (0 cells, 0 layers)"), null)
+
+    // The real gemma-4-26b --verbose run emits each cache block twice, so the
+    // fold must be idempotent over a repeated block. These are the four
+    // accounting lines in the order the engine prints them.
+    s._kvProbeAcc = { kvBytes: 0, kvLayers: 0, computeBytes: -1, blocks: [], compute: ({}), computeSeen: [] }
+    var log26 = [
+      "llama_kv_cache: layer   0: dev = CPU",
+      "llama_kv_cache:        CPU KV buffer size =     0.00 MiB",
+      "llama_kv_cache: size = 2720.00 MiB (262144 cells,   5 layers,  1/1 seqs), K (q8_0): 1360.00 MiB, V (q8_0): 1360.00 MiB",
+      "llama_kv_cache: size =  159.38 MiB (  1536 cells,  25 layers,  1/1 seqs), K (q8_0):   79.69 MiB, V (q8_0):   79.69 MiB",
+      "sched_reserve:      CUDA0 compute buffer size =  1887.86 MiB",
+      "sched_reserve:  CUDA_Host compute buffer size =   272.30 MiB",
+      "llama_kv_cache: layer   0: dev = CPU",
+      "llama_kv_cache: size = 2720.00 MiB (262144 cells,   5 layers,  1/1 seqs), K (q8_0): 1360.00 MiB, V (q8_0): 1360.00 MiB",
+      "llama_kv_cache: size =  159.38 MiB (  1536 cells,  25 layers,  1/1 seqs), K (q8_0):   79.69 MiB, V (q8_0):   79.69 MiB",
+      "sched_reserve:      CUDA0 compute buffer size =  1887.86 MiB",
+      "sched_reserve:  CUDA_Host compute buffer size =   272.30 MiB"]
+    for (var li = 0; li < log26.length; li++) s._onKvProbeLine(log26[li])
+    var acc26 = s._kvProbeAcc
+    A.ok("kvprobe/dedupe-bytes", Math.abs(acc26.kvBytes - 3019243520) <= 8 * 1024)
+    A.check("kvprobe/dedupe-layers", acc26.kvLayers, 30)
+    // The real log also reserves a HOST-side buffer next to the device one
+    // (CUDA0 1887.86 MiB + CUDA_Host 272.30 MiB, each logged twice). Only the
+    // device reserve may be charged against VRAM.
+    A.check("kvprobe/compute-device-only", s._kvProbeAcc.compute.CUDA0, Math.round(1887.86 * 1048576))
+    A.check("kvprobe/compute-host-ignored", s._kvProbeAcc.compute.CUDA_Host, undefined)
+    A.check("kvprobe/compute-not-doubled", s._kvProbeAcc.computeSeen.length, 1)
+    // A failed run must publish nothing, even though llama.cpp allocates and
+    // logs its cache before it can fail (the real gemma-4 probe that exceeds
+    // the address-space cap prints both size lines and then exits 1).
+    s._kvProbeSignature = "sig-fail"
+    s._finishKvProbe(false)
+    A.check("kvprobe/failed-run-not-cached", s._kvProbeCache["sig-fail"], false)
+    A.check("kvprobe/reset-bytes", s._kvProbeAcc.kvBytes, 0)
+    A.check("kvprobe/reset-blocks", s._kvProbeAcc.blocks.length, 0)
+    s._kvProbeSignature = ""
+    // A clean exit does publish, and the cache is keyed by signature so a
+    // refresh never re-probes it.
+    s._kvProbeSignature = "sig-ok"
+    s._onKvProbeLine(log26[2])
+    s._finishKvProbe(true)
+    A.ok("kvprobe/clean-run-cached", s._kvProbeCache["sig-ok"] !== undefined
+      && s._kvProbeCache["sig-ok"] !== false)
+    s._kvProbeCache = ({})
+    // Two DISTINCT caches (a main + a spec context) both still count.
+    s._kvProbeAcc = { kvBytes: 0, kvLayers: 0, computeBytes: -1, blocks: [], compute: ({}), computeSeen: [] }
+    s._onKvProbeLine("llama_kv_cache: size = 100.00 MiB (4096 cells, 10 layers, 1/1 seqs), K (q8_0): 50.00 MiB, V (q8_0): 50.00 MiB")
+    s._onKvProbeLine("llama_kv_cache: size =   8.00 MiB (  256 cells,  1 layers, 1/1 seqs), K (q8_0): 8.00 MiB")
+    A.check("kvprobe/distinct-caches", s._kvProbeAcc.kvBytes, Math.round(108 * 1048576))
+    A.check("kvprobe/distinct-layers", s._kvProbeAcc.kvLayers, 11)
+
+    // Signature: what can change the allocation. Stable across unrelated field
+    // changes, and different for every input that matters.
+    var pe = { modelPath: "/m/a.gguf", contextLen: 262144, ubatch: 512, parallel: 1,
+      cacheK: "q8_0", cacheV: "q8_0", swaFull: false, noKvUnified: false, ngl: "30" }
+    function clone(o, k, v) { var c = ({}) ; for (var t in o) c[t] = o[t]; c[k] = v; return c }
+    var sig = s._kvProbeSignatureFor(pe)
+    A.ok("kvprobe/sig-stable", sig === s._kvProbeSignatureFor(pe))
+    A.ok("kvprobe/sig-ignores-ngl", sig === s._kvProbeSignatureFor(clone(pe, "ngl", "99")))
+    A.ok("kvprobe/sig-ctx", sig !== s._kvProbeSignatureFor(clone(pe, "contextLen", 131072)))
+    A.ok("kvprobe/sig-dtype", sig !== s._kvProbeSignatureFor(clone(pe, "cacheV", "q4_0")))
+    A.ok("kvprobe/sig-ubatch", sig !== s._kvProbeSignatureFor(clone(pe, "ubatch", 1024)))
+    A.ok("kvprobe/sig-parallel", sig !== s._kvProbeSignatureFor(clone(pe, "parallel", 4)))
+    A.ok("kvprobe/sig-swafull", sig !== s._kvProbeSignatureFor(clone(pe, "swaFull", true)))
+    A.ok("kvprobe/sig-kvu", sig !== s._kvProbeSignatureFor(clone(pe, "noKvUnified", true)))
+    A.check("kvprobe/sig-nopath", s._kvProbeSignatureFor({}), "")
+
+    // argv: replays the KV-relevant flags, forces the probe off the GPU, and
+    // stays away from every server-only flag.
+    var av = s._kvProbeArgv(pe).join(" ")
+    A.check("kvprobe/argv-ngl0", av.indexOf("-ngl 0") >= 0, true)
+    A.check("kvprobe/argv-verbose", av.indexOf("--verbose") >= 0, true)
+    A.check("kvprobe/argv-no-warmup", av.indexOf("--no-warmup") >= 0, true)
+    A.check("kvprobe/argv-ctx", av.indexOf("-c 262144") >= 0, true)
+    A.check("kvprobe/argv-ubatch", av.indexOf("-ub 512") >= 0, true)
+    A.check("kvprobe/argv-parallel", av.indexOf("-np 1") >= 0, true)
+    A.check("kvprobe/argv-kv", av.indexOf("--cache-type-k q8_0 --cache-type-v q8_0") >= 0, true)
+    A.check("kvprobe/argv-swafull-absent", av.indexOf("--swa-full") < 0, true)
+    A.check("kvprobe/argv-kvu-absent", av.indexOf("--no-kv-unified") < 0, true)
+    A.check("kvprobe/argv-nkvo", s._kvProbeArgv(clone(pe, "noKvOffload", true))
+      .join(" ").indexOf("--no-kv-offload") >= 0, true)
+    // The model path is an argv element, never part of the script text.
+    A.ok("kvprobe/argv-has-model", s._kvProbeArgv(pe).length < 30)
+    A.check("kvprobe/argv-no-server-flags", /--port|--host|--api-key|--jinja|--mmproj|--draft|--threads/.test(av), false)
+
+    // Result fold: exact bytes, cache layer count and compute reserve land on
+    // the entry, and the resolver reports them as Tier 3.5 with no marker.
+    s._ggufCache = ({})
+    s.running = true
+    s.runningModels = [{ modelPath: "/m/probe.gguf", draftPath: "", ngl: "all",
+      contextLen: 262144, ubatch: 512, parallel: 1, cacheK: "q8_0", cacheV: "q8_0",
+      swaFull: false, noKvUnified: false, sizeBytes: 14249045120, totalLayers: 30,
+      mainLayers: 30, mainGpu: 30, mainCpu: 0, _gpuSplitSource: "api",
+      kvCacheBytes: -1, kvBytesExact: -1, kvLayersExact: -1, computeBytes: -1 }]
+    s._applyKvProbeResult(s._kvProbeSignatureFor(s.runningModels[0]),
+      { kvBytes: 3019243520, kvLayers: 30, computeBytes: Math.round(1887.86 * 1048576) })
+    A.check("kvprobe/fold-bytes", s.runningModels[0].kvBytesExact, 3019243520)
+    A.check("kvprobe/fold-layers", s.runningModels[0].kvLayersExact, 30)
+    A.check("kvprobe/fold-compute", s.runningModels[0].computeBytes, Math.round(1887.86 * 1048576))
+    var rq = s._resolveFieldSources(s.runningModels[0],
+      { vramBytes: 13782482944, memBytes: 3070361600, presetSection: null })
+    A.check("kvprobe/rs-tier", rq.kvBytes.tier, 3)
+    A.check("kvprobe/rs-marker", rq.kvBytes.marker, "")
+    A.check("kvprobe/rs-value", rq.kvBytes.value, 3019243520)
+    A.check("kvprobe/rs-format", s.formatGB(rq.kvBytes.value), "2.8 GB")
+    // No answer from the engine → the header derivation keeps the line as "~".
+    var rq2 = s._resolveFieldSources({ kvCacheBytes: 4000000000 },
+      { vramBytes: -1, memBytes: -1, presetSection: null })
+    A.check("kvprobe/rs-fallback-tier", rq2.kvBytes.tier, 4)
+    A.check("kvprobe/rs-fallback-marker", rq2.kvBytes.marker, "~")
+    var rq3 = s._resolveFieldSources({ kvCacheBytes: -1 },
+      { vramBytes: -1, memBytes: -1, presetSection: null })
+    A.check("kvprobe/rs-unknown-tier", rq3.kvBytes.tier, null)
+    A.check("kvprobe/rs-unknown-value", rq3.kvBytes.value, -1)
+    // A null result is cached as "tried, no answer" and never re-probed.
+    s._kvProbeCache = ({})
+    s._kvProbeQueue = []
+    s._kvProbeSignature = ""
+    var qs = s._kvProbeSignatureFor(s.runningModels[0])
+    s._kvProbeCache[qs] = false
+    s._queueKvProbe(s.runningModels[0])
+    A.check("kvprobe/cached-no-answer", s._kvProbeQueue.length, 0)
+    A.check("kvprobe/cached-exact-skips", s._queueKvProbe.length > 0, true)
+    s._kvProbeCache[qs] = { kvBytes: 1, kvLayers: 1, computeBytes: -1 }
+    s._queueKvProbe(s.runningModels[0])
+    A.check("kvprobe/cached-exact-no-queue", s._kvProbeQueue.length, 0)
+    // Disabled by configuration, and never for a backend without a KV cache.
+    // Two devices sum; a CPU-only run reserves nothing to charge to VRAM.
+    s._kvProbeAcc = { kvBytes: 0, kvLayers: 0, computeBytes: -1, blocks: [], compute: ({}), computeSeen: [] }
+    s._onKvProbeLine("sched_reserve:      CPU compute buffer size =  100.00 MiB")
+    s._onKvProbeLine("sched_reserve:     CUDA0 compute buffer size =  100.00 MiB")
+    s._onKvProbeLine("sched_reserve:     CUDA1 compute buffer size =   50.00 MiB")
+    s._kvProbeSignature = "sig-multi"
+    s._onKvProbeLine("llama_kv_cache: size = 10.00 MiB (1024 cells, 4 layers, 1/1 seqs), K (q8_0): 5.00 MiB, V (q8_0): 5.00 MiB")
+    s._finishKvProbe(true)
+    A.check("kvprobe/multi-device-compute", s._kvProbeCache["sig-multi"].computeBytes,
+      Math.round(150 * 1048576))
+    s._kvProbeAcc = { kvBytes: 0, kvLayers: 0, computeBytes: -1, blocks: [], compute: ({}), computeSeen: [] }
+    s._onKvProbeLine("sched_reserve:      CPU compute buffer size =  100.00 MiB")
+    s._kvProbeSignature = "sig-cpu"
+    s._onKvProbeLine("llama_kv_cache: size = 10.00 MiB (1024 cells, 4 layers, 1/1 seqs), K (q8_0): 5.00 MiB, V (q8_0): 5.00 MiB")
+    s._finishKvProbe(true)
+    A.check("kvprobe/cpu-only-no-compute", s._kvProbeCache["sig-cpu"].computeBytes, -1)
+    s._kvProbeSignature = ""
+    s._kvProbeCache = ({})
+    // A stale accumulator missing the dedupe bookkeeping must not throw.
+    s._kvProbeAcc = ({ kvBytes: 0, kvLayers: 0, computeBytes: -1 })
+    s._onKvProbeLine("llama_kv_cache: size = 10.00 MiB (1024 cells, 4 layers, 1/1 seqs), K (q8_0): 5.00 MiB")
+    A.check("kvprobe/self-heals-accumulator", s._kvProbeAcc.kvBytes, Math.round(10 * 1048576))
+    // Overflowing the diagnostic log buffer must NOT stop the parse: the real
+    // gemma-4 verbose log is ~224 KiB against a 256 KiB cap and prints its
+    // cache blocks at the end of it.
+    s._kvProbeAcc = { kvBytes: 0, kvLayers: 0, computeBytes: -1, blocks: [], compute: ({}), computeSeen: [] }
+    s._kvProbeBuffer = ""
+    for (var bl = 0; bl < 20000; bl++) s._onKvProbeLine("0.00.000.000 I load_tensors:   CPU_Mapped model buffer size = 100.00 MiB")
+    s._onKvProbeLine("llama_kv_cache: size = 10.00 MiB (1024 cells, 4 layers, 1/1 seqs), K (q8_0): 5.00 MiB, V (q8_0): 5.00 MiB")
+    A.check("kvprobe/parses-past-log-cap", s._kvProbeAcc.kvBytes, Math.round(10 * 1048576))
+    A.ok("kvprobe/log-cap-bounded", s._kvProbeBuffer.length <= s._kvProbeBufferMax)
+    s._kvProbeBuffer = ""
+    A.check("kvprobe/off-setting", s.kvProbeBinary, "llama-cli")
 
     A.finish()
   }

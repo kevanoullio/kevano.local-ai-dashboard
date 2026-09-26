@@ -69,7 +69,10 @@ Item {
     // a real .gguf; here the buffer is the parsed marker stream it emits).
     s._ggufCache = ({})
     s._ggufPath = "/m/fit-model.gguf"
-    s._ggufBuffer = "GGUF-OK\narch=qwen35\nblock_count=80\nhead_count=24\nhead_count_kv=8\nembedding_length=5120\n"
+    // sliding_window=0 is a real declaration (a dense cache), which is what lets
+    // the header derivation answer at all: without it this hybrid is unknown
+    // until the Tier-3.5 probe runs, and there would be no KV line to assert.
+    s._ggufBuffer = "GGUF-OK\narch=qwen35\nblock_count=80\nhead_count=24\nhead_count_kv=8\nembedding_length=5120\nsliding_window=0\n"
     s._finishGguf()
     A.check("preset-e2e/mainGpu", entry.mainGpu, 80)
     A.check("preset-e2e/mainCpu", entry.mainCpu, 0)
@@ -93,8 +96,33 @@ Item {
     A.ok("preset-e2e/gpu-layers-line", gpuLine.indexOf("GPU Layers: 80") === 0)
     A.ok("preset-e2e/gpu-layers-exact", gpuLine.indexOf("~") === -1)
     A.ok("preset-e2e/cpu-layers-exact", cpuLine.indexOf("CPU Layers: 0") === 0 && cpuLine.indexOf("~") === -1)
-    A.ok("preset-e2e/context-on-gpu", String(d).indexOf("Context: 131,072 tok on GPU") !== -1)
     A.ok("preset-e2e/kv-estimate-present", String(d).indexOf("KV Cache: ~") !== -1)
+    // `n-gpu-layers = all` is NOT proof of where the cache went — the live
+    // gemma-4 worker has every layer on the device and its cache in host RAM —
+    // so with no cgroup readings the Context line must make no device claim.
+    A.check("preset-e2e/context-device-unknown", lineOf(d, "Context:"), "Context: 131,072 tok")
+    A.ok("preset-e2e/kv-line-device-unknown", lineOf(d, "KV Cache:").indexOf("KV Cache: ~") === 0
+      && lineOf(d, "KV Cache:").indexOf(" on ") === -1)
+    // Nor may the cache be folded into a device total on a guess.
+    A.check("preset-e2e/gpu-total-weights-only", lineOf(d, "GPU Total:"),
+      "GPU Total: ~" + s.formatGB(9200000000))
+
+    // With a cgroup reading that locates the cache, the same entry does place
+    // it — and then both the Context line and the GPU total must show it.
+    s.serviceMemoryBytes = 400000000
+    s.serviceVramBytes = 8 * 1024 * 1024 * 1024
+    var dGpu = sec.llamaDetailBlock(entry)
+    A.ok("preset-e2e/context-on-gpu", String(dGpu).indexOf("Context: 131,072 tok on GPU") !== -1)
+    A.ok("preset-e2e/kv-on-gpu", lineOf(dGpu, "KV Cache:").indexOf(" on GPU") !== -1)
+    A.ok("preset-e2e/gpu-total-includes-kv", lineOf(dGpu, "GPU Total:")
+      !== lineOf(d, "GPU Total:"))
+    // The flag still overrides any reading.
+    entry.noKvOffload = true
+    var dCpu = sec.llamaDetailBlock(entry)
+    A.ok("preset-e2e/no-kv-offload-beats-reading", String(dCpu).indexOf("Context: 131,072 tok on CPU") !== -1)
+    entry.noKvOffload = false
+    s.serviceMemoryBytes = -1
+    s.serviceVramBytes = -1
 
     A.finish()
   }
