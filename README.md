@@ -235,7 +235,7 @@ chain through — matching `_applyGgufPresetSplit` semantics. The entry's
 | GPU/CPU layer split | `--n-gpu-layers` in `status.args` | — | estimated from VRAM/~ | derived from above | explicit preset value | exact / ~ / — |
 | Layer % on GPU/CPU | — | — | — | split ÷ total | — | exact / ~ / — |
 | Weight GB per device | — | — | — | size × split ratio | — | exact / ~ / — |
-| KV cache size | — | engine accounting: `llama-cli --verbose` `llama_kv_cache: size` / `sched_reserve` (Tier 3.5) | — | per-layer GGUF sum `Σ (K+V) · cells`, from `attention.head_count_kv` (array or scalar), `key_length` / `value_length` (+ `_swa`), `sliding_window`, `sliding_window_pattern`, `recurrent_layers`, `shared_kv_layers`, `kv_lora_rank`, `rope.dimension_count` (Tier 4) | — | exact / ~ / — |
+| KV cache size | — | engine accounting: `llama-cli --verbose` `llama_kv_cache: size` (kept even on a non-zero exit) / `sched_reserve` (clean exit only) (Tier 3.5) | — | per-layer GGUF sum `Σ (K+V) · cells`, from `attention.head_count_kv` (array or scalar; `0` = layer holds no cache), `key_length` / `value_length` (+ `_swa`), `sliding_window`, `sliding_window_pattern`, `recurrent_layers`, `full_attention_interval`, `shared_kv_layers`, `kv_lora_rank`, `rope.dimension_count` (Tier 4) | — | exact / ~ / — |
 | KV cache dtype | `--cache-type-k/v` in args | — | — | — | — | exact |
 | KV cache placement | `--no-kv-offload` (pins it to the host), `-ngl 0` (nothing on the device) | — | where the bytes turned up: cgroup `anon+shmem` vs. the cache size, plus per-PID VRAM | `_kvPlacement` | — | exact / — |
 | Service DRAM | — | — | cgroup `anon+shmem` (ControlGroup, else `/proc/<pid>/cgroup`); `MemoryCurrent` only if neither resolves | — | — | ~ |
@@ -248,7 +248,7 @@ it actually allocated, so the dashboard asks it directly instead of guessing.
 `llamaProbeProcess` runs `llama-cli` once per model with the running model's own
 KV flags — `-c <ctx>`, `-ub/-b <ubatch>`, `-np <parallel>`,
 `--cache-type-k/-v`, `--swa-full`, `--no-kv-unified`, `--no-kv-offload` — plus
-`-ngl 0 --no-warmup -st -n 0 -p x --verbose`, and folds the log:
+`-ngl 0 -dev none --no-warmup -st -n 0 -p x --verbose`, and folds the log:
 
 - `llama_kv_cache: size = 2720.00 MiB (262144 cells, 5 layers, …)` → bytes +
   layer count, **de-duplicated by (bytes, layers)**. The engine prints every
@@ -266,9 +266,25 @@ Everything about this tier is measured facts about a real run:
 - **It logs on stderr, not stdout.** Verified on gemma-4-26b: 3,116 stderr
   lines, 32 stdout lines, **zero** `llama_kv_cache` lines on stdout. Both
   channels are parsed; a stdout-only reader never sees an answer.
-- **A non-zero exit publishes nothing.** llama.cpp allocates *and logs* the
-  cache before it can fail — a model that will not fit still prints both size
-  lines and then exits 1 — so the exit status gates the fold.
+- **It never touches the GPU.** `-ngl 0` only keeps the *weights* off the device;
+  the graph/compute reserve still went to `cudaMalloc` (measured 1,537 MiB
+  against a live qwen3.6-35b-a3b worker) and the probe then failed in
+  `ggml_gallocr_reserve_n_impl` and exited non-zero. `-dev none` keeps the
+  compute buffers on the CPU too. Cache *size* is device-independent either way.
+- **A non-zero exit still publishes the cache size, but not the compute
+  reserve.** The two are trusted under different contracts, because they become
+  known at different points in the run and only one depends on the run
+  finishing:
+  - `llama_kv_cache: size` is emitted by the kv-cache constructor once the
+    allocation is fully sized (a sum of `ggml_nbytes()` over the built tensors),
+    so it is a pure function of the hparams and cparams the probe passed in —
+    not a measurement of an inference that ran. Gating it on a clean exit threw
+    away correct answers: the run above printed `2720.00 MiB` and *then* died.
+  - `sched_reserve` is a forward-looking reservation for a graph that may never
+    have been built, and the device split is derived from it, so it stays
+    unknown (`-1`) unless the run exited 0.
+  - A run that never reached a cache (refused by the pre-flight gate, or killed
+    during load) still publishes nothing and caches "no answer".
 - **It is not memory-capped with `ulimit -v`.** That caps *virtual* address
   space, which llama.cpp's GPU backends reserve far beyond their working set:
   measured here, `ulimit -v 19.5G` killed a 14.2 GB gemma-4 load with `mmap
@@ -288,8 +304,8 @@ unmarked — like `nvidia-smi`'s own figures — and never as a fabricated exact
 byte count.
 
 **Tier 4 — the header derivation (`~`).** Used when the probe cannot answer
-(no `llama-cli`, skipped by the pre-flight gate, timeout, non-zero exit). It
-mirrors llama.cpp's per-layer allocation. For
+(no `llama-cli`, skipped by the pre-flight gate, timeout, or a run that never
+reached a cache). It mirrors llama.cpp's per-layer allocation. For
 each main-layer `il`: skip recurrent layers (`attention.recurrent_layers` array,
 else the `full_attention_interval` fallback where `(il+1) % fai != 0`) and the
 `attention.shared_kv_layers` tail (those layers reuse earlier KV). A full/`--swa-full`
@@ -299,20 +315,69 @@ parallel : 1) + ubatch)` padded up to 256. Per layer `K = kvHeads · key_length
 `embedding_length / head_count` (V to K's dim) — then `(K + V) · cells ·
 (unified ? 1 : parallel)` bytes at the KV dtype's `kBits/vBits`. Layer type comes
 from the `sliding_window_pattern` array, else an explicit scalar period, else an
-explicit `attention.sliding_window == 0` (a dense declaration). MLA
-(DeepSeek-style, `kv_lora_rank > 0`) is K-only with row = `kv_lora_rank +
-rope.dimension_count` and dense full-ctx cells. Any unsized layer → `—`.
+explicit `attention.sliding_window == 0` (a dense declaration), else the hybrid
+declaration below. MLA (DeepSeek-style, `kv_lora_rank > 0`) is K-only with row =
+`kv_lora_rank + rope.dimension_count` and dense full-ctx cells. Any unsized layer
+→ `—`.
+
+**A hybrid that declares its recurrent layers and no window is dense.** This is
+a fourth *declaration*, not a per-architecture default, and it is what sizes
+qwen3.6 (arch `qwen35moe`: 40 layers, `full_attention_interval = 4`, 2 KV heads,
+`key_length`/`value_length` 256, `ssm.*` keys, and **no** `attention.sliding_window`
+at all). The reasoning is structural: a sliding window is a property of an
+attention stack, and llama.cpp hardcodes one for no architecture whose layers
+interleave with recurrent ones. The sources that *declare recurrence*
+(`recurrent_layers` / `full_attention_interval` / `ssm.*`) and the sources that
+*impose a window* (`load_swa_pattern` or a window pattern read from the file) are
+**disjoint**, so such a file either carries its own window key or has none — and
+with no key there is nothing for a period to be. llama.cpp then leaves
+`is_swa_impl` all-zero and builds one flat full-context cache over the
+non-recurrent layers.
+
+That is a property of the checkout, not of this README, so **verify it rather
+than trusting the paragraph** — the sets move as upstream adds architectures:
+
+```bash
+cd llama.cpp/src/models
+comm -12 \
+  <(grep -lE 'LLM_KV_ATTENTION_RECURRENT_LAYERS|LLM_KV_ATTENTION_FULL_ATTENTION_INTERVAL|SSM' *.cpp | sort) \
+  <(grep -lE 'load_swa_pattern|LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN'        *.cpp | sort)
+# must print nothing; if it ever does, this rule needs revisiting
+```
+
+Verified against the engine on the deployed qwen3.6-35b-a3b:
+
+| | layers | cells | bytes |
+|---|---|---|---|
+| Tier 4 derivation | 10 | 262144 | 2,852,126,720 (2720.00 MiB) |
+| `llama_kv_cache: size` | 10 | 262144 | 2720.00 MiB |
+
+Exact — 0 B delta. Note the "10 layers" is the *counted* set, not the file's
+40, which is precisely what the interval is for.
+
+**What is still deliberately unknown.** Two adjacent cases are left to the probe
+on purpose, because answering them would be a one-architecture table in
+disguise:
+
+- A file that declares **nothing** about its layer types and carries no window
+  key. llama4 and cohere2 have no window key and still get a 4-layer SWA
+  pattern from their own source, so absence proves nothing here.
+- A **positive** window on a file that declares recurrent layers. Only lfm2 among
+  the hybrids derives its pattern that way (`is_swa_impl[il] = !is_recr_impl[il]`);
+  lfm2moe and bailingmoe3 read the same `head_count_kv == 0` convention and ignore
+  the window entirely.
 
 **There is no architecture table, and that is deliberate.** A missing
-`sliding_window_pattern` is *not* filled in from a per-architecture default and
-*not* assumed dense: the dashboard used to carry `_swaPeriodFor` with
+`sliding_window_pattern` is *not* filled in from a per-architecture default: the
+dashboard used to carry `_swaPeriodFor` with
 `gemma3=6, gemma3n=5, gemma2=2, gpt_oss=2, llama4=4, cohere2=4`, which is a copy
 of llama.cpp's C++ that silently rots on upgrade and is wrong for any model
-whose converter happened to omit the array (llama4, and every hybrid like
-qwen3-next that simply does not use SWA). An absent pattern with an absent or
-positive window now yields **unknown (`—`)** and the header line shows nothing;
-only the declaration in the file, or the engine's own accounting, can answer it.
-Uncertainty is rendered, not filled in.
+whose converter happened to omit the array. What replaced it is not a table
+either, but a check that the omitted array implies a flat dense cache because no
+hybrid architecture can have a window in the first place. An absent pattern that
+cannot be resolved that way yields **unknown (`—`)** and the header line shows
+nothing; only the declaration in the file, or the engine's own accounting, can
+answer it. Uncertainty is rendered, not filled in.
 
 **Per-layer `head_count_kv`.** `attention.head_count_kv` may be a **scalar or a
 per-layer array** (`arr[i32]`, one entry per block; the header reader also accepts
@@ -323,6 +388,15 @@ full-attention layers and **8** on the 25 SWA ones, is only sized correctly from
 the array. Reading only `u32`/`bool` arrays silently dropped Gemma4's `i32` array,
 fell back to `head_count = 16` and inflated that model's KV estimate **8×**
 (21.6 GiB instead of 2.81 GiB).
+
+**`head_count_kv == 0` means the layer has no cache.** That is llama.cpp's own
+declaration, not a missing value: lfm2, lfm2moe and bailingmoe3 all set
+`hparams.is_recr_impl[il] = (hparams.n_head_kv(il) == 0)`. Such a layer is
+excluded from the count, exactly like one named by `recurrent_layers`, and the
+two compose — a `0` entry is skipped from both the full and the SWA half of a
+declared period. Used to be parsed as "no entry" and silently replaced by the
+scalar/`head_count` fallback, charging a full context cache to layers that store
+none.
 
 **KV cache placement.** `--no-kv-offload` (Tier 1) pins the cache to host RAM,
 and `-ngl 0` leaves nothing on the device to hold it. Everything else is read
@@ -352,6 +426,11 @@ date, cloud flag). All values are engine-reported and treated as exact.
 
 ### Worked examples
 
+> Examples 1 and 3 are illustrative schematics showing how the tier ladder
+> resolves each field. Example 2 uses the real GGUF header of the deployed
+> `qwen3.6-35b-a3b` model — all numbers in its resolution line up with the
+> actual file.
+
 #### Example 1: `qwen3.8-27b-fast` (explicit `n-gpu-layers = all`)
 
 ```ini
@@ -377,10 +456,11 @@ cache-type-v = q4_0
 - KV dtype K/V: Tier 1 → `--cache-type-k q5_0` / `--cache-type-v q4_0` (exact, from API args)
 - KV cache size: Tier 3.5 → `llama-cli --verbose` reports the allocation it
   built: `llama_kv_cache: size = 2090.00 MiB (131072 cells, 16 layers)` (exact,
-  to the log's 2-decimal MiB). Tier 4 would have given ~2.0 GB from
-  `full_attention_interval = 4` → 16 full-attention layers, `head_count_kv = 4`,
-  head dim `5120/24`, K q5_0 / V q4_0 — an upper bound, and it is only used when
-  the probe cannot answer.
+  to the log's 2-decimal MiB). Tier 4 also derives it now — `block_count = 65`
+  with `full_attention_interval = 4` → 16 full-attention layers,
+  `head_count_kv = 4`, head dim `5120/24`, K q5_0 / V q4_0, and a hybrid with no
+  window key is dense — so the header stands on its own here and the probe is a
+  cross-check rather than the only source. Rendered `~` either way.
 - KV placement: Tier 1 → no `--no-kv-offload`, and `-ngl all` is *not* proof (see
   the placement note above); Tier 3 → the service's 2.1 GB anonymous host block
   covers the 2.0 GB cache, so the cache is in host RAM → on CPU.
@@ -419,38 +499,44 @@ ctx-size = 262144
 **Resolution:**
 
 - Name: Tier 1 → `m.id` from `/v1/models`
-- Size: Tier 1 → `meta.size` = 9.2 GB (exact)
+- Size: Tier 1 → `meta.size` = 17.7 GB (exact)
 - Quant: Tier 2 → GGUF `general.file_type` → `iq4_xs` (exact)
 - Params: Tier 1 → `meta.n_params` = 30.5B (exact)
 - Context: Tier 1 → `meta.n_ctx` = 262144 (exact)
-- Total layers: Tier 2 → GGUF `block_count` = 80 (exact)
+- Total layers: Tier 2 → GGUF `block_count` = 40 (exact)
 - GPU/CPU split: Tier 1 → `status.args` has NO `--n-gpu-layers` (not set explicitly)
   - Tier 3 → measured VRAM = 7.5 GB from nvidia-smi per-PID
-  - Tier 4 → estimate: gpu_layers = round(7.5 GB / 9.2 GB × 80) ≈ 65 layers (~)
-- Layer %: Tier 4 → ~65/80 × 100 ≈ ~81% GPU (~ estimated)
-- Weight GB GPU: Tier 4 → 9.2 GB × 65/80 ≈ ~7.5 GB (~)
-- Weight GB CPU: Tier 4 → 9.2 GB × 15/80 ≈ ~1.7 GB (~)
+  - Tier 4 → estimate: gpu_layers = round(7.5 GB / 17.7 GB × 40) ≈ 17 layers (~)
+- Layer %: Tier 4 → ~17/40 × 100 ≈ ~43% GPU (~ estimated)
+- Weight GB GPU: Tier 4 → 17.7 GB × 17/40 ≈ ~7.5 GB (~)
+- Weight GB CPU: Tier 4 → 17.7 GB × 23/40 ≈ ~10.2 GB (~)
 - KV dtype K/V: Tier 1 → `--cache-type-k q8_0` / `--cache-type-v q8_0` (exact, from API args)
-- KV cache size: Tier 3.5 → the engine reports `llama_kv_cache: size =
-  18133.00 MiB (262144 cells, 20 layers)` (exact). Tier 4's sum from
-  `full_attention_interval = 4` → 20 full-attention layers, `head_count_kv = 8`,
-  K/V q8_0 would have read ~17.7 GB — an upper bound, shown only `~`.
+- KV cache size: Tier 3.5 → the engine's own accounting, which is what this
+  model is best known for. It is also the case that motivated both halves of the
+  current fix: the probe used to die *after* printing the right answer, and
+  Tier 4 used to render `—`. Both now answer, and on the real deployed
+  `qwen3.6-35b-a3b` they agree to the byte. Worked numbers, header fields and the
+  Tier 3.5 / Tier 4 comparison are in [the hybrid-dense note](#kv-cache-size-measured-then-derived)
+  above; the schematic figures below are illustrative.
+  - `-dev none` is part of why it completes at all: the probe reserves
+    `CPU compute buffer size = 656.30 MiB` instead of failing a 1,537 MiB
+    `cudaMalloc` on a device the live server is already using.
 - KV placement: Tier 1 → no `--no-kv-offload`; Tier 3 → host anon ≈ 19.3 GB
   covers the cache, so it is in host RAM → on CPU
 - GPU Total: Tier 4 → ~7.5 GB (weights only)
-- CPU Total: Tier 4 → ~1.7 GB weights + ~17.7 GB KV = ~19.4 GB
+- CPU Total: Tier 4 → ~10.2 GB weights + ~2.7 GB KV = ~12.9 GB
 
 **Displayed:**
 
 ```
 Quant: iq4_xs | 30.5B params
-Model Size: 80 layers | 9.2 GB
-GPU Layers: ~65 | ~7.5 GB | ~81%
-CPU Layers: ~15 | ~1.7 GB | ~19%
+Model Size: 40 layers | 17.7 GB
+GPU Layers: ~17 | ~7.5 GB | ~43%
+CPU Layers: ~23 | ~10.2 GB | ~57%
 Context: 262,144 tok on CPU
-KV Cache: 17.7 GB (K q8_0 / V q8_0) on CPU
+KV Cache: 2.7 GB (K q8_0 / V q8_0) on CPU
 GPU Total: ~7.5 GB
-CPU Total: ~19.4 GB
+CPU Total: ~12.9 GB
 ```
 
 #### Example 3: `gemma-4-26b-a4b-qat` (per-layer `head_count_kv`, KV dropped to the host)
@@ -586,6 +672,19 @@ on their lower tiers (list stays empty, split falls back to Tier 3).
 - **Capping the probe with `ulimit -v`** — virtual address space is not memory;
   llama.cpp's GPU backends reserve far more VA than RSS and the load dies with
   `mmap failed` on a machine with tens of GiB free.
+- **Gating the whole probe fold on a clean exit** — the `llama_kv_cache: size`
+  line and the `sched_reserve` line are not equally trustworthy, and treating
+  them as one unit throws away correct answers. The size is fixed once the cache
+  is allocated; the reserve is a promise about a graph that may never run. Only
+  the reserve needs the exit status, and the device split that depends on it must
+  not be invented from a dead run.
+- **Letting the probe touch the GPU to measure a device-independent number.**
+  `-ngl 0` alone still routes the compute reserve through `cudaMalloc`, which
+  both perturbs the very VRAM the dashboard is reporting on and fails outright
+  when the device is already occupied. `-dev none` costs nothing here.
+- **Reading a `head_count_kv` entry of 0 as absent** — it is llama.cpp's
+  declaration that the layer stores no KV, not a missing value. Falling back to
+  the scalar silently charges a full context cache to layers that have none.
 - **Guessing offload from VRAM math when a higher tier answered** — the layer
   split prefers the resolved `--n-gpu-layers` (Tier 1) and the explicit preset
   value (Tier 5). The measured-VRAM estimate (~, Tier 3) is used **only when

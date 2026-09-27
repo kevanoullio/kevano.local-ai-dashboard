@@ -919,9 +919,34 @@ exec "$cli" "$@"`
       return Math.ceil(cells / 256) * 256
     }
 
+    // Does the file DECLARE which layers are recurrent? Exactly two file-level
+    // keys express this and they are the only ones any llama.cpp source reads:
+    // `attention.recurrent_layers` (a sparse index list) and
+    // `attention.full_attention_interval` (the period, consulted only when the
+    // list is absent). Either is a positive declaration, not an inference.
+    // Pure: never throws.
+    function _declaresRecurrent(g) {
+      if (!g) return false
+      if (g.recurrentArr && typeof g.recurrentArr.length === "number" && g.recurrentArr.length > 0) return true
+      return isFinite(g.fai) && g.fai > 1
+    }
+
+    // Does the file declare this layer as holding NO KV cache? llama.cpp's own
+    // convention for that is a zero `head_count_kv` entry — lfm2, lfm2moe and
+    // bailingmoe3 all set `is_recr_impl[il] = (n_head_kv(il) == 0)` — so a 0 in
+    // the per-layer array is a statement about the layer, not a missing value.
+    // Pure: never throws.
+    function _kvlessByHeads(g, il) {
+      if (!g || !g.hckvArr || typeof g.hckvArr.length !== "number") return false
+      if (il >= g.hckvArr.length) return false
+      var e = parseInt(g.hckvArr[il], 10)
+      return isFinite(e) && e === 0
+    }
+
     // Layer indices whose KV cache is reused / not stored: recurrent_layers
     // (sparse index set) wins; otherwise the full_attention_interval fallback
-    // marks every non-(N-th) layer recurrent (qwen35/qwen33n semantics).
+    // marks every non-(N-th) layer recurrent (qwen35/qwen33n semantics); a
+    // head_count_kv entry of 0 marks its own layer recurrent regardless.
     function _recurrentSet(g, m, fai) {
       var set = {}
       if (g.recurrentArr && typeof g.recurrentArr.length === "number" && g.recurrentArr.length > 0) {
@@ -932,6 +957,7 @@ exec "$cli" "$@"`
       } else if (fai > 1) {
         for (var il = 0; il < m; il++) if ((il + 1) % fai !== 0) set[il] = true
       }
+      for (var il2 = 0; il2 < m; il2++) if (_kvlessByHeads(g, il2)) set[il2] = true
       return set
     }
 
@@ -995,13 +1021,41 @@ exec "$cli" "$@"`
         return layers.length ? { layers: layers, parallel: parallel, kvUnified: kvUnified } : null
       }
       // Layer type: an explicit pattern array (written by some converters), an
-      // explicit scalar period, or an explicit "no SWA" declaration
+      // explicit scalar period, an explicit "no SWA" declaration
       // (attention.sliding_window == 0, which every llama.cpp source that reads
-      // that key treats as KV_TYPE_NONE). None of those → the layout comes from
-      // the engine's own source rather than the file → unknown (null), so the
-      // caller falls back to the engine probe instead of guessing. A merely
-      // ABSENT sliding_window is not such a declaration (llama4 builds an SWA
-      // cache even then), so it deliberately does not answer here.
+      // that key treats as KV_TYPE_NONE), or a file that declares its own
+      // recurrent layers and no window at all (below).
+      //
+      // The last case is a DECLARATION too, not a guess about one architecture.
+      // A window is a property of an attention stack, and llama.cpp never
+      // hardcodes one for an architecture whose layers are interleaved with
+      // recurrent ones. The two sets are disjoint — no file both declares
+      // recurrence (recurrent_layers / full_attention_interval / ssm.*) and calls
+      // load_swa_pattern or reads a window pattern. Verify against the checkout
+      // rather than trusting this comment, and expect the lists to move with
+      // upstream:
+      //   grep -lE 'LLM_KV_ATTENTION_RECURRENT_LAYERS|LLM_KV_ATTENTION_FULL_ATTENTION_INTERVAL|SSM' src/models/*.cpp
+      //   grep -lE 'load_swa_pattern|LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN' src/models/*.cpp
+      //   comm -12 <(sort the two)   # must be empty
+      // So such a file either carries its own window key or has none, and with no
+      // key there is nothing for a period to be — the attention layers are dense.
+      // qwen35moe (the shipped qwen3.6-35b-a3b) is the case that motivated it:
+      // 40 layers, full_attention_interval 4, no attention.sliding_window at all,
+      // and its own load_arch_hparams calls neither get_key(SLIDING_WINDOW) nor
+      // load_swa_pattern, so is_swa_impl stays all-zero and llama.cpp builds one
+      // flat full-context cache over the 10 non-recurrent layers. Measured
+      // against the engine: `llama_kv_cache: size = 2720.00 MiB (262144 cells,
+      // 10 layers, 1/1 seqs)`, which Tier 4 reproduces to the byte.
+      //
+      // A merely ABSENT sliding_window on a file that declares NOTHING about its
+      // layer types is still not a declaration (llama4 and cohere2 carry no
+      // window key and still get a 4-layer SWA pattern from their own source),
+      // so that case deliberately falls through to unknown and the engine probe
+      // answers it. A POSITIVE window with recurrent layers declared is also
+      // left unknown: only lfm2 among the hybrids derives its pattern that way
+      // (`is_swa_impl[il] = !is_recr_impl[il]`), while lfm2moe and bailingmoe3
+      // use the same recurrence convention and ignore the window entirely — so
+      // answering it would be a one-architecture table in disguise.
       var pattern = null, period = -1
       if (g.swaPatternArr && typeof g.swaPatternArr.length === "number" && g.swaPatternArr.length > 0) {
         pattern = g.swaPatternArr
@@ -1009,6 +1063,8 @@ exec "$cli" "$@"`
         period = Math.round(g.swaPattern)
       } else if (g.swa === 0) {
         period = -1                     // declared dense: every layer full-size
+      } else if (g.swa < 0 && _declaresRecurrent(g)) {
+        period = -1                     // declared hybrid, no window: also dense
       } else {
         return null
       }
@@ -1968,7 +2024,15 @@ exec "$cli" "$@"`
   // the process build a context and exit instead of sitting in its REPL.
   function _kvProbeArgv(entry) {
     var e = entry || {}
-    var a = ["--verbose", "--no-warmup", "-st", "-n", "0", "-p", "x", "-ngl", "0"]
+    // -ngl 0 keeps the WEIGHTS off the device; -dev none additionally keeps the
+    // graph/compute buffers off it. Only the first was passed, so the probe still
+    // tried to cudaMalloc its compute reserve — measured 1,537 MiB against the
+    // live qwen3.6-35b-a3b worker — and failed there, exiting non-zero. That is
+    // both a needless allocation of the user's VRAM and, because the probe
+    // inspects models that are already loaded, a failure on the common path.
+    // Cache size is device-independent, so there is nothing to gain by touching
+    // the GPU at all.
+    var a = ["--verbose", "--no-warmup", "-st", "-n", "0", "-p", "x", "-ngl", "0", "-dev", "none"]
     var ctx = _kvProbeNum(e.contextLen, 0)
     if (ctx > 0) a.push("-c", String(ctx))
     var ub = _kvProbeNum(e.ubatch, 0)
@@ -2103,15 +2167,35 @@ exec "$cli" "$@"`
   property var _kvProbeAcc: ({ kvBytes: 0, kvLayers: 0, computeBytes: -1, blocks: [], compute: ({}), computeSeen: [] })
 
   // Exact KV bytes for the signature, or false when the probe could not answer
-  // (no llama-cli, allocation refused by the address-space cap, non-zero exit,
-  // watchdog). false is cached too, so a broken probe is not retried every
-  // refresh; the header derivation then answers instead.
-  // `ok` is the child's own verdict and is REQUIRED: llama.cpp allocates and
-  // logs its cache BEFORE it can fail — a model that will not fit the
-  // address-space cap still emits both `llama_kv_cache: size` lines and then
-  // exits 1 — so folding without the exit status would publish the accounting
-  // of a run that never served. The watchdog passes false, because a timeout
-  // says nothing about what the partial log contains.
+  // at all (no llama-cli, watchdog, or a run that never reached a cache).
+  // false is cached too, so a broken probe is not retried every refresh; the
+  // header derivation then answers instead.
+  //
+  // The two numbers in a probe result are published under DIFFERENT contracts,
+  // because they become known at different points in the run and only one of
+  // them depends on the run finishing:
+  //
+  //   kvBytes  Published whenever a positive `llama_kv_cache: size` line was
+  //            folded — whatever the child went on to do. That line is emitted
+  //            by llama_kv_cache's constructor once the allocation is fully
+  //            sized (it is the sum of ggml_nbytes() over the built tensors), so
+  //            it is a pure function of the hparams and cparams the probe passed
+  //            in, not a measurement of an inference that ran. Gating it on a
+  //            clean exit threw away correct answers: `-ngl 0` offloads the
+  //            weights but leaves the GRAPH reserve on the GPU, so probing a
+  //            model that is already loaded died in ggml_gallocr_reserve_n_impl
+  //            ~1.4 s AFTER printing both `llama_kv_cache: size` lines, and the
+  //            result was cached as `false` for the rest of the session.
+  //   computeBytes
+  //            Still requires a clean exit. `sched_reserve` is a forward-looking
+  //            reservation for a graph that may never have been built, so a run
+  //            that died inside the reserve has no usable number — and
+  //            _estimateSplitFromProbes derives the device split from it. It
+  //            stays -1 (unknown, and already handled as such) in that case.
+  //
+  // The pre-flight gate in kvProbeScript is unaffected: it refuses BEFORE the
+  // engine starts, so a model that cannot fit is never allocated for at all and
+  // prints no size line to fold.
   function _finishKvProbe(ok) {
     var sig = _kvProbeSignature
     var acc = _kvProbeAcc
@@ -2121,11 +2205,13 @@ exec "$cli" "$@"`
     _kvProbeArgvList = []
     if (sig === "") { _pumpKvProbe(); return }
     var res = null
-    if (ok === true && acc.kvBytes > 0) {
+    if (acc.kvBytes > 0) {
       var compute = -1
-      for (var d in acc.compute) {
-        if (compute < 0) compute = 0
-        compute += acc.compute[d]
+      if (ok === true) {
+        for (var d in acc.compute) {
+          if (compute < 0) compute = 0
+          compute += acc.compute[d]
+        }
       }
       res = { kvBytes: acc.kvBytes, kvLayers: acc.kvLayers, computeBytes: compute }
     }
