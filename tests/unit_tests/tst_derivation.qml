@@ -169,12 +169,73 @@ Item {
     A.check("kvarch/qwen35-count-parity", svR.layers.length, svF.layers.length)
     A.check("kvarch/qwen35-dense-bytes", s._kvEstimateBytesArch(svF, 5.25, 4.5),
       s._kvEstimateBytes(16, 96256, 4, 5120 / 24, 5.25, 4.5))
-    // The same hybrid with no SWA declaration is unknown, not dense-by-default.
+    // A hybrid that declares its recurrent layers but carries no window at all
+    // is DENSE, and must agree with the same file declaring sliding_window 0.
+    // Rationale (Service.qml): a window is a property of an attention stack, and
+    // llama.cpp hardcodes one for no architecture whose layers interleave with
+    // recurrent ones — the set of sources that read recurrent_layers /
+    // full_attention_interval / ssm.* and the set that call load_swa_pattern are
+    // disjoint. So such a file either carries its own window key or has none, and
+    // with no key the attention layers are full-size. This is the qwen3.6-35b-a3b
+    // case (qwen35moe, 40 layers, fai 4, no window key), which the engine sizes
+    // at one flat full-context cache over the 10 non-recurrent layers.
     var gqwU = {}
     for (var qw in gqw) gqwU[qw] = gqw[qw]
     gqwU.swa = -1
-    A.check("kvarch/qwen35-undeclared-unknown", s._buildKvLayers(gqwU, 64, 96256,
+    var svU = s._buildKvLayers(gqwU, 64, 96256, { ubatch: 512, parallel: 1, swaFull: false, kvUnified: true })
+    A.check("kvarch/qwen35-undeclared-dense", svU !== null, true)
+    A.check("kvarch/qwen35-undeclared-count", svU.layers.length, svF.layers.length)
+    A.check("kvarch/qwen35-undeclared-bytes", s._kvEstimateBytesArch(svU, 5.25, 4.5),
+      s._kvEstimateBytesArch(svF, 5.25, 4.5))
+    // ... but a POSITIVE window with recurrent layers stays unknown: only lfm2
+    // among the hybrids derives its pattern that way, so answering it would be a
+    // one-architecture table in disguise.
+    var gqwP = {}
+    for (var qw2 in gqw) gqwP[qw2] = gqw[qw2]
+    gqwP.swa = 512
+    A.check("kvarch/qwen35-window-plus-hybrid-unknown", s._buildKvLayers(gqwP, 64, 96256,
       { ubatch: 512, parallel: 1, swaFull: false, kvUnified: true }), null)
+    // ... and a file that declares NOTHING about its layer types is still unknown
+    // even with no window key: llama4 and cohere2 carry no window key and still
+    // get a 4-layer SWA pattern from their own source. The probe answers these.
+    var gnoHyb = { arch: "llama4", bc: 48, hc: 40, hckv: 8, hckvArr: null, embd: 5120,
+      kl: -1, vl: -1, klswa: -1, vlswa: -1, swa: -1, swaPattern: -1,
+      swaPatternArr: null, recurrentArr: null, fai: -1, sharedKv: -1,
+      kvLoraRank: -1, ropeDim: -1 }
+    A.check("kvarch/llama4-undeclared-unknown", s._buildKvLayers(gnoHyb, 48, 8192,
+      { ubatch: 512, parallel: 1, swaFull: false, kvUnified: true }), null)
+
+    // head_count_kv == 0 is llama.cpp's own declaration that the layer holds NO
+    // KV cache: lfm2, lfm2moe and bailingmoe3 all set
+    // `is_recr_impl[il] = (n_head_kv(il) == 0)`. Used to be read as "missing" and
+    // silently replaced by the scalar/head-count fallback, which charged a full
+    // context cache to layers that store none.
+    var kvless = [2, 0, 0, 2, 0, 2]
+    var gkv0 = { arch: "lfm2", bc: 6, hc: 8, hckv: 2, hckvArr: kvless, embd: 2048,
+      kl: 256, vl: 256, klswa: -1, vlswa: -1, swa: 0, swaPattern: -1,
+      swaPatternArr: null, recurrentArr: null, fai: -1, sharedKv: -1,
+      kvLoraRank: -1, ropeDim: -1 }
+    var svKv0 = s._buildKvLayers(gkv0, 6, 32768, { ubatch: 512, parallel: 1, swaFull: false, kvUnified: true })
+    A.check("kvarch/zero-kv-heads-count", svKv0.layers.length, 3)
+    // The 3 surviving layers are the ones that declared 2 heads.
+    A.check("kvarch/zero-kv-heads-cells", svKv0.layers[0].cells, 32768)
+    A.check("kvarch/zero-kv-heads-heads", svKv0.layers[0].kvHeads, 2)
+    A.check("kvarch/zero-kv-heads-bytes", s._kvEstimateBytesArch(svKv0, 8.5, 8.5),
+      s._kvEstimateBytes(3, 32768, 2, 256, 8.5, 8.5))
+    // A zero entry is a statement about THAT layer, so it composes with an
+    // explicit period. 0/1 = SWA, 1/2 = dense, 0/3 = SWA, 2/4 = dense, 0/5 = dense
+    // with period 2 and a 512 window; the 1, 2 and 4 layers declare no cache and
+    // are excluded from BOTH halves, leaving 3 layers (2 full + 1 SWA).
+    var gkv0p = {}
+    for (var k0 in gkv0) gkv0p[k0] = gkv0[k0]
+    gkv0p.swa = 512
+    gkv0p.swaPattern = 2
+    var svKv0p = s._buildKvLayers(gkv0p, 6, 32768, { ubatch: 512, parallel: 1, swaFull: false, kvUnified: true })
+    A.check("kvarch/zero-kv-heads-pattern-count", svKv0p.layers.length, 3)
+    var fullKv0p = 0
+    for (var k0i = 0; k0i < svKv0p.layers.length; k0i++) if (svKv0p.layers[k0i].cells === 32768) fullKv0p++
+    A.check("kvarch/zero-kv-heads-pattern-full", fullKv0p, 2)
+    A.check("kvarch/zero-kv-heads-pattern-swa", svKv0p.layers[0].cells, 1024)
 
     // shared_kv_layers: the tail layers reuse earlier KV → excluded from count.
     var gsh = { arch: "llama", bc: 30, hc: 16, hckv: -1, hckvArr: null, embd: 2816,
@@ -567,9 +628,16 @@ Item {
     A.check("hybrid/mainLayers", s.runningModels[0].mainLayers, 64)
     A.check("hybrid/mtpLayers", s.runningModels[0].mtpLayers, 1)
     A.ok("hybrid/mtpSizeBytes", s.runningModels[0].mtpSizeBytes > 0)
-    // Same for the hybrid: the interval array says WHICH layers keep a context
-    // cache, not whether those layers slide, so the header alone cannot size it.
-    A.check("hybrid/kvCacheBytes", s.runningModels[0].kvCacheBytes, -1)
+    // The interval array says WHICH layers keep a context cache; the ABSENCE of
+    // a window key says the rest. A window is a property of an attention stack and
+    // llama.cpp hardcodes one for no architecture that interleaves recurrent
+    // layers, so a hybrid with no window key is dense and IS sizeable from the
+    // header. 16 full-attention layers of 96256 cells, 4 KV heads x 213.33 head
+    // dim, q5_0 K + q4_0 V. Cross-checked against the engine on the deployed
+    // qwen3.6-35b-a3b (qwen35moe, 40 layers, fai 4, no window key): 2720.00 MiB
+    // derived vs `llama_kv_cache: size = 2720.00 MiB (262144 cells, 10 layers)`
+    // reported — exact, 0 B delta.
+    A.check("hybrid/kvCacheBytes", s.runningModels[0].kvCacheBytes, 1601699840)
 
     // ── Integration: ngl unknown (fit = on) → probe fallback in _applyGguf ───
     s._ggufCache = ({})
@@ -847,14 +915,30 @@ Item {
     A.check("kvprobe/compute-device-only", s._kvProbeAcc.compute.CUDA0, Math.round(1887.86 * 1048576))
     A.check("kvprobe/compute-host-ignored", s._kvProbeAcc.compute.CUDA_Host, undefined)
     A.check("kvprobe/compute-not-doubled", s._kvProbeAcc.computeSeen.length, 1)
-    // A failed run must publish nothing, even though llama.cpp allocates and
-    // logs its cache before it can fail (the real gemma-4 probe that exceeds
-    // the address-space cap prints both size lines and then exits 1).
+    // A run that exits non-zero still PUBLISHES the KV size it measured, but
+    // NOT its compute reserve — those two numbers are trusted under different
+    // contracts. The size line is emitted by the kv-cache constructor once the
+    // allocation is fully sized, so it is a pure function of the hparams and
+    // cparams the probe passed in; gating it on a clean exit discarded correct
+    // answers, because `-ngl 0` leaves the graph reserve on the GPU and the
+    // probe died in ggml_gallocr_reserve_n_impl after printing it. The compute
+    // reserve is a reservation for a graph that may never have been built, and
+    // the device split is derived from it, so it stays unknown here (-1).
     s._kvProbeSignature = "sig-fail"
     s._finishKvProbe(false)
-    A.check("kvprobe/failed-run-not-cached", s._kvProbeCache["sig-fail"], false)
+    A.ok("kvprobe/failed-run-kv-published", s._kvProbeCache["sig-fail"] !== false
+      && s._kvProbeCache["sig-fail"].kvBytes > 0)
+    A.check("kvprobe/failed-run-compute-unknown", s._kvProbeCache["sig-fail"].computeBytes, -1)
     A.check("kvprobe/reset-bytes", s._kvProbeAcc.kvBytes, 0)
     A.check("kvprobe/reset-blocks", s._kvProbeAcc.blocks.length, 0)
+    s._kvProbeSignature = ""
+    // A run that never reached a cache (refused by the address-space pre-flight,
+    // or a SIGKILL during load) still publishes nothing and caches `false`, so a
+    // model that cannot fit is never probed again.
+    s._kvProbeAcc = { kvBytes: 0, kvLayers: 0, computeBytes: -1, blocks: [], compute: ({}), computeSeen: [] }
+    s._kvProbeSignature = "sig-nothing"
+    s._finishKvProbe(false)
+    A.check("kvprobe/no-line-publishes-nothing", s._kvProbeCache["sig-nothing"], false)
     s._kvProbeSignature = ""
     // A clean exit does publish, and the cache is keyed by signature so a
     // refresh never re-probes it.
@@ -899,6 +983,12 @@ Item {
     A.check("kvprobe/argv-kv", av.indexOf("--cache-type-k q8_0 --cache-type-v q8_0") >= 0, true)
     A.check("kvprobe/argv-swafull-absent", av.indexOf("--swa-full") < 0, true)
     A.check("kvprobe/argv-kvu-absent", av.indexOf("--no-kv-unified") < 0, true)
+    // The probe must not touch the GPU at all. -ngl 0 only keeps the WEIGHTS off
+    // the device; the graph/compute reserve still went to cudaMalloc (measured
+    // 1,537 MiB against the live qwen3.6-35b-a3b worker) and the probe then
+    // failed there and exited non-zero. -dev none is what keeps the compute
+    // buffers on the CPU; cache SIZE is device-independent either way.
+    A.check("kvprobe/argv-dev-none", av.indexOf("-dev none") >= 0, true)
     A.check("kvprobe/argv-nkvo", s._kvProbeArgv(clone(pe, "noKvOffload", true))
       .join(" ").indexOf("--no-kv-offload") >= 0, true)
     // The model path is an argv element, never part of the script text.
