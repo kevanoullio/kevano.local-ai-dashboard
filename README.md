@@ -10,8 +10,7 @@ This project is an extended derivative work based on `omarchy-ollama-status` by 
 
 > **For contributors and AI tooling:** this README is the authoritative contract for
 > modifying the plugin — no separate `AGENTS.md` is maintained. It covers the
-> [Source Ladder](#model-information-retrieval--source-ladder) (field precedence and
-> anti-patterns), the [Testing contract](#testing), [Development Conventions](#development-conventions),
+> [llama.cpp service architecture](#design-documentation), the [Testing contract](#testing), [Development Conventions](#development-conventions),
 > and the [Contributing](#contributing) branch flow. Keep all guidance consolidated;
 > never contradict it.
 
@@ -39,6 +38,7 @@ kevano.local-ai-dashboard/
 ├── configs/                         # Per-backend configuration files
 │   ├── llama.env                    #   llama.cpp env template / config
 │   └── ollama.json                  #   ollama JSON config
+├── docs/                            # Design documentation (llama.cpp tier system)
 ├── sections/                        # Dashboard section components
 │   ├── HeroSection.qml              #   Backend cards + power toggle
 │   ├── ServiceDetailsSection.qml    #   Status/version/API grid + configure buttons
@@ -56,9 +56,9 @@ kevano.local-ai-dashboard/
 ├── manifest.json                    # Plugin metadata + entry point declaration
 ├── tests/                           # Hermetic test suite (unit, integration, e2e)
 │   ├── run_all.sh                   #   Orchestrates all test phases
-│   ├── unit_tests/                  #   QML harnesses (~135 assertions)
-│   ├── integration_tests/           #   BATS scripts (29 tests)
-│   └── e2e_tests/                   #   Sandbox lifecycle harnesses
+│   ├── unit_tests/                  #   8 QML harnesses (561 assertions)
+│   ├── integration_tests/           #   9 BATS files (66 tests)
+│   └── e2e_tests/                   #   7 sandbox lifecycle harnesses (120 assertions)
 └── README.md
 ```
 
@@ -66,6 +66,79 @@ kevano.local-ai-dashboard/
 registers a `Controller` that loads `Dashboard.qml` on demand. Both the
 `Service.qml` model and the `qs.Ui` panel primitives (`Panel`,
 `KeyboardPanel`, `CursorSurface`, etc.) are reused across the sections.
+
+---
+
+## Design Documentation
+
+The llama.cpp backend uses a **six-tier acquisition ladder** to resolve every displayed value through a demand-driven orchestrator that asks the cheapest definitive source first, keeps asking while a question is genuinely unanswered, and lets direct system observation overrule predictions. The ollama backend uses a separate, simpler model: all values come directly from the engine (`ollama ps`, `ollama list`) and are treated as exact — there is no tier ladder, field store, or resolver for ollama.
+
+The full architectural design is documented in [`docs/`](docs/). This section provides a quick overview; see the linked files for complete specifications.
+
+### Six-tier acquisition ladder (llama.cpp only)
+
+| # | Tier | Cost | Role | Status | Mechanism |
+|---|---|---|---|---|---|
+| 1 | Server API | ~5 ms | definitive | active | `GET /v1/models` incl. `status.args`, plus `GET /slots` for resolved `n_ctx` |
+| 2 | Model file (GGUF header) | ~15 ms | definitive | active | bounded 16 KiB header read — provides `totalLayers`, shape, quant |
+| 3 | Preset config | ~5 ms | definitive | active | `models.ini` section over `[*]` globals — acquires the raw `n-gpu-layers` token; the split is derived |
+| 4 | System observation | ~20 ms | definitive | active | per-PID GPU memory + cgroup `anon+shmem` — hardware truth for placement |
+| 5 | Engine projection | ~555 ms | **permanently approximate** | planned | `llama-fit-params --fit off --fit-print on -ngl N` — per-device byte breakdown, integer MiB |
+| 6 | Deep engine observation | 3–45 s | definitive | planned | `llama-cli --verbose` oracle — last resort for undescribable shapes |
+
+**Status** records what exists in the tree today, not what the design allows. Tiers
+1–4 are the current implementation; 5 and 6 are specified in
+[`concern-3-p1-plan.md`](concern-3-p1-plan.md) and
+[`concern-1-p0-plan.md`](concern-1-p0-plan.md) and are not built. The current code
+estimates the KV shape from the header and reads placement from cgroup/VRAM, so
+there is no 3–45 s probe in the shipped panel.
+
+Tier 5's *Status* is separate from its certainty, and the difference is load-bearing:
+it is not built, and when it is built it will still be `~` forever. `llama-fit-params`
+prints **integer MiB**, so the projection has already discarded up to ~1 MiB per cell
+before it is printed. A later tier confirming it could only agree, never upgrade — so
+no confirmation tier exists or is planned
+([`concern-4-p2-plan.md`](concern-4-p2-plan.md)).
+
+**Key design points:**
+
+- **Derivation is not a tier.** It is exact arithmetic over whatever the tiers hold, running after each tier commits. For a model whose KV shape the GGUF header fully describes, the walk never spawns tier 5.
+- **Nothing arbitrates anything.** Every rung holds a reading; the ladder picks the *strongest available* one and the display states its certainty. There is no cross-tier conflict resolution, because a rung that cannot answer declares so rather than answering badly. A tier that cannot answer is *absent* (`—`), not zero and not a guess.
+- **Walk order is `[1, 2, 3, 4, 5, 6]`.** The order is by the **quality and speed of the values held**, not by dependency. Tiers are independent: the derivation that turns a layer count into a split is *retried* on every settle rather than scheduled, so no tier has to run before another for the arithmetic to resolve.
+- **Certainty markers:** `exact` (unmarked), `~` (estimate or derived over a model of reality), `…` (pending: in flight at a named tier), `—` (absent: looked everywhere, cannot be had). `…` and `—` are deliberately distinct — the first is "not yet", the second is "looked, and no" — and the store keeps them apart so neither has to be inferred from a `-1` sentinel.
+- **An architecture is read through a key template, and an unknown one degrades to a decline rather than a guess.** GGUF keys are prefixed with the architecture namespace, so hardcoding `llama.block_count` reads nothing from `Qwen3.6-35B-A3B-UD-IQ4_XS.gguf`, which reports `general.architecture = qwen35moe` and carries `qwen35moe.block_count = 40` but no `llama.*` keys at all. That is the regression this design exists to prevent. The derivation therefore resolves keys through a per-namespace suffix template; a namespace with no template yields no shape, the field is `—`, and tier 6 answers it if it can. A uniform-layer assumption applied to an unrecognised layout would produce an authoritative-looking wrong number, which is worse than no number.
+
+### Documentation files
+
+| File | Purpose |
+|---|---|
+| [docs/llama-service-tiers-overview.md](docs/llama-service-tiers-overview.md) | **Start here.** Governing principles, all six tiers at a glance, resolver logic, certainty rules, lifecycle. |
+| [docs/llama-service-tier-1-server-api.md](docs/llama-service-tier-1-server-api.md) | `GET /v1/models` + resolved `status.args` command line parsing. |
+| [docs/llama-service-tier-2-gguf-header.md](docs/llama-service-tier-2-gguf-header.md) | Bounded 16 KiB GGUF header read. Provides `totalLayers`, shape, quantization. |
+| [docs/llama-service-tier-3-preset-config.md](docs/llama-service-tier-3-preset-config.md) | `models.ini` preset, section over `[*]` globals. Resolves `n-gpu-layers` intent to a split. |
+| [docs/llama-service-tier-4-system-observation.md](docs/llama-service-tier-4-system-observation.md) | cgroup `anon+shmem` and per-PID GPU memory. The authoritative tier. |
+| [docs/llama-service-tier-5-engine-projection.md](docs/llama-service-tier-5-engine-projection.md) | `llama-fit-params --fit-print on` per-device decomposition. |
+| [docs/llama-service-tier-6-deep-engine-observation.md](docs/llama-service-tier-6-deep-engine-observation.md) | `llama-cli --verbose` oracle and its parsers. Last resort. |
+| [docs/llama-service-field-matrix.md](docs/llama-service-field-matrix.md) | Every value and every location variable, which tier answers it, certainty, and functions involved. |
+| [`concern-1-p0-plan.md`](concern-1-p0-plan.md) … [`concern-5-p2-p3-plan.md`](concern-5-p2-p3-plan.md) | **The plan.** Field store and resolver, placement ladder, tier 5, declined corroboration, documentation and assertions. These five files replaced `docs/change-plan.md`, which has been removed. |
+
+### How the docs relate
+
+```
+llama-service-tiers-overview.md     the model: principles, certainty, resolver
+        │
+        ├── llama-service-tier-1 … tier-6   one per rung:
+        │                    what it answers, how the code works,
+        │                    what it cannot answer
+        │
+        └── llama-service-field-matrix.md   the cross-product: field × tier × function
+
+concern-1 … concern-5 (repo root)        the work: bugs, new build, change surface
+        │
+        └── supersedes the removed docs/change-plan.md
+```
+
+For the complete source ladder details — worked examples, anti-patterns, KV cache mechanics, and per-tier code locations — see the files above. The inline documentation below has been superseded by these detailed tier documents.
 
 ---
 
@@ -81,9 +154,11 @@ bash tests/run_all.sh
 
 Individual phases:
 
-- **Unit tests** (`tests/run_unit_tests.sh`) — 6 Quickshell harnesses (~135 assertions) covering config parsing, defaults, exit-code maps, provisioning state, security contracts, and input validators.
-- **Integration tests** (`tests/run_integration_tests.sh`) — 29 BATS tests exercising the embedded bash scripts (config reader/writer, env writer, provision create flows, rollback/unsafe matrices) against mocked `systemctl` and `systemd-analyze`.
-- **End-to-end tests** (`tests/run_e2e_tests.sh`) — 3 sandbox harnesses covering llama.cpp full lifecycle, rollback on start failure, and Dashboard→section signal wiring.
+- **Unit tests** (`tests/run_unit_tests.sh`) — 8 Quickshell harnesses (561 assertions) covering config parsing, defaults, exit-code maps, provisioning state, security contracts, input validators, and field derivation.
+- **Integration tests** (`tests/run_integration_tests.sh`) — 66 BATS tests across 9 files, exercising the embedded bash scripts (config reader/writer, env writer, provision create flows, rollback/unsafe matrices) against mocked `systemctl` and `systemd-analyze`.
+- **End-to-end tests** (`tests/run_e2e_tests.sh`) — 7 sandbox harnesses (120 assertions) covering llama.cpp full lifecycle, rollback on start failure, and Dashboard→section signal wiring.
+
+These counts are derived, not typed: `tests/integration_tests/docs.bats` re-derives each one and fails naming the README line if it drifts. A contributor who adds a test and does not update this section gets a red test, which is the intended friction.
 
 A detailed description of the test architecture, constant extraction process,
 and how to add new tests is in [tests/README.md](tests/README.md).
@@ -156,485 +231,17 @@ Rules for anyone (human or agent) modifying the code:
 
 ---
 
-## Model Information Retrieval — Source Ladder
+## Model Information Retrieval
 
-Every displayed per-model and per-service value is resolved through a **per-field,
-fixed precedence ladder** across five tiers. The engine's own API is always
-preferred; the model file comes second; measured probes fill in runtime state;
-derivation computes final values; and the preset serves as a last-resort
-fallback. This section is the ground truth for where each number comes from and
-whether it is exact, measured, or an estimate — the source of every value, how it
-is resolved in code, and the rules for extending it are all documented in this
-README (no separate tooling file is maintained).
+### ollama — simple, exact
 
-### Tier precedence
+No separate ladder — the engine reports everything itself. Running models come from `ollama ps` (per-model size + the `processor` string, e.g. `51%/49% CPU/GPU`); the available list comes from `ollama list` (size, modified date, cloud flag). All values are engine-reported and treated as exact.
 
-The ladder is **per-field**, not one global order: within a field, the first
-tier that answers wins.
+### llama.cpp — six-tier acquisition ladder
 
-1. **API** — `/v1/models` JSON response + resolved CLI args from `status.args`
-2. **GGUF** — bounded 16 KiB header read of the `.gguf` file
-3. **Probes** — cgroup memory.stat (DRAM) + per-PID GPU memory (VRAM)
-4. **Derivation** — pure computation from tiers 1-3 inputs
-5. **Preset** — direct `models.ini` read for values the API didn't resolve
+The llama.cpp backend resolves every displayed per-model value through a **six-tier acquisition ladder** described in detail in [Design Documentation](#design-documentation). The key principle: ask the cheapest definitive source first, keep asking while a question is genuinely unanswered, and let direct system observation overrule predictions.
 
-One tier sits *between* 3 and 4 for the KV cache only, because it is worth its
-own rung: **3.5 — the engine's own accounting.** `llama-cli --verbose` is run
-once per model against the running model's exact KV flags and prints the cache
-it actually built (`llama_kv_cache: size = … MiB (… cells, N layers)`,
-`sched_reserve: <device> compute buffer size = …`). A measurement of the
-engine's own allocation is a stronger answer than any header derivation, so it
-wins whenever it succeeds — see [KV cache](#kv-cache-size-measured-then-derived).
-
-### Marker conventions
-
-- **Exact** — read verbatim from the API or the model file, or derived without
-  estimation (e.g. layer ratio × size). Rendered with no prefix.
-- **`~` estimate / measured** — a GGUF-derived upper bound (KV cache), a number
-  that fell back to the measured per-device footprint, a measured cgroup/GPU
-  figure, a derived CPU/GPU percentage, or a derivation consuming any estimated
-  input. Rendered with a `~` prefix.
-- **`—`** — no source answered for that field (unknown). Never guess.
-
-### Executable ladder
-
-The precedence above is not duplicated across call sites. `Service.qml` owns it in
-one place: **`_resolveFieldSources(entry, p)`** walks the tiers once per field and
-returns every value tagged with the **winning Tier** (1-5) and its **render
-marker** ("", "~", "—"). `sections/ModelsSection.qml::llamaDetailBlock` and
-`_weightBytes` consume these resolved values (via **`_resolveWeights`**) instead of
-re-deriving precedence, so the golden rules are unit-testable in a single pure
-function:
-
-- **Tier 5 beats Tier 3**: a resolved `models.ini` `n-gpu-layers` (any `all`/`N`
-  token) wins over a live VRAM estimate. `_isPresetSplitToken` rejects `auto` and
-  empty values, which do not answer.
-- **Tier 1 beats Tier 5**: an explicit `--n-gpu-layers` in `status.args` beats the
-  preset.
-- **`~` when any input was `~`**: the marker propagates from an estimated split
-  (probe) through to the derived weight bytes; a derivation consuming an estimate
-  is itself rendered `~`.
-
-`**_presetSectionFor(entry)**` is the preset resolver's read side (Tier 5): the
-model's own section merged over the `[*]` globals — section keys win, globals
-chain through — matching `_applyGgufPresetSplit` semantics. The entry's
-`_gpuSplitSource` (`api`/`preset`/`probe`) records which tier answered the split.
-
-### llama.cpp loaded-model matrix
-
-| Field | Tier 1 (API) | Tier 2 (GGUF) | Tier 3 (Probes) | Tier 4 (Derivation) | Tier 5 (Preset) | Marker |
-|---|---|---|---|---|---|---|
-| Name / id | `m.id` from `/v1/models` | — | — | — | — | exact |
-| Loaded status | `status.value` (`loaded`) | — | — | — | — | exact |
-| Model size | `meta.size` | `.gguf` file stat | — | — | — | exact |
-| Parameter count | `meta.n_params` | — | — | — | — | exact |
-| Quantization | — | `general.file_type` (GGUF header) → `_ftypeLabel` (llama.h enum, build 10729) | — | — | — | exact |
-| Context length | `meta.n_ctx` | — | — | — | — | exact |
-| Total layers | — | `block_count` | — | — | — | exact |
-| Main / MTP layers | — | `block_count` + `nextn_predict_layers` + `full_attention_interval` | — | — | — | exact |
-| GPU/CPU layer split | `--n-gpu-layers` in `status.args` | — | estimated from VRAM/~ | derived from above | explicit preset value | exact / ~ / — |
-| Layer % on GPU/CPU | — | — | — | split ÷ total | — | exact / ~ / — |
-| Weight GB per device | — | — | — | size × split ratio | — | exact / ~ / — |
-| KV cache size | — | engine accounting: `llama-cli --verbose` `llama_kv_cache: size` (kept even on a non-zero exit) / `sched_reserve` (clean exit only) (Tier 3.5) | — | per-layer GGUF sum `Σ (K+V) · cells`, from `attention.head_count_kv` (array or scalar; `0` = layer holds no cache), `key_length` / `value_length` (+ `_swa`), `sliding_window`, `sliding_window_pattern`, `recurrent_layers`, `full_attention_interval`, `shared_kv_layers`, `kv_lora_rank`, `rope.dimension_count` (Tier 4) | — | exact / ~ / — |
-| KV cache dtype | `--cache-type-k/v` in args | — | — | — | — | exact |
-| KV cache placement | `--no-kv-offload` (pins it to the host), `-ngl 0` (nothing on the device) | — | where the bytes turned up: cgroup `anon+shmem` vs. the cache size, plus per-PID VRAM | `_kvPlacement` | — | exact / — |
-| Service DRAM | — | — | cgroup `anon+shmem` (ControlGroup, else `/proc/<pid>/cgroup`); `MemoryCurrent` only if neither resolves | — | — | ~ |
-| Service VRAM | — | — | per-PID nvidia-smi/rocm-smi | — | — | ~ |
-
-#### KV cache size: measured, then derived
-
-**Tier 3.5 — the engine's own accounting (exact).** llama.cpp prints the cache
-it actually allocated, so the dashboard asks it directly instead of guessing.
-`llamaProbeProcess` runs `llama-cli` once per model with the running model's own
-KV flags — `-c <ctx>`, `-ub/-b <ubatch>`, `-np <parallel>`,
-`--cache-type-k/-v`, `--swa-full`, `--no-kv-unified`, `--no-kv-offload` — plus
-`-ngl 0 -dev none --no-warmup -st -n 0 -p x --verbose`, and folds the log:
-
-- `llama_kv_cache: size = 2720.00 MiB (262144 cells, 5 layers, …)` → bytes +
-  layer count, **de-duplicated by (bytes, layers)**. The engine prints every
-  cache block twice (setup, then populate); gemma-4-26b emits its 5-layer and
-  25-layer blocks once each and then both again verbatim, so a naive sum would
-  report exactly double. Distinct blocks (a main + a spec context) still both
-  count.
-- `sched_reserve: <device> compute buffer size = …` → per **device** reserve,
-  `CPU` and `*_Host` tags excluded (llama.cpp also reserves host-side staging:
-  `CUDA0 1887.86 MiB` + `CUDA_Host 272.30 MiB`), so only real VRAM is ever
-  subtracted from a split estimate.
-
-Everything about this tier is measured facts about a real run:
-
-- **It logs on stderr, not stdout.** Verified on gemma-4-26b: 3,116 stderr
-  lines, 32 stdout lines, **zero** `llama_kv_cache` lines on stdout. Both
-  channels are parsed; a stdout-only reader never sees an answer.
-- **It never touches the GPU.** `-ngl 0` only keeps the *weights* off the device;
-  the graph/compute reserve still went to `cudaMalloc` (measured 1,537 MiB
-  against a live qwen3.6-35b-a3b worker) and the probe then failed in
-  `ggml_gallocr_reserve_n_impl` and exited non-zero. `-dev none` keeps the
-  compute buffers on the CPU too. Cache *size* is device-independent either way.
-- **A non-zero exit still publishes the cache size, but not the compute
-  reserve.** The two are trusted under different contracts, because they become
-  known at different points in the run and only one depends on the run
-  finishing:
-  - `llama_kv_cache: size` is emitted by the kv-cache constructor once the
-    allocation is fully sized (a sum of `ggml_nbytes()` over the built tensors),
-    so it is a pure function of the hparams and cparams the probe passed in —
-    not a measurement of an inference that ran. Gating it on a clean exit threw
-    away correct answers: the run above printed `2720.00 MiB` and *then* died.
-  - `sched_reserve` is a forward-looking reservation for a graph that may never
-    have been built, and the device split is derived from it, so it stays
-    unknown (`-1`) unless the run exited 0.
-  - A run that never reached a cache (refused by the pre-flight gate, or killed
-    during load) still publishes nothing and caches "no answer".
-- **It is not memory-capped with `ulimit -v`.** That caps *virtual* address
-  space, which llama.cpp's GPU backends reserve far beyond their working set:
-  measured here, `ulimit -v 19.5G` killed a 14.2 GB gemma-4 load with `mmap
-  failed: Cannot allocate memory` while 40 GiB sat free, and the same command
-  succeeded uncapped in 2.3 s. Safety is a **pre-flight gate** instead: if the
-  model + twice the cache + 2 GiB does not fit in 85% of `MemAvailable`, the
-  wrapper exits 98 without starting the engine.
-- Results are cached per signature (model path, context, ubatch, parallel, K/V
-  dtype, swa-full, kv-unified), single-flighted, and a failure is cached as
-  "no answer" so a broken probe is not retried on every refresh.
-- Settings: `kvProbe` (`auto` | `off`), `kvProbeBinary` (default `llama-cli`),
-  `kvProbeTimeoutSec` (default 45).
-
-Precision: the log prints MiB to two decimals, so a Tier-3.5 size is accurate
-to ~5 KiB per cache. That is a measurement, not a derivation, so it renders
-unmarked — like `nvidia-smi`'s own figures — and never as a fabricated exact
-byte count.
-
-**Tier 4 — the header derivation (`~`).** Used when the probe cannot answer
-(no `llama-cli`, skipped by the pre-flight gate, timeout, or a run that never
-reached a cache). It mirrors llama.cpp's per-layer allocation. For
-each main-layer `il`: skip recurrent layers (`attention.recurrent_layers` array,
-else the `full_attention_interval` fallback where `(il+1) % fai != 0`) and the
-`attention.shared_kv_layers` tail (those layers reuse earlier KV). A full/`--swa-full`
-layer holds `ctx` cells; an SWA layer holds `min(ctx, sliding_window·(unified?
-parallel : 1) + ubatch)` padded up to 256. Per layer `K = kvHeads · key_length
-(+`_swa`)` and `V = kvHeads · value_length (+`_swa`)` — both falling back to
-`embedding_length / head_count` (V to K's dim) — then `(K + V) · cells ·
-(unified ? 1 : parallel)` bytes at the KV dtype's `kBits/vBits`. Layer type comes
-from the `sliding_window_pattern` array, else an explicit scalar period, else an
-explicit `attention.sliding_window == 0` (a dense declaration), else the hybrid
-declaration below. MLA (DeepSeek-style, `kv_lora_rank > 0`) is K-only with row =
-`kv_lora_rank + rope.dimension_count` and dense full-ctx cells. Any unsized layer
-→ `—`.
-
-**A hybrid that declares its recurrent layers and no window is dense.** This is
-a fourth *declaration*, not a per-architecture default, and it is what sizes
-qwen3.6 (arch `qwen35moe`: 40 layers, `full_attention_interval = 4`, 2 KV heads,
-`key_length`/`value_length` 256, `ssm.*` keys, and **no** `attention.sliding_window`
-at all). The reasoning is structural: a sliding window is a property of an
-attention stack, and llama.cpp hardcodes one for no architecture whose layers
-interleave with recurrent ones. The sources that *declare recurrence*
-(`recurrent_layers` / `full_attention_interval` / `ssm.*`) and the sources that
-*impose a window* (`load_swa_pattern` or a window pattern read from the file) are
-**disjoint**, so such a file either carries its own window key or has none — and
-with no key there is nothing for a period to be. llama.cpp then leaves
-`is_swa_impl` all-zero and builds one flat full-context cache over the
-non-recurrent layers.
-
-That is a property of the checkout, not of this README, so **verify it rather
-than trusting the paragraph** — the sets move as upstream adds architectures:
-
-```bash
-cd llama.cpp/src/models
-comm -12 \
-  <(grep -lE 'LLM_KV_ATTENTION_RECURRENT_LAYERS|LLM_KV_ATTENTION_FULL_ATTENTION_INTERVAL|SSM' *.cpp | sort) \
-  <(grep -lE 'load_swa_pattern|LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN'        *.cpp | sort)
-# must print nothing; if it ever does, this rule needs revisiting
-```
-
-Verified against the engine on the deployed qwen3.6-35b-a3b:
-
-| | layers | cells | bytes |
-|---|---|---|---|
-| Tier 4 derivation | 10 | 262144 | 2,852,126,720 (2720.00 MiB) |
-| `llama_kv_cache: size` | 10 | 262144 | 2720.00 MiB |
-
-Exact — 0 B delta. Note the "10 layers" is the *counted* set, not the file's
-40, which is precisely what the interval is for.
-
-**What is still deliberately unknown.** Two adjacent cases are left to the probe
-on purpose, because answering them would be a one-architecture table in
-disguise:
-
-- A file that declares **nothing** about its layer types and carries no window
-  key. llama4 and cohere2 have no window key and still get a 4-layer SWA
-  pattern from their own source, so absence proves nothing here.
-- A **positive** window on a file that declares recurrent layers. Only lfm2 among
-  the hybrids derives its pattern that way (`is_swa_impl[il] = !is_recr_impl[il]`);
-  lfm2moe and bailingmoe3 read the same `head_count_kv == 0` convention and ignore
-  the window entirely.
-
-**There is no architecture table, and that is deliberate.** A missing
-`sliding_window_pattern` is *not* filled in from a per-architecture default: the
-dashboard used to carry `_swaPeriodFor` with
-`gemma3=6, gemma3n=5, gemma2=2, gpt_oss=2, llama4=4, cohere2=4`, which is a copy
-of llama.cpp's C++ that silently rots on upgrade and is wrong for any model
-whose converter happened to omit the array. What replaced it is not a table
-either, but a check that the omitted array implies a flat dense cache because no
-hybrid architecture can have a window in the first place. An absent pattern that
-cannot be resolved that way yields **unknown (`—`)** and the header line shows
-nothing; only the declaration in the file, or the engine's own accounting, can
-answer it. Uncertainty is rendered, not filled in.
-
-**Per-layer `head_count_kv`.** `attention.head_count_kv` may be a **scalar or a
-per-layer array** (`arr[i32]`, one entry per block; the header reader also accepts
-`u32`/`u64`/`i64`/`bool` element types and requires `count == block_count`, except
-the sparse `recurrent_layers` index list). A per-layer entry always wins, then the
-scalar, then `head_count` — so Gemma4, which uses **2** KV heads on its 5
-full-attention layers and **8** on the 25 SWA ones, is only sized correctly from
-the array. Reading only `u32`/`bool` arrays silently dropped Gemma4's `i32` array,
-fell back to `head_count = 16` and inflated that model's KV estimate **8×**
-(21.6 GiB instead of 2.81 GiB).
-
-**`head_count_kv == 0` means the layer has no cache.** That is llama.cpp's own
-declaration, not a missing value: lfm2, lfm2moe and bailingmoe3 all set
-`hparams.is_recr_impl[il] = (hparams.n_head_kv(il) == 0)`. Such a layer is
-excluded from the count, exactly like one named by `recurrent_layers`, and the
-two compose — a `0` entry is skipped from both the full and the SWA half of a
-declared period. Used to be parsed as "no entry" and silently replaced by the
-scalar/`head_count` fallback, charging a full context cache to layers that store
-none.
-
-**KV cache placement.** `--no-kv-offload` (Tier 1) pins the cache to host RAM,
-and `-ngl 0` leaves nothing on the device to hold it. Everything else is read
-off **where the bytes actually are** (Tier 3): llama.cpp maps weights with
-`CPU_Mapped` but allocates the cache with plain CPU buffers, so a KV-sized
-anonymous host block can only be the cache — its presence proves host RAM, and
-its absence plus the presence of device memory proves the device, by exhaustion
-over those two possibilities. For a multi-model router both readings are the
-whole cgroup's and neither can be attributed, so only the flag branches answer.
-
-Two placements this explicitly does **not** guess:
-
-- **A fully offloaded stack.** It looks like the mirror of `-ngl 0` — every layer
-  on the device, so where else would the cache be? — and it is wrong: the
-  running gemma-4-26b worker has all 30 layers on the device with its 2,879 MiB
-  cache in host RAM, because llama.cpp sizes the KV buffer against its own
-  `--fit` budget rather than following the layer buffers. Only a measurement
-  places that cache, so total offload falls through to the readings above.
-- **Free VRAM vs. `kv + fit-target`.** Rejected: llama.cpp's internal fit budget
-  is larger than, and version-specific relative to, any `--fit-target` we can
-  read, and it misreported the very model above.
-
-**ollama:** no separate ladder — the engine reports everything itself. Running
-models come from `ollama ps` (per-model size + the `processor` string, e.g.
-`51%/49% CPU/GPU`); the available list comes from `ollama list` (size, modified
-date, cloud flag). All values are engine-reported and treated as exact.
-
-### Worked examples
-
-> Examples 1 and 3 are illustrative schematics showing how the tier ladder
-> resolves each field. Example 2 uses the real GGUF header of the deployed
-> `qwen3.6-35b-a3b` model — all numbers in its resolution line up with the
-> actual file.
-
-#### Example 1: `qwen3.8-27b-fast` (explicit `n-gpu-layers = all`)
-
-```ini
-[qwen3.8-27b-fast]
-model = $HOME/.lmstudio/models/.../Qwen3.8-27B-UD-IQ3_S.gguf
-n-gpu-layers = all
-cache-type-k = q5_0
-cache-type-v = q4_0
-```
-
-**Resolution:**
-
-- Name: Tier 1 → `m.id` from `/v1/models`
-- Size: Tier 1 → `meta.size` = 3.8 GB (exact)
-- Quant: Tier 2 → GGUF `general.file_type` → `iq3_s` (exact)
-- Params: Tier 1 → `meta.n_params` = 27.6B (exact)
-- Context: Tier 1 → `meta.n_ctx` = 131072 (exact)
-- Total layers: Tier 2 → GGUF `block_count` = 65 (exact)
-- GPU/CPU split: Tier 1 → `status.args` contains `--n-gpu-layers all` → gpu=65, cpu=0 (exact)
-- Layer %: Tier 4 → 65/65 × 100 = 100% GPU (exact)
-- Weight GB GPU: Tier 4 → 3.8 GB × 65/65 = 3.8 GB (exact)
-- Weight GB CPU: Tier 4 → 3.8 GB × 0/65 = 0 GB (exact)
-- KV dtype K/V: Tier 1 → `--cache-type-k q5_0` / `--cache-type-v q4_0` (exact, from API args)
-- KV cache size: Tier 3.5 → `llama-cli --verbose` reports the allocation it
-  built: `llama_kv_cache: size = 2090.00 MiB (131072 cells, 16 layers)` (exact,
-  to the log's 2-decimal MiB). Tier 4 also derives it now — `block_count = 65`
-  with `full_attention_interval = 4` → 16 full-attention layers,
-  `head_count_kv = 4`, head dim `5120/24`, K q5_0 / V q4_0, and a hybrid with no
-  window key is dense — so the header stands on its own here and the probe is a
-  cross-check rather than the only source. Rendered `~` either way.
-- KV placement: Tier 1 → no `--no-kv-offload`, and `-ngl all` is *not* proof (see
-  the placement note above); Tier 3 → the service's 2.1 GB anonymous host block
-  covers the 2.0 GB cache, so the cache is in host RAM → on CPU.
-- GPU Total: Tier 4 → 3.8 GB (weights only; the cache is not on the device)
-- CPU Total: Tier 4 → ~0 GB weights + ~2.0 GB KV
-
-**Displayed:**
-
-```
-Quant: iq3_s | 27.6B params
-Model Size: 65 layers | 3.8 GB
-GPU Layers: 65 | 3.8 GB | 100%
-CPU Layers: 0 | 0.0 GB | 0%
-Context: 131,072 tok on CPU
-KV Cache: 2.0 GB (K q5_0 / V q4_0) on CPU
-GPU Total: ~3.8 GB
-CPU Total: ~2.0 GB
-```
-
-#### Example 2: `qwen3.6-35b-a3b` (`fit = on`, no explicit `n-gpu-layers`)
-
-```ini
-[*]                    # Global defaults
-fit = on
-fit-target = 1024
-flash-attn = on
-cache-type-k = q8_0
-cache-type-v = q8_0
-
-[qwen3.6-35b-a3b]
-model = $HOME/.lmstudio/models/.../Qwen3.6-35B-A3B-UD-IQ4_XS.gguf
-# NO n-gpu-layers — relies on global fit = on
-ctx-size = 262144
-```
-
-**Resolution:**
-
-- Name: Tier 1 → `m.id` from `/v1/models`
-- Size: Tier 1 → `meta.size` = 17.7 GB (exact)
-- Quant: Tier 2 → GGUF `general.file_type` → `iq4_xs` (exact)
-- Params: Tier 1 → `meta.n_params` = 30.5B (exact)
-- Context: Tier 1 → `meta.n_ctx` = 262144 (exact)
-- Total layers: Tier 2 → GGUF `block_count` = 40 (exact)
-- GPU/CPU split: Tier 1 → `status.args` has NO `--n-gpu-layers` (not set explicitly)
-  - Tier 3 → measured VRAM = 7.5 GB from nvidia-smi per-PID
-  - Tier 4 → estimate: gpu_layers = round(7.5 GB / 17.7 GB × 40) ≈ 17 layers (~)
-- Layer %: Tier 4 → ~17/40 × 100 ≈ ~43% GPU (~ estimated)
-- Weight GB GPU: Tier 4 → 17.7 GB × 17/40 ≈ ~7.5 GB (~)
-- Weight GB CPU: Tier 4 → 17.7 GB × 23/40 ≈ ~10.2 GB (~)
-- KV dtype K/V: Tier 1 → `--cache-type-k q8_0` / `--cache-type-v q8_0` (exact, from API args)
-- KV cache size: Tier 3.5 → the engine's own accounting, which is what this
-  model is best known for. It is also the case that motivated both halves of the
-  current fix: the probe used to die *after* printing the right answer, and
-  Tier 4 used to render `—`. Both now answer, and on the real deployed
-  `qwen3.6-35b-a3b` they agree to the byte. Worked numbers, header fields and the
-  Tier 3.5 / Tier 4 comparison are in [the hybrid-dense note](#kv-cache-size-measured-then-derived)
-  above; the schematic figures below are illustrative.
-  - `-dev none` is part of why it completes at all: the probe reserves
-    `CPU compute buffer size = 656.30 MiB` instead of failing a 1,537 MiB
-    `cudaMalloc` on a device the live server is already using.
-- KV placement: Tier 1 → no `--no-kv-offload`; Tier 3 → host anon ≈ 19.3 GB
-  covers the cache, so it is in host RAM → on CPU
-- GPU Total: Tier 4 → ~7.5 GB (weights only)
-- CPU Total: Tier 4 → ~10.2 GB weights + ~2.7 GB KV = ~12.9 GB
-
-**Displayed:**
-
-```
-Quant: iq4_xs | 30.5B params
-Model Size: 40 layers | 17.7 GB
-GPU Layers: ~17 | ~7.5 GB | ~43%
-CPU Layers: ~23 | ~10.2 GB | ~57%
-Context: 262,144 tok on CPU
-KV Cache: 2.7 GB (K q8_0 / V q8_0) on CPU
-GPU Total: ~7.5 GB
-CPU Total: ~12.9 GB
-```
-
-#### Example 3: `gemma-4-26b-a4b-qat` (per-layer `head_count_kv`, KV dropped to the host)
-
-```ini
-[*]                    # Global defaults
-fit = on
-fit-target = 1024
-cache-type-k = q8_0
-cache-type-v = q8_0
-parallel = 1
-
-[gemma-4-26b-a4b-qat]
-model = $HOME/.lmstudio/models/.../gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf
-mmproj = $HOME/.lmstudio/models/.../mmproj-F32.gguf
-no-mmproj-offload = true
-ctx-size = 262144
-batch-size = 1024
-# NO n-gpu-layers — llama.cpp's --fit decides, and no no-kv-offload
-```
-
-**Resolution:**
-
-- Size: Tier 1 → `meta.size` = 13.3 GB (exact)
-- Quant: Tier 2 → GGUF `general.file_type = 2` → `q4_0` (exact). Note the file
-  name says `Q4_K_XL`; the header is the only truth, so the panel shows `q4_0`.
-- Total layers: Tier 2 → GGUF `block_count` = 30 (exact)
-- GPU/CPU split: Tier 1 → no `--n-gpu-layers`; Tier 5 → no `n-gpu-layers` in the
-  preset either
-  - Tier 3 → measured per-PID VRAM = 12.8 GB (13,144 MiB) → gpu ≈ 29/30 (~)
-- KV dtype K/V: Tier 1 → `--cache-type-k q8_0` / `--cache-type-v q8_0` (exact)
-- KV cache size: Tier 3.5 → the engine's own accounting (exact), measured with
-  `llama-cli -ngl 0 --verbose -c 262144 -ub 512 -np 1 --cache-type-k q8_0
-  --cache-type-v q8_0` in 3.2 s:
-  - `llama_kv_cache: size = 2720.00 MiB (262144 cells,  5 layers)` → 5 full layers
-  - `llama_kv_cache: size =  159.38 MiB (  1536 cells, 25 layers)` → 25 SWA layers
-  - each block printed twice and folded once → **2,879.38 MiB = 3,019,248,763 B**
-    (2,879.375 MiB true; the 5,243 B delta is the log's 2-decimal MiB printing)
-  - `sched_reserve: CUDA0 compute buffer size = 1887.86 MiB` → device reserve
-    only; the sibling `CUDA_Host 272.30 MiB` is host staging and is excluded
-  - the model loads and the probe runs in **3.2 s**, once per signature
-  Tier 4 agrees here and would have read the same bytes from the header
-  (`sliding_window_pattern` → 5 full + 25 SWA layers, `head_count_kv =
-  [8,8,8,8,8,2,…]`, `key_length` 512 / `key_length_swa` 256,
-  `sliding_window` 1024, ubatch 512, K/V q8_0), but as a `~` upper bound.
-- KV placement: Tier 1 → no `--no-kv-offload`, and *all 30 layers on the device
-  proves nothing* — this is the model where it fails. Tier 3 → the service's
-  3,070,361,600 B of anonymous host memory covers the 2,879 MiB cache, so the
-  cache is in host RAM → **on CPU** (llama.cpp's `--fit` dropped it: 13.3 GB of
-  weights + 2.9 GB of KV does not fit above the 1 GiB fit target on a 15.9 GiB
-  card)
-- GPU Total: Tier 4 → weights only (~12.8 GB); the KV is on the host
-- CPU Total: Tier 4 → ~0.4 GB weights + ~2.8 GB KV
-
-**Displayed:**
-
-```
-Quant: q4_0 | — params
-Model Size: 30 layers | 13.3 GB
-GPU Layers: ~29 | ~12.8 GB | ~97%
-CPU Layers: ~1 | ~0.4 GB | ~3%
-Context: 262,144 tok on CPU
-KV Cache: 2.8 GB (K q8_0 / V q8_0) on CPU
-GPU Total: ~12.8 GB
-CPU Total: ~3.3 GB
-```
-
-### Where models.ini values actually come from
-
-The plugin does **not** scan `models.ini` to populate loaded-model fields, and
-it does **not** parse journald output for statistics (journald is display-only,
-for "View debug output"). Per-model values that originate in the preset —
-layer offload, KV cache type, KV offload, model/draft paths — reach the panel
-as the **resolved command line the service was actually launched with**:
-`GET /v1/models[].status.args`, parsed in `Service.qml`'s `_parseLlamaArgs()`.
-This is authoritative (it is exactly what the router passed to each worker) and
-is present even for **unloaded** preset models while the service runs.
-
-A direct `models.ini` read is the **Tier 5 fallback only**, used in exactly two
-cases the API cannot answer, via the bounded (16 KiB), single-flight reader
-`modelsIniScript` → `_parsePreset`:
-
-- **Global-default layer split** — values that never surface in `status.args`
-  because they came from the `[*]` block (e.g. a global `n-gpu-layers`) resolve
-  the split in `_applyGguf` before the Tier-3 estimate. The section keyed by the
-  model's **file path** wins; the `[*]` globals are the fallback; only validated
-  tokens (`all`, an integer, or `auto`) apply and land as an **exact** split
-  (source `preset`, same marker rules as `api` — no `~`). `auto` still degrades
-  to the Tier-3 probe, exactly as an unset flag does.
-- **Service-stopped available list** — with no API to answer, the preset is the
-  only way to keep listing preset models and their configured intent. Every
-  section carrying a `model =` key becomes an entry, named after the file's
-  basename, rendered with `preset intent: N GPU layers` (the section's
-  `n-gpu-layers`, or the `[*]` globals') under its name.
-
-The reader refuses symlinks/special files, reads at most 16 KiB, and is parsed
-once per session (cached); an unknown or missing preset leaves both consumers
-on their lower tiers (list stays empty, split falls back to Tier 3).
+For the complete specification — including worked examples, anti-patterns, KV cache mechanics, and per-tier code locations — see the tier documents in [`docs/`](docs/).
 
 ### Anti-patterns (do not reintroduce)
 
@@ -642,8 +249,7 @@ on their lower tiers (list stays empty, split falls back to Tier 3).
   or DRM `mem_info_vram_used_total`. These count every process on the GPU.
   GPU memory is attributed only by summing the **per-PID** GPU contexts of the
   llama.cpp service processes (`nvidia-smi --query-compute-apps=pid,used_memory`
-  / `rocm-smi --showpids`). This holds even for the Tier-3 layer-split estimate:
-  it must consume a per-PID VRAM reading, never a whole-GPU figure.
+  / `rocm-smi --showpids`).
 - **`memory.current` / systemd `MemoryCurrent` for the footprint** — both
   include reclaimable page cache, i.e. the mmap'd `.gguf` pages, double-counting
   weight pages already held as anon or on the GPU (a loaded 13 GB model reads
@@ -661,14 +267,17 @@ on their lower tiers (list stays empty, split falls back to Tier 3).
 - **KV cache shown as exact without having asked the engine** — the header sum is
   an upper bound and renders `~`: the server may default any externally-run
   `--cache-type/--ubatch/--parallel` flag to its own values. Unmarked is reserved
-  for Tier 3.5, where llama.cpp printed the allocation it built.
+  for **Tier 6**, where llama.cpp printed the allocation it built.
 - **Assuming "KV offload is enabled, so the KV is on the GPU"** — or, the
   subtler version, "every layer is on the GPU, so the cache must be too".
-  `--fit` moves the cache to host RAM as soon as weights + KV stop fitting,
-  without setting `--no-kv-offload`, and it does so on a **fully** offloaded
-  stack. Placement is decided by `_kvPlacement` from flags and measurements, and
-  it also decides which device's total the KV is added to. Unplaceable stays
-  unattributed rather than being folded into a guess.
+  A **fully** offloaded stack is not evidence about the cache: `--fit`,
+  `--no-kv-offload`, the cache dtypes and the free VRAM all bear on it, and only a
+  measurement decides. Naming `--fit` as the mechanism would assert an unverified
+  cause — the measurement behind this claim showed host `anon+shmem` *above* the
+  cache while per-PID VRAM was 13.5 GB, which cannot separate the cache from the
+  CPU-resident weights. Placement is decided by `_kvPlacement` from flags and
+  measurements, and it also decides which device's total the KV is added to.
+  Unplaceable stays unattributed rather than being folded into a guess.
 - **Capping the probe with `ulimit -v`** — virtual address space is not memory;
   llama.cpp's GPU backends reserve far more VA than RSS and the load dies with
   `mmap failed` on a machine with tens of GiB free.
@@ -687,8 +296,8 @@ on their lower tiers (list stays empty, split falls back to Tier 3).
   the scalar silently charges a full context cache to layers that have none.
 - **Guessing offload from VRAM math when a higher tier answered** — the layer
   split prefers the resolved `--n-gpu-layers` (Tier 1) and the explicit preset
-  value (Tier 5). The measured-VRAM estimate (~, Tier 3) is used **only when
-  neither Tier 1 nor Tier 5 provides `--n-gpu-layers`**, always from a per-PID
+  value (Tier 3). The measured-VRAM estimate (~, Tier 4) is used **only when
+  neither Tier 1 nor Tier 3 provides `--n-gpu-layers`**, always from a per-PID
   reading, rounded to whole layers. When even that is unavailable, render `—`.
 - **Guessing quant or params from the filename or `meta.size`** — the quant is
   an exact Tier-2 value read only from the GGUF header's `general.file_type`
@@ -696,18 +305,6 @@ on their lower tiers (list stays empty, split falls back to Tier 3).
   from `meta.n_params`. Never derive them heuristically (file-name substrings,
   size ratios); `meta.size` is the aggregate file size and encodes no
   quantization. Unknown renders `—`.
-
-### Where each tier lives in the code
-
-| Tier | Source | Code (Service.qml unless noted) |
-|---|---|---|
-| 1 (API) | `/v1/models`, `/slots` | `_finishJsonModels`, `_parseLlamaArgs`, `_finishSlots` |
-| 2 (GGUF) | `ggufScript` bounded 16 KiB header read | `_queueGguf` → `ggufProcess` → `_finishGguf` → `_applyGguf` / `_applyGgufDraft` / `_applyGgufToRunning` |
-| 3 (Probes) | cgroup + GPU drivers | `serviceMemoryScript` / `serviceVramScript` → `_finishServiceMemory` / `_finishServiceVram` → `_deriveServiceTotal` |
-| 3.5 (Engine accounting) | `llama-cli --verbose` KV/compute lines, via `kvProbeScript` | `kvProbeProcess` → `_onKvProbeLine` / `_parseKvProbeLine` → `_finishKvProbe` → `_applyKvProbeResult` / `_resolveKvBytes` |
-| 4 (Derivation) | pure computation from tiers 1-3 | `_mtpSplit`, `_percentLayersOnGPU/CPU`, `_weightBytes`, `_kvEstimateBytes`, `_kvEstimateBytesArch`, `_buildKvLayers`, `_kvCellsForType`, `_recurrentSet`, `_kvPlacement`, `_estimateSplitFromProbes`, `_kvDtypeBits` |
-| 5 (Preset) | `models.ini` bounded 16 KiB read (unresolved layer split + service-stopped list) | `modelsIniScript` → `presetProcess` → `_finishPreset` → `_parsePreset` / `_presetModels`, `_applyGgufPresetSplit` |
-| Display | `~` / `—` rendering, per-device totals | `sections/ModelsSection.qml llamaDetailBlock` |
 
 ---
 
@@ -718,6 +315,8 @@ on their lower tiers (list stays empty, split falls back to Tier 3).
 The top header presents a horizontal row of available local services. Each service is represented by a single-column, two-row element:
 
 ```
+
+
 
 
 +--------------+--------------+
@@ -767,17 +366,17 @@ Displays an itemized list of all local models recognized by the selected service
 - **Model Size:** Layer count and total file size (base + draft)
 - **GPU Layers / CPU Layers:** Per-device layer counts, weight GB, and percentage of the main stack on that device. A `(+N MTP ~X MB)` suffix appears when MTP draft layers are present.
 - **Context:** Context length with location indicator (`on GPU` or `on CPU`)
-- **KV Cache:** Estimated KV cache size with dtype info (e.g., `K f16 / V f16`) and location. Both the Context and KV lines share one placement decision: `--no-kv-offload` pins it to the host, otherwise the measured per-PID VRAM must show a KV-sized excess over the estimated GPU weights for it to be called `on GPU` (llama.cpp's `--fit` otherwise leaves the cache in host RAM). Omitted when unknown.
+- **KV Cache:** Estimated KV cache size with dtype info (e.g., `K f16 / V f16`) and location. Both the Context and KV lines share one placement decision: `--no-kv-offload` pins it to the host, otherwise the measured per-PID VRAM must show a KV-sized excess over the estimated GPU weights for it to be called `on GPU`. Omitted when unknown.
 - **Quant / Params:** First row (`Quant: q4_k_m | 30.5B params`), shown above Model
    Size whenever the quant (from the GGUF header's `general.file_type`, Tier 2) or
    the param count (`meta.n_params`, Tier 1) is known. Both are exact — no `~`.
    Each unknown shows `—`; the whole line is omitted when none are known.
 - **GPU Total / CPU Total:** Combined weight + co-located KV cache per device (shown when applicable)
 
-When the preset sets no explicit `--n-gpu-layers`, layer counts and percentages fall back to a `~` estimate derived from measured per-PID VRAM (Tier 3 → Tier 4), and show "—" only when even that is unavailable; the weight GB follows the same split (exact layer-ratio when known, otherwise the measured "~" VRAM/DRAM footprint). The KV cache size is the engine's own accounting when `llama-cli --verbose` can be asked (Tier 3.5, one ~3 s run per model, rendered without `~`), and otherwise a "~" upper bound: a per-layer sum over the model's GGUF header (`_buildKvLayers`), so hybrid architectures — per-layer `head_count_kv`, sliding-window layers, recurrent/shared layers, MLA — are sized the way llama.cpp allocates them rather than as a uniform product. A model whose header declares no usable SWA shape and whose probe could not run shows `—` rather than a guess.
+When the preset sets no explicit `--n-gpu-layers`, layer counts and percentages fall back to a `~` estimate **derived** from measured per-PID VRAM (Tier 4) and the header's layer count (Tier 2), and show `—` only when even that is unavailable; the weight GB follows the same split, and is `~` by construction even when every input is exact — the arithmetic is a division, the *equal-layer* model of it is the approximation. The KV cache size is the engine's own accounting when `llama-cli --verbose` can be asked (**Tier 6**, not built yet — a 3–45 s run per model, rendered without `~`), and otherwise a `~` upper bound: a per-layer sum over the model's GGUF header (`_buildKvLayers`), so hybrid architectures — per-layer `head_count_kv`, sliding-window layers, recurrent/shared layers, MLA — are sized the way llama.cpp allocates them rather than as a uniform product. A model whose header declares no usable SWA shape and whose probe could not run shows `—` rather than a guess.
 
 For the full precedence ladder, the exact source of every value, and the
-anti-pattern rules, see [Model Information Retrieval — Source Ladder](#model-information-retrieval--source-ladder).
+anti-pattern rules, see [Design Documentation](#design-documentation).
 
 **Loaded model detail (ollama):** A single-line summary showing memory footprint and CPU/GPU split: `"Memory: X.X GB | CPU: Y% | GPU: Z%"`, parsed from the engine's `processor` string.
 
