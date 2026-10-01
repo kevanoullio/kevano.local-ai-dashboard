@@ -66,24 +66,33 @@ tests/
 │   ├── dump_constants.qml          # marker-JSON dump of Service.qml constants
 │   ├── Commons/                    # qs.Commons stubs (Style, Color, Border, Util)
 │   └── Ui/                         # qs.Ui stubs (Panel*, CursorSurface, ...)
-├── unit_tests/                     # Phase 2 — 6 quickshell harnesses
+├── unit_tests/                     # Phase 2 — 8 quickshell harnesses (561 assertions)
 │   ├── tst_config_parser.qml
 │   ├── tst_defaults.qml
+│   ├── tst_derivation.qml
 │   ├── tst_exitcode_maps.qml
 │   ├── tst_provision_state.qml
 │   ├── tst_security_contract.qml
+│   ├── tst_unload.qml
 │   └── tst_validators.qml
-├── integration_tests/              # Phase 3 — 5 bats files (29 tests)
+├── integration_tests/              # Phase 3 — 9 bats files (66 tests)
 │   ├── config_reader.bats
 │   ├── config_writer.bats
 │   ├── env_writer.bats
+│   ├── gguf_header.bats
+│   ├── kv_probe.bats
+│   ├── models_ini.bats
 │   ├── provision_dryrun_create.bats
-│   └── provision_rollback_unsafe.bats
-└── e2e_tests/                      # Phase 4 — 4 sandbox harnesses
+│   ├── provision_rollback_unsafe.bats
+│   └── unload_slots_api.bats
+└── e2e_tests/                      # Phase 4 — 7 sandbox harnesses (120 assertions)
     ├── e2e_llama_lifecycle.qml
     ├── e2e_llama_rollback.qml
     ├── e2e_dashboard_confirm_wiring.qml
-    └── e2e_controller_reinjection.qml
+    ├── e2e_controller_reinjection.qml
+    ├── e2e_model_meta.qml
+    ├── e2e_mtp_draft.qml
+    └── e2e_preset.qml
 ```
 
 `tests/.cache/` is scratch (ignored by git). It holds the dumped constants
@@ -119,7 +128,8 @@ string constants. `extract_constants.sh`:
 
 Dumped constants: `llamaEnvDefault`, `llamaUnitBody`, `provisionLlamaScript`,
 `createEnvScript`, `configScript`, `createConfigScript`, `ggufScript`,
-`modelsIniScript`, `unloadScriptLlama`, `slotsScriptLlama`, `userUnitDir`.
+`modelsIniScript`, `unloadScriptLlama`, `slotsScriptLlama`, `kvProbeScript`,
+`userUnitDir`.
 Every bats test reads these files via `lconst()`/`fab()`, so a change to
 `Service.qml` propagates automatically — there is nothing to hand-synchronize.
 
