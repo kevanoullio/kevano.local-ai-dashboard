@@ -25,7 +25,7 @@ Item {
       "llamaEnvDefault", "llamaUnitBody", "provisionLlamaScript",
       "createEnvScript", "configScript", "createConfigScript",
       "ggufScript", "modelsIniScript", "unloadScriptLlama", "slotsScriptLlama",
-      "kvProbeScript"
+      "kvProbeScript", "kvFitScript"
     ]
     for (var i = 0; i < names.length; i++) {
       console.log(">>>DUMP:" + names[i] + "<<<")

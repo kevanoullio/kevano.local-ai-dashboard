@@ -56,9 +56,9 @@ kevano.local-ai-dashboard/
 ├── manifest.json                    # Plugin metadata + entry point declaration
 ├── tests/                           # Hermetic test suite (unit, integration, e2e)
 │   ├── run_all.sh                   #   Orchestrates all test phases
-│   ├── unit_tests/                  #   8 QML harnesses (561 assertions)
-│   ├── integration_tests/           #   9 BATS files (66 tests)
-│   └── e2e_tests/                   #   7 sandbox lifecycle harnesses (120 assertions)
+│   ├── unit_tests/                  #   8 QML harnesses (855 assertions)
+│   ├── integration_tests/           #   11 BATS files (86 tests)
+│   └── e2e_tests/                   #   7 sandbox lifecycle harnesses (154 assertions)
 └── README.md
 ```
 
@@ -83,18 +83,16 @@ The full architectural design is documented in [`docs/`](docs/). This section pr
 | 2 | Model file (GGUF header) | ~15 ms | definitive | active | bounded 16 KiB header read — provides `totalLayers`, shape, quant |
 | 3 | Preset config | ~5 ms | definitive | active | `models.ini` section over `[*]` globals — acquires the raw `n-gpu-layers` token; the split is derived |
 | 4 | System observation | ~20 ms | definitive | active | per-PID GPU memory + cgroup `anon+shmem` — hardware truth for placement |
-| 5 | Engine projection | ~555 ms | **permanently approximate** | planned | `llama-fit-params --fit off --fit-print on -ngl N` — per-device byte breakdown, integer MiB |
-| 6 | Deep engine observation | 3–45 s | definitive | planned | `llama-cli --verbose` oracle — last resort for undescribable shapes |
+| 5 | Engine projection | ~555 ms | **permanently approximate** | active | `llama-fit-params --fit off --fit-print on -ngl N` — per-device byte breakdown, integer MiB |
+| 6 | Deep engine observation | 3–45 s | definitive | active | `llama-cli --verbose` oracle — last resort for undescribable shapes |
 
-**Status** records what exists in the tree today, not what the design allows. Tiers
-1–4 are the current implementation; 5 and 6 are specified in
-[`concern-3-p1-plan.md`](concern-3-p1-plan.md) and
-[`concern-1-p0-plan.md`](concern-1-p0-plan.md) and are not built. The current code
-estimates the KV shape from the header and reads placement from cgroup/VRAM, so
-there is no 3–45 s probe in the shipped panel.
+**Status** records what exists in the tree today. All six tiers are implemented:
+tiers 1–4 are the fast path, and 5 and 6 are the need-gated deep rungs that run
+**only** when the header shape is not fully described — the derivation never
+spawns them for a model the GGUF can size exactly.
 
-Tier 5's *Status* is separate from its certainty, and the difference is load-bearing:
-it is not built, and when it is built it will still be `~` forever. `llama-fit-params`
+Tier 5's *Status* is separate from its certainty, and the difference is
+load-bearing: it is built, and it will still be `~` forever. `llama-fit-params`
 prints **integer MiB**, so the projection has already discarded up to ~1 MiB per cell
 before it is printed. A later tier confirming it could only agree, never upgrade — so
 no confirmation tier exists or is planned
@@ -120,7 +118,7 @@ no confirmation tier exists or is planned
 | [docs/llama-service-tier-5-engine-projection.md](docs/llama-service-tier-5-engine-projection.md) | `llama-fit-params --fit-print on` per-device decomposition. |
 | [docs/llama-service-tier-6-deep-engine-observation.md](docs/llama-service-tier-6-deep-engine-observation.md) | `llama-cli --verbose` oracle and its parsers. Last resort. |
 | [docs/llama-service-field-matrix.md](docs/llama-service-field-matrix.md) | Every value and every location variable, which tier answers it, certainty, and functions involved. |
-| [`concern-1-p0-plan.md`](concern-1-p0-plan.md) … [`concern-5-p2-p3-plan.md`](concern-5-p2-p3-plan.md) | **The plan.** Field store and resolver, placement ladder, tier 5, declined corroboration, documentation and assertions. These five files replaced `docs/change-plan.md`, which has been removed. |
+| [`concern-1-p0-plan.md`](concern-1-p0-plan.md) … [`concern-5-p2-p3-plan.md`](concern-5-p2-p3-plan.md) | **The plan.** Field store and resolver, placement ladder, tier 5, declined corroboration, documentation and assertions. These five files replace the removed change plan. |
 
 ### How the docs relate
 
@@ -135,7 +133,7 @@ llama-service-tiers-overview.md     the model: principles, certainty, resolver
 
 concern-1 … concern-5 (repo root)        the work: bugs, new build, change surface
         │
-        └── supersedes the removed docs/change-plan.md
+        └── supersede the removed change plan
 ```
 
 For the complete source ladder details — worked examples, anti-patterns, KV cache mechanics, and per-tier code locations — see the files above. The inline documentation below has been superseded by these detailed tier documents.
@@ -154,9 +152,9 @@ bash tests/run_all.sh
 
 Individual phases:
 
-- **Unit tests** (`tests/run_unit_tests.sh`) — 8 Quickshell harnesses (561 assertions) covering config parsing, defaults, exit-code maps, provisioning state, security contracts, input validators, and field derivation.
-- **Integration tests** (`tests/run_integration_tests.sh`) — 66 BATS tests across 9 files, exercising the embedded bash scripts (config reader/writer, env writer, provision create flows, rollback/unsafe matrices) against mocked `systemctl` and `systemd-analyze`.
-- **End-to-end tests** (`tests/run_e2e_tests.sh`) — 7 sandbox harnesses (120 assertions) covering llama.cpp full lifecycle, rollback on start failure, and Dashboard→section signal wiring.
+- **Unit tests** (`tests/run_unit_tests.sh`) — 8 Quickshell harnesses (855 assertions) covering config parsing, defaults, exit-code maps, provisioning state, security contracts, input validators, and field derivation.
+- **Integration tests** (`tests/run_integration_tests.sh`) — 86 BATS tests across 11 files, exercising the embedded bash scripts (config reader/writer, env writer, provision create flows, rollback/unsafe matrices) against mocked `systemctl` and `systemd-analyze`.
+- **End-to-end tests** (`tests/run_e2e_tests.sh`) — 7 sandbox harnesses (154 assertions) covering llama.cpp full lifecycle, rollback on start failure, and Dashboard→section signal wiring.
 
 These counts are derived, not typed: `tests/integration_tests/docs.bats` re-derives each one and fails naming the README line if it drifts. A contributor who adds a test and does not update this section gets a red test, which is the intended friction.
 
@@ -373,7 +371,7 @@ Displays an itemized list of all local models recognized by the selected service
    Each unknown shows `—`; the whole line is omitted when none are known.
 - **GPU Total / CPU Total:** Combined weight + co-located KV cache per device (shown when applicable)
 
-When the preset sets no explicit `--n-gpu-layers`, layer counts and percentages fall back to a `~` estimate **derived** from measured per-PID VRAM (Tier 4) and the header's layer count (Tier 2), and show `—` only when even that is unavailable; the weight GB follows the same split, and is `~` by construction even when every input is exact — the arithmetic is a division, the *equal-layer* model of it is the approximation. The KV cache size is the engine's own accounting when `llama-cli --verbose` can be asked (**Tier 6**, not built yet — a 3–45 s run per model, rendered without `~`), and otherwise a `~` upper bound: a per-layer sum over the model's GGUF header (`_buildKvLayers`), so hybrid architectures — per-layer `head_count_kv`, sliding-window layers, recurrent/shared layers, MLA — are sized the way llama.cpp allocates them rather than as a uniform product. A model whose header declares no usable SWA shape and whose probe could not run shows `—` rather than a guess.
+When the preset sets no explicit `--n-gpu-layers`, layer counts and percentages fall back to a `~` estimate **derived** from measured per-PID VRAM (Tier 4) and the header's layer count (Tier 2), and show `—` only when even that is unavailable; the weight GB follows the same split, and is `~` by construction even when every input is exact — the arithmetic is a division, the *equal-layer* model of it is the approximation. The KV cache size is the engine's own accounting when `llama-cli --verbose` can be asked — the **Tier 6** oracle, a need-gated 3–45 s run per model, rendered without `~` — and otherwise a `~` upper bound: a per-layer sum over the model's GGUF header (`_buildKvLayers`), so hybrid architectures — per-layer `head_count_kv`, sliding-window layers, recurrent/shared layers, MLA — are sized the way llama.cpp allocates them rather than as a uniform product. A model whose header declares no usable SWA shape and whose probe could not run shows `—` rather than a guess.
 
 For the full precedence ladder, the exact source of every value, and the
 anti-pattern rules, see [Design Documentation](#design-documentation).

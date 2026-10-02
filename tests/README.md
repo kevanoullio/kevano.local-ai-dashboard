@@ -66,7 +66,7 @@ tests/
 │   ├── dump_constants.qml          # marker-JSON dump of Service.qml constants
 │   ├── Commons/                    # qs.Commons stubs (Style, Color, Border, Util)
 │   └── Ui/                         # qs.Ui stubs (Panel*, CursorSurface, ...)
-├── unit_tests/                     # Phase 2 — 8 quickshell harnesses (561 assertions)
+├── unit_tests/                     # Phase 2 — 8 quickshell harnesses (855 assertions)
 │   ├── tst_config_parser.qml
 │   ├── tst_defaults.qml
 │   ├── tst_derivation.qml
@@ -75,17 +75,19 @@ tests/
 │   ├── tst_security_contract.qml
 │   ├── tst_unload.qml
 │   └── tst_validators.qml
-├── integration_tests/              # Phase 3 — 9 bats files (66 tests)
+├── integration_tests/              # Phase 3 — 11 bats files (86 tests)
 │   ├── config_reader.bats
 │   ├── config_writer.bats
+│   ├── docs.bats
 │   ├── env_writer.bats
 │   ├── gguf_header.bats
+│   ├── kv_fit.bats
 │   ├── kv_probe.bats
 │   ├── models_ini.bats
 │   ├── provision_dryrun_create.bats
 │   ├── provision_rollback_unsafe.bats
 │   └── unload_slots_api.bats
-└── e2e_tests/                      # Phase 4 — 7 sandbox harnesses (120 assertions)
+└── e2e_tests/                      # Phase 4 — 7 sandbox harnesses (154 assertions)
     ├── e2e_llama_lifecycle.qml
     ├── e2e_llama_rollback.qml
     ├── e2e_dashboard_confirm_wiring.qml
@@ -129,7 +131,7 @@ string constants. `extract_constants.sh`:
 Dumped constants: `llamaEnvDefault`, `llamaUnitBody`, `provisionLlamaScript`,
 `createEnvScript`, `configScript`, `createConfigScript`, `ggufScript`,
 `modelsIniScript`, `unloadScriptLlama`, `slotsScriptLlama`, `kvProbeScript`,
-`userUnitDir`.
+`kvFitScript`, `userUnitDir`.
 Every bats test reads these files via `lconst()`/`fab()`, so a change to
 `Service.qml` propagates automatically — there is nothing to hand-synchronize.
 

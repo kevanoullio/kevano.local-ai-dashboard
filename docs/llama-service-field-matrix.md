@@ -27,7 +27,9 @@ anything else. For *how* a tier works, read its file.
   is genuinely only one source. Derived producers are never listed here; they are
   named in **Derived from**.
 
-**Tiers 1–4 are active; 5 and 6 are planned and not yet built.** The numbering is
+**All six tiers are active.** Tiers 1–4 are the fast path; 5 (projection) and 6
+(oracle) are need-gated deep rungs that run only when the header shape is not
+fully described. The numbering is
 [llama-service-tiers-overview.md](llama-service-tiers-overview.md) §2: API 1, file
 2, preset 3, system 4, projection 5, oracle 6. There is no tier 0 and no tier 3.5
 — the "3.5" label described today's probe, which becomes tier 6.
@@ -61,7 +63,7 @@ order. Everything else in the panel is a service-level figure.
 |---|---|---|---|---|---|---|
 | model name | *(row label)* | **1** | exact | — | `_finishJsonModels` | `name` |
 | `sizeBytes` | `Model Size: … \| X GB` | **1** | exact | 3 (`size`) | `parseInt(meta.size)` | `sizeBytes` |
-| `contextLen` | `Context: N tok` | **1** | exact | 6 (probe) | `parseInt(meta.n_ctx)` | `contextLen` |
+| `contextLen` | `Context: N tok` | **1** | exact | — | `_applySlotsContext` (`/slots` `n_ctx`) supersedes `/v1/models` `meta.n_ctx` | `contextLen` |
 | `nParams` | `… \| 30.5B params` | **1** | exact | — | `parseInt` → `_formatCount` | `nParams` |
 | `ftype` | `Quant: q4_k_m` | **2** | exact | — | `_applyGguf` → `_ftypeLabel` | `ftype` |
 | `modelPath` | *(internal)* | **1** | exact | — | `_parseLlamaArgs` | `modelPath` |
@@ -73,6 +75,13 @@ order. Everything else in the panel is a service-level figure.
 API (upstream-confirmed; `e2e_model_meta.qml` pins it). The `processor` split
 has **no marker machinery at all** today — an unparseable string yields
 `""` and the row says `Memory unavailable`.
+
+`contextLen` is **tier-1 only** and has **no tier-2 fallback**. `/slots` `n_ctx`
+is the resolved (`fit`-decided) allocation and supersedes the declared
+`meta.n_ctx`; when neither is available the field stays unanswered. The header's
+`<arch>.context_length` is the *trained capacity* and is never read — see
+[tier 1](llama-service-tier-1-server-api.md) and the rejection note in
+[concern-1 §7.1](../concern-1-p0-plan.md).
 
 ### 2.2 Flags read from `status.args`
 

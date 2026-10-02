@@ -5,7 +5,9 @@
 # qs.Commons/qs.Ui stubs, asserts.js and (for unit runs, callers pre-copy it)
 # Service.qml itself. The dir IS the -p config dir, so qs.Commons resolves.
 # Tokens substituted: @SERVICE_QML_PATH@ and @SECTION_QML_PATH@ (sibling of
-# service under sections/). Prints the LAD-* summary. Exits nonzero on failure.
+# service under sections/), plus @TESTS_DIR@ so a harness can read a committed
+# fixture regardless of which .cache dir its Service.qml was copied into.
+# Prints the LAD-* summary. Exits nonzero on failure.
 set -u
 T="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 harn=${1:?}
@@ -13,11 +15,26 @@ service=${2:?}
 shift 2
 
 name=$(basename "$harn" .qml)
-dir=$(cd "$(dirname "$service")" && pwd)
-service="$dir/$(basename "$service")"
+src_dir=$(cd "$(dirname "$service")" && pwd)
 LOG="$T/.cache/run-$name.log"
+# The assembly dir (stubs + harness qml, the -p config dir) must always live
+# under tests/.cache. If the service's own dir is outside it (e.g. a dev run
+# pointed at the real repo Service.qml), copy that plugin tree in first so
+# nothing is ever written into the plugin source tree.
+case "$src_dir" in
+  "$T"/.cache/*) dir="$src_dir" ;;
+  *)
+    dir="$T/.cache/run-$name"
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    # .cache is excluded so the copy never reads its own destination.
+    tar -C "$src_dir" --exclude=.git --exclude=.cache -cf - . | tar -C "$dir" -xf -
+    ;;
+esac
+service="$dir/$(basename "$service")"
 mkdir -p "$dir"
 
+rm -rf "$dir/Commons" "$dir/Ui"
 cp -r "$T/support/Commons" "$dir/Commons"
 cp -r "$T/support/Ui" "$dir/Ui"
 cp "$T/lib/asserts.js" "$dir/asserts.js"
@@ -27,6 +44,7 @@ sed -e "s|@SERVICE_QML_PATH@|file://$service|g" \
     -e "s|@SECTION_QML_PATH@|file://$plugin_dir/sections/ServiceDetailsSection.qml|g" \
     -e "s|@DASHBOARD_QML_PATH@|file://$plugin_dir/Dashboard.qml|g" \
     -e "s|@PROBE_SCRIPT_PATH@|${PROBE_SCRIPT_PATH:-@PROBE_SCRIPT_PATH@}|g" \
+    -e "s|@TESTS_DIR@|${TESTS_DIR:-$T}|g" \
     < "$harn" > "$dir/$name.qml"
 
 (cd "$T" && env QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}" "$@" timeout 90 quickshell -p "$dir/$name.qml" > "$LOG" 2>&1) &

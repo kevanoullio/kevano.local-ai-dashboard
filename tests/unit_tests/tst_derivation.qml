@@ -1,5 +1,6 @@
 import QtQuick
 import Quickshell
+import Quickshell.Io
 import "asserts.js" as A
 
 // Unit: the pure llama.cpp derivation helpers that turn raw --n-gpu-layers /
@@ -8,6 +9,19 @@ import "asserts.js" as A
 // input, so a partial or surprising server response can't break rendering.
 Item {
   id: root
+
+  // The tier-5 parser is driven from the committed golden capture, so a
+  // toolchain change fails here with a diff instead of quietly mis-parsing the
+  // rows. No invented strings: if the fixture is missing the parse groups fail
+  // loudly rather than passing against a guess.
+  FileView { id: fixtureView; printErrors: false; blockAllReads: true }
+  function readFixture(path) {
+    fixtureView.path = ""
+    fixtureView.path = path
+    var t = fixtureView.text()
+    return (t === undefined || t === null) ? "" : String(t)
+  }
+
   Component.onCompleted: {
     var s = A.service("@SERVICE_QML_PATH@", root, "llama.cpp")
 
@@ -84,7 +98,7 @@ Item {
     // There is deliberately no per-architecture SWA-period table in the service:
     // llama.cpp owns those constants in its own source and a copy goes stale the
     // next time upstream changes a model, so a missing pattern key is answered
-    // by the engine probe (Tier 3.5) instead. Pinned here so re-adding one fails.
+    // by the engine probe (tier 6) instead. Pinned here so re-adding one fails.
     A.check("kvarch/no-arch-table", typeof s._swaPeriodFor, "undefined")
     A.check("kvarch/no-arch-switch", /_swaPeriodFor|gemma3|gemma4|llama4|cohere2|gpt_oss|gemma3n/
       .test(String(s.kvProbeScript)), false)
@@ -352,63 +366,99 @@ Item {
     A.check("args-kv/default-swaFull", pfd.swaFull, false)
     A.check("args-kv/default-noKvUnified", pfd.noKvUnified, false)
 
-    // ── _kvPlacement: where the KV cache actually lives ──────────────────────
-    // Only two things decide, and both are facts rather than a model of the
-    // engine's placement heuristic: the flags it was given, and where the bytes
-    // turned up. A KV-sized anonymous host block PROVES the cache is in RAM
-    // (llama.cpp maps weights with CPU_Mapped and the cache with plain CPU
-    // buffers, so a KV-sized anon+shmem block can only be the cache); its
-    // absence plus the presence of device memory PROVES the device by
-    // exhaustion. The old free-VRAM-vs-fit-target comparison needed llama.cpp's
-    // internal fit budget, which is version-specific and not readable — and it
-    // disagreed with the running worker on the very model this exists for.
+    // ── pl/*: the tier-4 placement ladder (Service.qml _kvPlacement) ─────────
+    // PURE: a readings record in, {value, marker, action} out. Two things decide
+    // and both are facts rather than a model of the engine's placement heuristic:
+    // the flags it was given, and where the bytes turned up. -1 is "not measured"
+    // and must never be treated as a measured 0 — that is the whole reason
+    // `mem === 0` and not `mem < 0`.
     // gemma-4-26b-a4b-qat as measured here: KV 3,019,243,520 B, service DRAM
-    // 3,070,361,600 B, service VRAM 13,144 MiB → CPU.
+    // 3,070,361,600 B, service VRAM 13,144 MiB → host anon ABOVE the cache, which
+    // is rung 3, not "CPU".
     var KV4 = 3019243520
     var VR4 = 13144 * 1048576
     var MEM4 = 3070361600
-    var sole = { memBytes: MEM4, vramBytes: VR4, sole: true }
-    A.check("kvplace/no-kv-offload-cpu", s._kvPlacement(true, 30, 30, KV4, sole), "CPU")
-    A.check("kvplace/no-kv-offload-beats-measure", s._kvPlacement(true, 30, 30, -1, sole), "CPU")
-    A.check("kvplace/fit-dropped-cpu", s._kvPlacement(false, 30, 30, KV4, sole), "CPU")
-    A.check("kvplace/nothing-offloaded-cpu", s._kvPlacement(false, 0, 30, -1, sole), "CPU")
-    // A FULLY offloaded stack is not the mirror of -ngl 0 and must not be
-    // treated as one: the live gemma-4 worker runs all 30 layers on the device
-    // with its cache in host RAM, so "every layer is on the GPU" proves
+    function pl(r) { return s._kvPlacement(r) }
+    // Rung 1a is the ONLY exact "GPU", and it requires host anon to be exactly 0.
+    A.check("pl/p1-mem-zero", pl({ memBytes: 0, vramBytes: KV4, kvBytes: KV4,
+      soleAttribution: "measured" }), { value: "GPU", marker: "", action: "commit" })
+    // Rung 1a also requires the device to hold at least a cache's worth.
+    A.check("pl/p1-vram-short", pl({ memBytes: 0, vramBytes: KV4 - 1, kvBytes: KV4,
+      soleAttribution: "measured" }), { value: "", marker: "—", action: "decline" })
+    // Rung 1b is the mirror: a SUCCESSFUL zero device reading, exact CPU.
+    A.check("pl/p1-vram-zero", pl({ memBytes: KV4, vramBytes: 0, kvBytes: KV4,
+      soleAttribution: "measured" }), { value: "CPU", marker: "", action: "commit" })
+    // Rung 2: a split is proven, its ratio is not.
+    A.check("pl/p2-mem-between", pl({ memBytes: 400000000, vramBytes: 5800000000,
+      kvBytes: 2000000000, soleAttribution: "measured" }),
+      { value: "GPU/CPU", marker: "~", action: "commit" })
+    // A -1 device reading is a missing measurement, not a zero, so it cannot
+    // contradict the host reading: host anon alone already proves the split.
+    A.check("pl/p2-no-vram-reading", pl({ memBytes: 400000000, vramBytes: -1,
+      kvBytes: 2000000000, soleAttribution: "measured" }),
+      { value: "GPU/CPU", marker: "~", action: "commit" })
+    // Rung 3 declines; it never says CPU.
+    A.check("pl/p3-mem-exceeds", pl({ memBytes: KV4, vramBytes: VR4, kvBytes: KV4,
+      soleAttribution: "measured" }), { value: "", marker: "—", action: "decline" })
+    // The draft's worst bug: a sentinel is not a zero. mem === -1 must wait.
+    A.check("pl/p1-mem-absent", pl({ memBytes: -1, vramBytes: VR4, kvBytes: KV4,
+      soleAttribution: "measured" }), { value: "", marker: "~", action: "wait" })
+    // Contradiction: device provably holds nothing AND host anon is smaller than
+    // the cache, so the cache is in neither place.
+    A.check("pl/contradiction", pl({ memBytes: 1000000, vramBytes: 0, kvBytes: KV4,
+      soleAttribution: "measured" }), { value: "", marker: "—", action: "decline" })
+    // Attribution gate: two models loaded means neither reading is this model's.
+    A.check("pl/attr-two-models", pl({ memBytes: 400000000, vramBytes: 5800000000,
+      kvBytes: 2000000000, soleAttribution: "unattributable" }),
+      { value: "", marker: "~", action: "decline" })
+    // ...but the flag branch needs no attribution, so it still answers.
+    A.check("pl/attr-two-models-flag", pl({ memBytes: 400000000, vramBytes: 5800000000,
+      kvBytes: 2000000000, soleAttribution: "unattributable", noKvOffload: true }),
+      { value: "CPU", marker: "", action: "commit" })
+    A.check("pl/attr-pending-waits", pl({ memBytes: 0, vramBytes: 0, kvBytes: KV4,
+      soleAttribution: "pending" }), { value: "", marker: "~", action: "wait" })
+    A.check("pl/flag-ngl-zero", pl({ memBytes: 400000000, vramBytes: 5800000000,
+      kvBytes: 2000000000, soleAttribution: "measured", ngl: "0" }),
+      { value: "CPU", marker: "", action: "commit" })
+    // -ngl all is NOT a rung: it says how many LAYERS may be offloaded and says
     // nothing about where the cache went.
-    A.check("kvplace/all-offloaded-not-proof", s._kvPlacement(false, 30, 30, KV4,
-      { memBytes: -1, vramBytes: VR4, sole: true }), "")
-    A.check("kvplace/all-offloaded-still-measured", s._kvPlacement(false, 30, 30, 2000000000,
-      { memBytes: 400000000, vramBytes: 5800000000, sole: true }), "GPU")
-    // A partial split is likewise not a measurement on its own.
-    A.check("kvplace/partial-needs-measurement", s._kvPlacement(false, 30, 64, KV4, sole), "CPU")
-    A.check("kvplace/partial-unknown-without-measurement", s._kvPlacement(false, 30, 64, KV4, {}), "")
-    // Cache on the device: host RAM holds far less than the cache, and the
-    // service does hold device memory.
-    A.check("kvplace/offloaded-gpu", s._kvPlacement(false, 65, 65, 2000000000,
-      { memBytes: 400000000, vramBytes: 5800000000, sole: true }), "GPU")
-    // Exactly at the boundary counts as host RAM (>=, not >): a cache that
-    // fills anon to the byte is a cache in RAM.
-    A.check("kvplace/host-boundary", s._kvPlacement(false, 30, 30, KV4,
-      { memBytes: KV4, vramBytes: VR4, sole: true }), "CPU")
-    A.check("kvplace/host-just-under", s._kvPlacement(false, 30, 30, KV4,
-      { memBytes: KV4 - 1, vramBytes: VR4, sole: true }), "GPU")
-    // No device context at all: the cache cannot be on a device, so it is RAM.
-    A.check("kvplace/no-device-context-cpu", s._kvPlacement(false, 30, 30, KV4,
-      { memBytes: 1000000, vramBytes: 0, sole: true }), "CPU")
-    // Multi-model router: both readings are the whole cgroup's, so neither can
-    // be attributed to this model. Only the flag branches may still answer.
-    A.check("kvplace/multi-model-unknown", s._kvPlacement(false, 30, 30, KV4,
+    A.check("pl/no-ngl-all-branch", pl({ memBytes: KV4, vramBytes: VR4, kvBytes: KV4,
+      soleAttribution: "measured", ngl: "all" }),
+      { value: "", marker: "—", action: "decline" })
+    A.check("pl/no-ngl-auto-branch", pl({ memBytes: KV4, vramBytes: VR4, kvBytes: KV4,
+      soleAttribution: "measured", ngl: "auto" }),
+      { value: "", marker: "—", action: "decline" })
+    // No cache ⇒ nothing to place.
+    A.check("pl/no-kv-bytes", pl({ memBytes: 400000000, vramBytes: 5800000000,
+      kvBytes: -1, soleAttribution: "measured" }), { value: "", marker: "—", action: "decline" })
+    A.check("pl/idempotent", pl({ memBytes: 400000000, vramBytes: 5800000000,
+      kvBytes: 2000000000, soleAttribution: "measured" }), pl({ memBytes: 400000000,
+      vramBytes: 5800000000, kvBytes: 2000000000, soleAttribution: "measured" }))
+    A.check("pl/idempotent-answered", pl({ answered: { value: "CPU", marker: "" } }),
+      { value: "CPU", marker: "", action: "commit" })
+    A.check("pl/wait-no-write", pl({ memBytes: -1, vramBytes: -1, kvBytes: KV4,
+      soleAttribution: "measured" }), { value: "", marker: "~", action: "wait" })
+    A.check("pl/null-inputs", pl(null), { value: "", marker: "~", action: "wait" })
+    // The gemma triple, asserted literally: a 49.2 MiB margin must not decide a
+    // 2.8 GB claim. Parameterising this would let someone retune the threshold
+    // and keep the test green, which is exactly the bug.
+    A.check("pl/gemma-triple", pl({ memBytes: 3070361600, vramBytes: VR4,
+      kvBytes: 3019243520, soleAttribution: "measured" }),
+      { value: "", marker: "—", action: "decline" })
+    // Entry-shaped adapter used by the pre-store call sites.
+    A.check("pl/adapter-cpu", s._kvLocationOf(true, 30, KV4,
+      { memBytes: MEM4, vramBytes: VR4, sole: true }), "CPU")
+    A.check("pl/adapter-rung3", s._kvLocationOf(false, 30, KV4,
+      { memBytes: MEM4, vramBytes: VR4, sole: true }), "")
+    A.check("pl/adapter-split", s._kvLocationOf(false, 30, KV4,
+      { memBytes: KV4 - 1, vramBytes: VR4, sole: true }), "GPU/CPU")
+    A.check("pl/adapter-multi-model", s._kvLocationOf(false, 30, KV4,
       { memBytes: MEM4, vramBytes: VR4, sole: false }), "")
-    A.check("kvplace/multi-model-still-exact", s._kvPlacement(true, 30, 30, KV4,
-      { memBytes: MEM4, vramBytes: VR4, sole: false }), "CPU")
-    // Unknowns must stay unknown ("" = the Context line just omits the device).
-    A.check("kvplace/unknown-kv", s._kvPlacement(false, 30, 30, -1, sole), "")
-    A.check("kvplace/unknown-dram", s._kvPlacement(false, 30, 30, KV4,
-      { memBytes: -1, vramBytes: VR4, sole: true }), "")
-    // The measurements answer even when the layer split didn't resolve.
-    A.check("kvplace/no-split-still-answers", s._kvPlacement(false, -1, -1, KV4, sole), "CPU")
-    A.check("kvplace/null-inputs", s._kvPlacement(null, null, null, null, null), "")
+    A.check("pl/adapter-ngl-zero", s._kvLocationOf(false, 0, KV4,
+      { memBytes: MEM4, vramBytes: VR4, sole: true }), "CPU")
+    A.check("pl/adapter-no-kv", s._kvLocationOf(false, 30, -1,
+      { memBytes: MEM4, vramBytes: VR4, sole: true }), "")
+    A.check("pl/adapter-unknown-kv", s._kvLocationOf(false, 30, -1, null), "")
 
     // ── _estimateSplitFromProbes: measured VRAM → layer estimate (~) ──────────
     // Built only from measurements: the device footprint minus the cache when
@@ -442,7 +492,7 @@ Item {
     A.check("resolve/mainGpu", out[0].mainGpu, 65)
     A.check("resolve/mainCpu", out[0].mainCpu, 0)
     A.check("resolve/kvCacheBytes-unknown", out[0].kvCacheBytes, -1)
-    // Tier 3.5 answers as soon as the engine has been asked.
+    // Tier 6 answers as soon as the engine has been asked.
     out[0].kvBytesExact = 3019243520
     var rk = s._resolveKvBytes(out[0])
     A.check("resolve/kvBytes-exact-tier", rk.tier, 3)
@@ -454,97 +504,86 @@ Item {
     A.check("wbytes/measured-fallback", s._weightBytes(100, -1, -1, 65, 42, 7), [42, 7])
     A.check("wbytes/all-unknown", s._weightBytes(100, -1, -1, 65, -1, -1), [-1, -1])
 
-    // ── _resolveFieldSources / _resolveWeights (change 4): the resolver owns the
-    // per-field Tier ladder exactly once. Golden rules pinned: Tier 5 beats
-    // Tier 3, Tier 1 beats Tier 5, and the render marker is "~" exactly when any
-    // contributing input carried "~". Entries are the post-_applyGguf shapes
-    // (mainGpu set + _gpuSplitSource) OR the raw meta shape; p = { vramBytes,
-    // memBytes, presetSection }.
-    //
-    // Tier 1 beats Tier 5: an explicit API split wins even with a preset section.
-    var rr = s._resolveFieldSources({
-      modelPath: "/m/a.gguf", ngl: "all", mainGpu: 65, mainCpu: 0,
-      _gpuSplitSource: "api", totalLayers: 65, sizeBytes: 100 },
-      { vramBytes: 42, memBytes: 7, presetSection: { "n-gpu-layers": "10" } })
-    A.check("rs/t1-split-tier", rr.gpuSplit.tier, 1)
-    A.check("rs/t1-split-marker", rr.gpuSplit.marker, "")
-    A.check("rs/t1-split-gpu", rr.gpuSplit.value.mainGpu, 65)
-    A.check("rs/t1-weights-gpu", rr.weightBytes.gpu, 100)   // 100 × 65/65
-    A.check("rs/t1-weights-cpu", rr.weightBytes.cpu, 0)
-    A.check("rs/t1-weights-marker", rr.weightBytes.gpuMarker, "")
+// ── _resolveFieldSources (the display reader): the block renders the store's
+    // decisions and makes none of its own. This used to BE the resolver — it
+    // re-derived the split from entry.ngl, the preset and the live VRAM, and
+    // invented its own markers, which is how "in flight" and "not found" ended up
+    // sharing one em-dash. The pins below are the reader's contract: mirror the
+    // store, never re-decide, and keep pending and absent apart.
+    var rPath = "/m/rs.gguf"
+    var rst = s._storeFor(rPath)
+    s._t1(rst, "sizeBytes", 1000)
+    s._t1(rst, "contextLen", 4096)
+    s._t1(rst, "nParams", 7000)
+    s._t1(rst, "ngl", "all")
+    s._t1(rst, "cacheK", "q8_0")
+    s._t1(rst, "cacheV", "f16")
+    s._t2(rst, "ftype", 15)
+    s._t2(rst, "totalLayers", 65)
+    // No separate draft: an ABSENT nextn_predict_layers is a reading (llama.cpp's
+    // default is 0 draft layers), which is what _applyTier2To commits for a model
+    // with no --model-draft. mainGpu requires it, so a store that skipped it would
+    // leave every split field pending.
+    s._t2(rst, "mtpLayers", 0)
+    s.applyDerivation(rst)
+    s._settle(rst)
 
-    // Tier 5 beats Tier 3: the preset section answers even though VRAM is
-    // available for a live estimate (the split resolves later in _applyGguf).
-    rr = s._resolveFieldSources({
-      modelPath: "/m/fit.gguf", ngl: "", mainGpu: null, mainCpu: null,
-      totalLayers: 65, sizeBytes: 100 },
-      { vramBytes: 42, memBytes: 7, presetSection: { "n-gpu-layers": "all" } })
-    A.check("rs/t5-split-tier", rr.gpuSplit.tier, 5)
-    A.check("rs/t5-split-marker", rr.gpuSplit.marker, "")
-    A.ok("rs/t5-split-unresolved-value", rr.gpuSplit.value === null)
-
-    // `auto`/empty preset tokens do NOT answer Tier 5 (isPresetSplitToken
-    // rejects them) → the resolver falls to the live Tier-3 probe.
-    rr = s._resolveFieldSources({ totalLayers: 65, sizeBytes: 10*1024*1024*1024 },
-      { vramBytes: 5*1024*1024*1024, presetSection: { "n-gpu-layers": "auto" } })
-    A.check("rs/t5-auto-ignored-tier", rr.gpuSplit.tier, 3)
-    A.check("rs/t5-auto-marker", rr.gpuSplit.marker, "~")
-    A.check("rs/t5-auto-value-gpu", rr.gpuSplit.value.mainGpu, 33)
-
-    // Tier 3 live estimate: no API, no preset, VRAM available → the same
-    // numbers _estimateSplitFromProbes yields, marked as an estimate.
-    rr = s._resolveFieldSources({ totalLayers: 65, sizeBytes: 10*1024*1024*1024 },
-      { vramBytes: 5*1024*1024*1024, memBytes: -1 })
-    A.check("rs/t3-split-tier", rr.gpuSplit.tier, 3)
-    A.check("rs/t3-split-marker", rr.gpuSplit.marker, "~")
-    A.check("rs/t3-split-gpu", rr.gpuSplit.value.mainGpu, 33)
-    // Placement is decided from measurements, never inferred from the split:
-    // gpuSplit.value carries layer counts and nothing else.
-    A.check("rs/t3-split-no-ctxOn", rr.gpuSplit.value.ctxOn, undefined)
-
-    // A STORED probe split is Tier 3 too the marker stays "~" through the
-    // weight bytes (any `~` input keeps the line estimated).
-    rr = s._resolveFieldSources({ ngl: "30", mainGpu: 30, mainCpu: 35,
-      _gpuSplitSource: "probe", totalLayers: 65, sizeBytes: 100 },
-      { vramBytes: -1, memBytes: -1 })
-    A.check("rs/probe-tier", rr.gpuSplit.tier, 3)
-    A.check("rs/probe-marker", rr.gpuSplit.marker, "~")
-    A.check("rs/probe-weights-gpu", rr.weightBytes.gpu, Math.round(100 * 30 / 65))
-    A.check("rs/probe-weights-cpu", rr.weightBytes.cpu, Math.round(100 * 35 / 65))
-    A.check("rs/probe-weights-marker", rr.weightBytes.gpuMarker, "~")
-
-    // No split answers (preset none, VRAM present but no model size to derive
-    // a split from) → split "—", weights still fall back to the measured
-    // per-device footprint as estimates.
-    rr = s._resolveFieldSources({ totalLayers: 65 },
-      { vramBytes: 42, memBytes: 7, presetSection: null })
-    A.ok("rs/nowhere-split-tier-null", rr.gpuSplit.tier === null)
-    A.check("rs/nowhere-split-marker", rr.gpuSplit.marker, "\u2014")
-    A.check("rs/nowhere-weights-gpu", rr.weightBytes.gpu, 42)
-    A.check("rs/nowhere-weights-cpu", rr.weightBytes.cpu, 7)
-    A.check("rs/nowhere-weights-marker", rr.weightBytes.gpuMarker, "~")
-
-    // Quant row + KV row: field precedence and markers.
-    rr = s._resolveFieldSources({ nParams: 1000, ftype: 15, cacheK: "q8_0",
-      cacheV: "q5_0", kvCacheBytes: 2048, totalLayers: 65, sizeBytes: 100 })
+    var rr = s._resolveFieldSources({ modelPath: rPath }, {})
     A.check("rs/params-tier", rr.params.tier, 1)
-    A.check("rs/params-value", rr.params.value, 1000)
+    A.check("rs/params-value", rr.params.value, 7000)
     A.check("rs/params-marker", rr.params.marker, "")
     A.check("rs/quant-tier", rr.quant.tier, 2)
     A.check("rs/quant-value", rr.quant.value, 15)
     A.check("rs/layers-tier", rr.totalLayers.tier, 2)
     A.check("rs/layers-value", rr.totalLayers.value, 65)
-    A.check("rs/kv-tier", rr.kvBytes.tier, 4)
-    A.check("rs/kv-marker", rr.kvBytes.marker, "~")
-    A.check("rs/kv-value", rr.kvBytes.value, 2048)
+    A.check("rs/mainLayers-value", rr.mainLayers.value, 65)
+    A.check("rs/mainLayers-derived", rr.mainLayers.derived, true)
+    A.check("rs/coreSize-value", rr.coreSize.value, 1000)
+    A.check("rs/context-value", rr.contextLen.value, 4096)
+    // String fields keep their VALUE. The numeric rows coerce an absent value to
+    // -1; a placement, a dtype and a spec type coerced that way rendered "-1" in
+    // the middle of a sentence.
+    A.check("rs/cacheK-value", rr.cacheK.value, "q8_0")
+    A.check("rs/cacheV-value", rr.cacheV.value, "f16")
     A.check("rs/kvDtype-k", rr.kvDtype.value.k, "q8_0")
-    A.check("rs/kvDtype-marker", rr.kvDtype.marker, "")
+    A.check("rs/kvDtype-v", rr.kvDtype.value.v, "f16")
+    A.check("rs/specType-value", rr.specType.value, "")
+    // The split is a COMPOSITE and carries its own worst-of state: -ngl all is
+    // exact for the GPU count while the CPU count is a subtraction, so "~" is the
+    // honest marker for the pair even though one half is a stated count.
+    A.check("rs/split-gpu", rr.gpuSplit.value.mainGpu, 65)
+    A.check("rs/split-cpu", rr.gpuSplit.value.mainCpu, 0)
+    A.check("rs/split-marker-worst", rr.gpuSplit.marker, "~")
+    A.check("rs/split-tier-weakest", rr.gpuSplit.tier, 2)
+    A.check("rs/weights-gpu", rr.weightBytes.gpu, 1000)
+    A.check("rs/weights-cpu", rr.weightBytes.cpu, 0)
+    A.check("rs/weights-marker", rr.weightBytes.gpuMarker, "~")
 
-    // Totally empty entry → every field degrades to "—" (-1); nothing throws.
-    rr = s._resolveFieldSources({}, {})
-    A.ok("rs/empty-split-tier-null", rr.gpuSplit.tier === null)
-    A.check("rs/empty-params", rr.params.value, -1)
-    A.check("rs/empty-weights", rr.weightBytes.gpu, -1)
+    // A field that is STILL BEING LOOKED FOR is pending, and pending is not
+    // absent. The reader is where the two stop being the same thing.
+    A.check("rs/kv-pending-state", rr.kvBytes.state, s.stateEnum.PENDING)
+    A.check("rs/kv-pending-glyph", rr.kvBytes.marker, "…")
+    A.check("rs/kv-pending-value", rr.kvBytes.value, -1)
+    A.check("rs/location-pending", rr.kvLocation.state, s.stateEnum.PENDING)
+
+    // Exhausted fields read "—", which is a different answer from "…".
+    var rex = s._storeFor("/m/rs-exhausted.gguf")
+    rex.decline("ftype", 2)
+    rex.decline("nParams", 1)
+    s._settle(rex)
+    var rxe = s._resolveFieldSources({ modelPath: "/m/rs-exhausted.gguf" }, {})
+    A.check("rs/exhausted-quant-state", rxe.quant.state, s.stateEnum.ABSENT)
+    A.check("rs/exhausted-quant-glyph", rxe.quant.marker, "—")
+    A.check("rs/exhausted-params-glyph", rxe.params.marker, "—")
+
+    // No store at all (the model's first render, before any tier answered) is
+    // pending across the board, not an error and not absent.
+    var rnn = s._resolveFieldSources({ modelPath: "/m/never-seen.gguf" }, {})
+    A.check("rs/no-store-params", rnn.params.state, s.stateEnum.PENDING)
+    A.check("rs/no-store-params-glyph", rnn.params.marker, "…")
+    A.ok("rs/no-store-split-null", rnn.gpuSplit.value === null)
+    A.check("rs/no-store-weights", rnn.weightBytes.gpu, -1)
+    A.check("rs/no-store-kv-dtype-absent", rnn.cacheK.state, s.stateEnum.PENDING)
 
     // _presetSectionFor: [*] globals merged, section wins on explicit keys,
     // globals-chain for keys the section omits; null when the preset is absent
@@ -594,7 +633,7 @@ Item {
     // No pattern key and no sliding_window declaration: this header does not
     // describe its own SWA layout, so the derivation answers nothing (the old
     // head_count product claimed a dense cache that qwen3next does not build).
-    // The engine probe is what fills this in — see the Tier-3.5 block below.
+    // The engine probe is what fills this in — see the tier-6 block below.
     A.check("gguf/kvCacheBytes-unknown", s.runningModels[0].kvCacheBytes, -1)
     // No MTP/interval keys → non-hybrid fallback: main = total, no MTP split.
     A.check("gguf/mainLayers-fallback", s.runningModels[0].mainLayers, 65)
@@ -858,7 +897,7 @@ Item {
     A.check("t5/finish-reapplied-source", s.runningModels[0]._gpuSplitSource, "preset")
     A.ok("t5/finish-stop-republished", s.models.length === 2)
 
-    // ── Tier 3.5 engine KV accounting probe ────────────────────────────────
+    // ── Tier 6 engine KV accounting probe ────────────────────────────────
     // llama.cpp prints the allocation it actually built; these are verbatim
     // lines from `llama-cli --verbose -ngl 0` against the real gemma-4-26b-a4b
     // at ctx 262144 / K=V q8_0, and the two caches (5 full + 25 SWA layers) are
@@ -996,7 +1035,9 @@ Item {
     A.check("kvprobe/argv-no-server-flags", /--port|--host|--api-key|--jinja|--mmproj|--draft|--threads/.test(av), false)
 
     // Result fold: exact bytes, cache layer count and compute reserve land on
-    // the entry, and the resolver reports them as Tier 3.5 with no marker.
+    // the entry, and the STORE reports them as Tier 6 — the probe IS the oracle,
+    // and Tier 6 is where an oracle's verdict is filed so it outranks every
+    // estimate without ever being outranked by one.
     s._ggufCache = ({})
     s.running = true
     s.runningModels = [{ modelPath: "/m/probe.gguf", draftPath: "", ngl: "all",
@@ -1011,16 +1052,19 @@ Item {
     A.check("kvprobe/fold-compute", s.runningModels[0].computeBytes, Math.round(1887.86 * 1048576))
     var rq = s._resolveFieldSources(s.runningModels[0],
       { vramBytes: 13782482944, memBytes: 3070361600, presetSection: null })
-    A.check("kvprobe/rs-tier", rq.kvBytes.tier, 3)
+    A.check("kvprobe/rs-tier", rq.kvBytes.tier, 6)
     A.check("kvprobe/rs-marker", rq.kvBytes.marker, "")
     A.check("kvprobe/rs-value", rq.kvBytes.value, 3019243520)
     A.check("kvprobe/rs-format", s.formatGB(rq.kvBytes.value), "2.8 GB")
-    // No answer from the engine → the header derivation keeps the line as "~".
-    var rq2 = s._resolveFieldSources({ kvCacheBytes: 4000000000 },
+    // A model the resolver has not reached yet is IN FLIGHT, not estimated: the
+    // header derivation may still answer and the tier-6 oracle is still out, so
+    // the honest marker is "…". The old reader called this "~", which claimed a
+    // number nobody had computed.
+    var rq2 = s._resolveFieldSources({ modelPath: "/m/no-store.gguf" },
       { vramBytes: -1, memBytes: -1, presetSection: null })
-    A.check("kvprobe/rs-fallback-tier", rq2.kvBytes.tier, 4)
-    A.check("kvprobe/rs-fallback-marker", rq2.kvBytes.marker, "~")
-    var rq3 = s._resolveFieldSources({ kvCacheBytes: -1 },
+    A.check("kvprobe/rs-fallback-state", rq2.kvBytes.state, s.stateEnum.PENDING)
+    A.check("kvprobe/rs-fallback-marker", rq2.kvBytes.marker, "…")
+    var rq3 = s._resolveFieldSources({ modelPath: "/m/no-store.gguf" },
       { vramBytes: -1, memBytes: -1, presetSection: null })
     A.check("kvprobe/rs-unknown-tier", rq3.kvBytes.tier, null)
     A.check("kvprobe/rs-unknown-value", rq3.kvBytes.value, -1)
@@ -1070,6 +1114,924 @@ Item {
     A.ok("kvprobe/log-cap-bounded", s._kvProbeBuffer.length <= s._kvProbeBufferMax)
     s._kvProbeBuffer = ""
     A.check("kvprobe/off-setting", s.kvProbeBinary, "llama-cli")
+
+    // ══ Six-tier field store ══════════════════════════════════════════
+    //
+    // The store is where the resolver's guarantees live, so these are the tests
+    // that matter most: an uncommitted field is unreachable, a weak answer cannot
+    // displace a strong one, and a field cannot hang as pending forever.
+
+    // ── Validity is per field, not blanket ──────────────────────────────
+    // false is the real answer for a bool and a sentinel for a byte count, so a
+    // single predicate would either refuse the booleans or admit false.
+    A.ok("types/num-zero", s.isValidValue("sizeBytes", 0))
+    A.ok("types/num-neg-sentinel", !s.isValidValue("sizeBytes", -1))
+    A.ok("types/num-nan", !s.isValidValue("sizeBytes", NaN))
+    A.ok("types/num-null", !s.isValidValue("sizeBytes", null))
+    A.ok("types/num-bool-is-not-num", !s.isValidValue("sizeBytes", false))
+    A.ok("types/str-empty-sentinel", !s.isValidValue("ngl", ""))
+    A.ok("types/str-value", s.isValidValue("ngl", "20"))
+    A.ok("types/str-num-rejected", !s.isValidValue("ngl", 20))
+    A.ok("types/bool-true", s.isValidValue("isCloud", true))
+    A.ok("types/bool-false-is-a-value", s.isValidValue("isCloud", false))
+    A.ok("types/bool-num-rejected", !s.isValidValue("isCloud", 0))
+    A.ok("types/unknown-field", !s.isValidValue("nonesuch", 1))
+
+    // ── Field-set seed: nothing is missing, everything is pending ───────
+    var st = s.createFieldStore("/m/a.gguf")
+    A.check("store/seed-pending", st.get("contextLen").state, "pending")
+    A.check("store/seed-null", st.get("contextLen").value, null)
+    A.check("store/seed-tier", st.get("contextLen").tier, null)
+    A.ok("store/seed-derived-too", st.needsMore("mainLayers"))
+    A.check("store/unknown-field-get", st.get("nonesuch"), null)
+
+    // ── Only commit() can write, and only a valid value ────────────────
+    A.ok("store/commit-exact", st.commit("contextLen", 8192, "exact", 1))
+    A.check("store/commit-value", st.get("contextLen").value, 8192)
+    A.check("store/commit-state", st.get("contextLen").state, "exact")
+    A.check("store/commit-tier", st.get("contextLen").tier, 1)
+    A.check("store/commit-not-derived", st.get("contextLen").derived, false)
+    A.ok("store/commit-bad-value", !st.commit("contextLen", -1, "exact", 1))
+    A.ok("store/commit-bad-state", !st.commit("contextLen", 4096, "guess", 1))
+    A.ok("store/commit-bad-tier", !st.commit("contextLen", 4096, "exact", 0))
+    A.ok("store/commit-bad-tier-hi", !st.commit("contextLen", 4096, "exact", 7))
+    A.ok("store/commit-unknown-field", !st.commit("nonesuch", 1, "exact", 1))
+    A.check("store/commit-leaves-value", st.get("contextLen").value, 8192)
+
+    // ── Effective tier: a weak answer cannot overwrite a strong one ─────
+    var st2 = s.createFieldStore("/m/b.gguf")
+    st2.commit("memBytes", 42, "exact", 4)
+    A.ok("store/weaker-refused", !st2.commit("memBytes", 99, "exact", 5))
+    A.ok("store/equal-tier-refused", !st2.commit("memBytes", 99, "exact", 4))
+    A.check("store/weaker-keeps-first", st2.get("memBytes").value, 42)
+    A.check("store/weaker-keeps-tier", st2.get("memBytes").tier, 4)
+    A.ok("store/stronger-wins", st2.commit("memBytes", 99, "exact", 1))
+    A.check("store/stronger-value", st2.get("memBytes").value, 99)
+    A.check("store/stronger-tier", st2.get("memBytes").tier, 1)
+
+    // ── Derived commits: weakest input tier + worst input state ────────
+    var st3 = s.createFieldStore("/m/c.gguf")
+    st3.commit("totalLayers", 40, "exact", 2)
+    st3.commit("mtpLayers", 0, "exact", 2)
+    A.ok("store/derived-commit", st3.commit("mainLayers", 40, null, null, ["totalLayers", "mtpLayers"], ""))
+    A.check("store/derived-tier-is-weakest", st3.get("mainLayers").tier, 2)
+    A.check("store/derived-flag", st3.get("mainLayers").derived, true)
+    A.check("store/derived-exact-from-exact", st3.get("mainLayers").state, "exact")
+    // An estimated input degrades the answer: the arithmetic may be exact, the
+    // inputs are not.
+    st3.commit("weightCpu", 5, "estimated", 4)
+    st3.commit("mainCpu", 7, null, null, ["mainLayers"], "~")
+    A.check("store/derived-floor-wins-over-input",
+            st3.get("mainCpu").state, "estimated")
+    // The tier is the weakest INPUT, so weightCpu (tier 4) does not raise it.
+    A.check("store/derived-floor-tier", st3.get("mainCpu").tier, 2)
+    // An unattributed input has no tier, and there is no tier 0 to file it under.
+    A.ok("store/derived-unattributed-refused",
+         !st3.commit("coreSize", 10, null, null, ["contextLen"], ""))
+
+    // ── decline + settled: the termination join ────────────────────────
+    var st4 = s.createFieldStore("/m/d.gguf")
+    A.ok("store/pending-at-lowest-tier", st4.pendingAt("contextLen") === 1)
+    st4.commit("contextLen", 2048, "exact", 1)
+    A.ok("store/settled-on-value", st4.isSettled("contextLen"))
+    A.ok("store/no-longer-needs-more", !st4.needsMore("contextLen"))
+    A.check("store/pendingAt-null", st4.pendingAt("contextLen"), null)
+    // One decliner is not exhaustion: tiers 3/4/5 can still answer memBytes.
+    st4.decline("memBytes", 3)
+    A.ok("store/not-settled-on-first-decline", !st4.isSettled("memBytes"))
+    st4.decline("memBytes", 4)
+    st4.decline("memBytes", 5)
+    A.ok("store/settled-after-all-decline", st4.isSettled("memBytes"))
+    st4.markSettled()
+    A.check("store/exhausted-becomes-absent", st4.get("memBytes").state, "absent")
+    A.check("store/absent-value-null", st4.get("memBytes").value, null)
+    A.ok("store/absent-is-terminal", !st4.needsMore("memBytes"))
+    // A derived field is pending while a REQUIRED input is pending, so it must
+    // not be swept to absent by the same markSettled() pass.
+    st4.markSettled()
+    A.check("store/derived-not-swept-early", st4.get("mainLayers").state, "pending")
+
+    // ── applyDerivation: retried, never scheduled ──────────────────────
+    var st5 = s.createFieldStore("/m/e.gguf")
+    s.applyDerivation(st5)
+    A.check("deriv/nothing-with-no-inputs", st5.get("mainLayers").state, "pending")
+    st5.commit("totalLayers", 40, "exact", 2)
+    s.applyDerivation(st5)
+    A.check("deriv/blocked-on-required-input", st5.get("mainLayers").state, "pending")
+    st5.commit("mtpLayers", 4, "exact", 2)
+    s.applyDerivation(st5)
+    A.check("deriv/mainLayers", st5.get("mainLayers").value, 36)
+    A.check("deriv/mainLayers-tier", st5.get("mainLayers").tier, 2)
+    // mtpSizeBytes has OPTIONAL inputs, so it answers from what landed.
+    st5.commit("sizeBytes", 4000, "exact", 1)
+    st5.commit("totalLayers", 40, "exact", 2)   // refused: already answered
+    s.applyDerivation(st5)
+    A.check("deriv/optional-input-pending-still-runs", st5.needsMore("mtpSizeBytes"), false)
+    A.check("deriv/mtpSize-uniform-estimate", st5.get("mtpSizeBytes").value, 400)
+    A.check("deriv/mtpSize-floor", st5.get("mtpSizeBytes").state, "estimated")
+    // mainCpu needs BOTH mainGpu and mainLayers; supplying one is not enough.
+    A.check("deriv/mainCpu-blocked", st5.get("mainCpu").state, "pending")
+    st5.commit("mainGpu", 20, "exact", 3)
+    s.applyDerivation(st5)
+    A.check("deriv/mainCpu", st5.get("mainCpu").value, 16)
+
+    // ── mainGpu: a stated offload count is exact arithmetic ─────────────
+    var st6 = s.createFieldStore("/m/f.gguf")
+    st6.commit("totalLayers", 40, "exact", 2)
+    st6.commit("mtpLayers", 0, "exact", 2)
+    st6.commit("ngl", "20", "exact", 1)
+    s.applyDerivation(st6)
+    A.check("deriv/mainGpu-from-flag", st6.get("mainGpu").value, 20)
+    A.check("deriv/mainGpu-from-flag-is-exact", st6.get("mainGpu").state, "exact")
+    A.check("deriv/mainGpu-from-flag-tier", st6.get("mainGpu").tier, 2)
+
+    // ── kvLocation: arithmetic over tiers, therefore revisable ──────────
+    var st7 = s.createFieldStore("/m/g.gguf")
+    st7.commit("soleAttribution", "measured", "exact", 4)
+    st7.commit("noKvOffload", false, "exact", 1)
+    st7.commit("kvBytes", 2 * 1073741824, "exact", 6)
+    st7.commit("memBytes", 1 * 1073741824, "exact", 4)
+    st7.commit("vramBytes", 4 * 1073741824, "exact", 4)
+    s.applyDerivation(st7)
+    A.check("deriv/kvLocation-split", st7.get("kvLocation").value, "GPU/CPU")
+    A.check("deriv/kvLocation-split-estimated", st7.get("kvLocation").state, "estimated")
+    A.check("deriv/kvLocation-tier-is-weakest", st7.get("kvLocation").tier, 6)
+    // A flag answers without attribution, so --no-kv-offload short-circuits.
+    var st8 = s.createFieldStore("/m/h.gguf")
+    st8.commit("soleAttribution", "unattributable", "exact", 4)
+    st8.commit("noKvOffload", true, "exact", 1)
+    st8.commit("kvBytes", 1024, "exact", 6)
+    s.applyDerivation(st8)
+    A.check("deriv/kvLocation-flag-branch", st8.get("kvLocation").value, "CPU")
+    A.check("deriv/kvLocation-flag-exact", st8.get("kvLocation").state, "exact")
+    A.check("deriv/kvLocation-flag-tier", st8.get("kvLocation").tier, 6)
+    // Unattributable + no flag → the derivation declines and stays pending.
+    var st9 = s.createFieldStore("/m/i.gguf")
+    st9.commit("soleAttribution", "unattributable", "exact", 4)
+    st9.commit("noKvOffload", false, "exact", 1)
+    st9.commit("kvBytes", 1024, "exact", 6)
+    s.applyDerivation(st9)
+    A.check("deriv/kvLocation-unattributable-declines", st9.get("kvLocation").state, "pending")
+    st9.markSettled()
+    A.check("deriv/kvLocation-unattributable-absent", st9.get("kvLocation").state, "absent")
+
+    // ── The tier-6 gate: two booleans, no oracle for a described shape ──
+    var st10 = s.createFieldStore("/m/j.gguf")
+    A.ok("gate6/runs-when-nothing-known", s.checkTier6Values(st10))
+    st10.commit("kvDescribed", false, "exact", 2)
+    A.ok("gate6/undescribable-runs", s.checkTier6Values(st10))
+    st10.commit("kvBlockAligned", false, "exact", 2)
+    A.ok("gate6/undescribable-unaligned-runs", s.checkTier6Values(st10))
+    var st11 = s.createFieldStore("/m/k.gguf")
+    st11.commit("kvDescribed", true, "exact", 2)
+    st11.commit("kvBlockAligned", false, "exact", 2)
+    A.ok("gate6/described-unaligned-skips-oracle", !s.checkTier6Values(st11))
+    st11.commit("kvBlockAligned", true, "exact", 2)
+    A.ok("gate6/described-aligned-skips-oracle", !s.checkTier6Values(st11))
+    st11.commit("kvBytes", 1024, "exact", 2)
+    A.ok("gate6/answered-skips", !s.checkTier6Values(st11))
+
+    // A cycle would not throw; it would silently stop deriving, because
+    // derivationSettled() finds a pending input in the cycle and gives up, and
+    // every field in it stays "…" forever. That is why it needs a static check
+    // rather than a behavioural one — the failure mode looks like "still
+    // loading", not like an error.
+    // The graph is a parameter, not s.derivations, so the SAME traversal is
+    // exercised by the negative cases below — otherwise those would be testing a
+    // second implementation of the walk rather than the one that guards the
+    // registry. (It also cannot be done by assigning s.derivations: that
+    // property is readonly, which is the point of it.)
+    function derCycleIn(graph, node, path) {
+      if (path.indexOf(node) >= 0) return path.slice(path.indexOf(node))
+      var d = graph[node]
+      if (!d) return null
+      var next = path.concat([node])
+      var edges = (d.inputs || []).concat(d.optional || [])
+      for (var i = 0; i < edges.length; i++) {
+        if (!graph[edges[i]]) continue
+        var hit = derCycleIn(graph, edges[i], next)
+        if (hit) return hit
+      }
+      return null
+    }
+    var cycleFields = []
+    for (var cy in s.derivations) {
+      var found = derCycleIn(s.derivations, cy, [])
+      if (found) cycleFields.push(found.join(" -> "))
+    }
+    A.check("deriv/no-cycles", cycleFields, [])
+    // A detector that cannot fail is decoration, and a detector that never
+    // pops the path calls every diamond a cycle — which is what the real
+    // registry is full of (mainGpu is an input to mainCpu, weightGpu and
+    // mtpGpu). Both halves matter: one catches a broken walk, the other stops a
+    // working walk from being "fixed" into a false alarm.
+    A.ok("deriv/cycle-detector-catches-a-cycle",
+         derCycleIn({ a: { inputs: ["b"] }, b: { inputs: ["a"] } }, "a", []) !== null)
+    A.ok("deriv/cycle-detector-survives-a-diamond",
+         derCycleIn({ a: { inputs: ["b", "c"] }, b: { inputs: ["d"] },
+                      c: { inputs: ["d"] }, d: { inputs: [] } }, "a", []) === null)
+
+    // ── Invariant 4: a derived state is never better than its inputs ─────
+    // Asserted as the COMBINED rule the plan states (worst input state and the
+    // field's floor, whichever is worse), because testing the two separately
+    // passes while the composition is wrong: an implementation that ORs them
+    // instead of taking the worse one satisfies both halves.
+    var worseThanLaw = []
+    var probe = s.createFieldStore("/m/store-inv/st.qml")
+    // Every input is committed EXCEPT coreSize, which is left to the derivation:
+    // pre-committing it at tier 1 would make the derivation refuse to run (its
+    // weakest input is tier 4), and the test would then measure the direct
+    // commit rather than the state rule it is about.
+    probe.commit("sizeBytes", 1000, "estimated", 4)
+    probe.commit("mainLayers", 10, "exact", 2)
+    probe.commit("mainGpu", 6, "exact", 1)
+    s.applyDerivation(probe)
+    // weightGpu's floor is "~" and one input is estimated: the result cannot be
+    // better than EITHER, so "~" regardless of mainGpu being exact.
+    if (probe.get("weightGpu").state === "exact")
+      worseThanLaw.push("weightGpu:" + probe.get("weightGpu").state)
+    // coreSize's floor is "" (exact arithmetic on exact inputs), so the
+    // estimated sizeBytes must drag it to "~".
+    if (probe.get("coreSize").state === "exact")
+      worseThanLaw.push("coreSize:" + probe.get("coreSize").state)
+    A.check("deriv/state-never-better-than-worst-input", worseThanLaw, [])
+
+    // ── Invariant 5: every capability field has a producer in its tier ───
+    // Two halves. (a) Each tier actually claims something — an empty tier is a
+    // rung that can never answer, which reads as "we checked" in the walk.
+    // (b) Each declared field is claimed by every tier that lists it, which
+    // caps/field-tiers-agree already covers from the other direction; here the
+    // check is that no tier's list is dead weight with no field behind it.
+    var emptyTiers = []
+    for (var et = 1; et <= 6; et++)
+      if (!s.capabilities[et] || !s.capabilities[et].length) emptyTiers.push(et)
+    A.check("caps/no-empty-tier", emptyTiers, [])
+    // Every declared field must be reachable: named by some tier OR derived. A
+    // type declared but owned by nobody can never be answered, so it is a field
+    // that renders "…" with no producer — the orphan `noMmprojOffload` and
+    // `flashAttn` were exactly this, carried in fieldTypes from a draft that
+    // never wired them.
+    var unreachable = []
+    for (var fr in s.fieldTypes)
+      if (!s.fieldTiers[fr] && !s.derivations[fr]) unreachable.push(fr)
+    A.check("caps/every-field-has-an-owner", unreachable, [])
+
+    // ── Capabilities: disjoint from derivations, except the join ────────
+    var derived = {}
+    for (var dk in s.derivations) derived[dk] = true
+    var overlap = []
+    for (var ti = 1; ti <= 6; ti++)
+      for (var ci = 0; ci < s.capabilities[ti].length; ci++) {
+        var f = s.capabilities[ti][ci]
+        if (derived[f] && f !== "kvBytes") overlap.push(ti + ":" + f)
+      }
+    A.check("caps/no-derived-in-capabilities", overlap, [])
+    A.ok("caps/kvBytes-is-tier6", s.capabilities[6].indexOf("kvBytes") >= 0)
+    A.ok("caps/every-capability-is-a-field", s.capabilities[6].indexOf("kvGpuBytes") < 0)
+    // Every field in fieldTiers must be claimed by exactly the tiers that list
+    // it — the store's wanted set is the join key.
+    var mismatched = []
+    for (var fi in s.fieldTiers) {
+      var want = s.fieldTiers[fi]
+      for (var wi = 0; wi < want.length; wi++)
+        if (s.capabilities[want[wi]].indexOf(fi) < 0) mismatched.push(fi)
+    }
+    A.check("caps/field-tiers-agree", mismatched, [])
+    // A derivation with no inputs would be unattributable by construction.
+    var noInputs = []
+    for (var di in s.derivations)
+      if (!s.derivations[di].inputs || !s.derivations[di].inputs.length) noInputs.push(di)
+    A.check("deriv/every-derivation-has-inputs", noInputs, [])
+    // ...and every required input must itself be resolvable.
+    var dangling = []
+    for (var ddi in s.derivations) {
+      var dd = s.derivations[ddi]
+      var all = (dd.inputs || []).concat(dd.optional || [])
+      for (var ai = 0; ai < all.length; ai++)
+        if (!s.fieldTiers[all[ai]] && !derived[all[ai]]) dangling.push(ddi + "<-" + all[ai])
+    }
+    A.check("deriv/no-dangling-inputs", dangling, [])
+
+    // ── Architecture templates ──────────────────────────────────────────
+    A.ok("arch/llama-templated", s._kvArchTemplate("llama") !== null)
+    A.ok("arch/qwen35moe-templated", s._kvArchTemplate("qwen35moe") !== null)
+    A.ok("arch/gemma4-templated", s._kvArchTemplate("gemma4") !== null)
+    A.ok("arch/dflash-templated", s._kvArchTemplate("dflash") !== null)
+    A.check("arch/unknown-null", s._kvArchTemplate("baichuan3"), null)
+    A.check("arch/empty-null", s._kvArchTemplate(""), null)
+    A.check("arch/null-null", s._kvArchTemplate(null), null)
+    A.ok("arch/suffixes-shared", s._kvArchTemplate("qwen35").blocks === "block_count")
+
+    // ── Block alignment: per tensor, per layer, in BLOCK bytes ──────────
+    A.check("blockbytes/f16", s._kvBlockBytes("f16"), 2)
+    A.check("blockbytes/q8_0", s._kvBlockBytes("q8_0"), 34)
+    A.check("blockbytes/q5_0", s._kvBlockBytes("q5_0"), 22)
+    A.check("blockbytes/unknown", s._kvBlockBytes("k_quants_99"), -1)
+    A.check("blockbytes/empty-defaults-f16", s._kvBlockBytes(""), 2)
+    var alignedSpec = { layers: [{ kLen: 256, vLen: 256, hasV: true, cells: 1024 }],
+                        kvUnified: true, parallel: 1 }
+    A.ok("block/aligned-f16", s._kvBlockAligned(alignedSpec, "f16", "f16"))
+    // 256 heads × 1024 cells × 8.5 bits = 278528 B; a whole number of q8_0 blocks.
+    A.ok("block/aligned-q8_0", s._kvBlockAligned(alignedSpec, "q8_0", "q8_0"))
+    // K and V have separate dtypes and separate block sizes: K aligned against
+    // q8_0 while V is not against q5_0 must NOT report aligned, which is why the
+    // two tensors are tested separately rather than their sum.
+    A.ok("block/k-aligned-v-not",
+         !s._kvBlockAligned(alignedSpec, "q8_0", "q5_0"))
+    A.ok("block/k-not-v-aligned",
+         !s._kvBlockAligned(alignedSpec, "q5_0", "q8_0"))
+    A.ok("block/unknown-quant-refuses", !s._kvBlockAligned(alignedSpec, "k_quants_99", "f16"))
+    A.ok("block/empty-spec-refuses", !s._kvBlockAligned(({ layers: [] }), "f16", "f16"))
+    A.ok("block/null-spec-refuses", !s._kvBlockAligned(null, "f16", "f16"))
+    // MLA: K only, so there is no V tensor to test.
+    var mlaSpec = { layers: [{ kLen: 576, hasV: false, cells: 4096 }],
+                     kvUnified: true, parallel: 1 }
+    A.ok("block/mla-k-only", s._kvBlockAligned(mlaSpec, "f16", "f16"))
+    // Non-unified multiplies the cells by the sequence count.
+    var parSpec = { layers: [{ kLen: 256, vLen: 256, hasV: true, cells: 1024 }],
+                    kvUnified: false, parallel: 2 }
+    A.ok("block/parallel-f16-still-aligned", s._kvBlockAligned(parSpec, "f16", "f16"))
+    var parOdd = { layers: [{ kLen: 1, vLen: 1, hasV: true, cells: 1 }],
+                   kvUnified: false, parallel: 2 }
+    A.ok("block/parallel-unaligned-detected", !s._kvBlockAligned(parOdd, "q8_0", "q8_0"))
+
+    // ── Tier 1 producer: the API's readings, committed or declined ──────
+    var entry1 = {
+      name: "qwen3-30b", modelPath: "/m/store-t1/a.gguf", draftPath: "",
+      sizeBytes: 18000000000, contextLen: 32768, nParams: 30000000000,
+      ngl: "20", nglDraft: "", specType: "", cacheK: "q8_0", cacheV: "",
+      noKvOffload: false, ubatch: 512, parallel: 1,
+      swaFull: false, noKvUnified: false }
+    s._pruneStores([entry1])
+    s._applyTier1([entry1])
+    var t1s = s._storeFor("/m/store-t1/a.gguf")
+    A.check("t1/sizeBytes", t1s.get("sizeBytes").value, 18000000000)
+    A.check("t1/sizeBytes-tier", t1s.get("sizeBytes").tier, 1)
+    A.check("t1/sizeBytes-exact", t1s.get("sizeBytes").state, "exact")
+    A.check("t1/ngl", t1s.get("ngl").value, "20")
+    A.check("t1/contextLen", t1s.get("contextLen").value, 32768)
+    A.check("t1/cacheK", t1s.get("cacheK").value, "q8_0")
+    // An absent --cache-type-v MEANS f16, so it is normalized, not declined.
+    A.check("t1/cacheV-normalized-to-f16", t1s.get("cacheV").value, "f16")
+    // false is the real answer for a bool, so it is committed, not declined.
+    A.check("t1/isCloud-false-is-a-value", t1s.get("isCloud").value, false)
+    A.check("t1/isCloud-exact", t1s.get("isCloud").state, "exact")
+    // Tier 1 is the ONLY tier that can answer draftPath, so its decline EXHAUSTS the
+    // field: the join over answeredBy vs the wanted set is complete and the
+    // durable "—" is correct. A decline is not automatically pending.
+    A.check("t1/draftPath-declined-exhausts", t1s.get("draftPath").state, "absent")
+    A.check("t1/tier2-fields-still-pending", t1s.get("totalLayers").state, "pending")
+    A.check("t1/derivation-blocked-on-tier2", t1s.get("mainLayers").state, "pending")
+    // Tier 2 landing unblocks the derivation, with no ordering requirement.
+    t1s.commit("totalLayers", 48, "exact", 2)
+    t1s.commit("mtpLayers", 0, "exact", 2)
+    s._settle(t1s)
+    A.check("t1/tier2-unblocks-derivation", t1s.get("mainLayers").value, 48)
+    A.check("t1/tier2-derivation-tier", t1s.get("mainLayers").tier, 2)
+
+    // The API's stand-in for an unknown size is 0, and 0 is a VALID byte count,
+    // so it must be declined (→ exhausted → "—"), not committed as a zero-byte
+    // file. Same for a negative context and a zero ubatch.
+    var entry2 = { name: "b", modelPath: "/m/store-t1/b.gguf", sizeBytes: 0,
+                   contextLen: -1, nParams: -1, ubatch: 0, parallel: 0 }
+    s._applyTier1([entry1, entry2])
+    var t2s = s._storeFor("/m/store-t1/b.gguf")
+    A.check("t1/zero-size-is-not-a-zero", t2s.get("sizeBytes").state, "absent")
+    A.check("t1/absent-has-no-value", t2s.get("sizeBytes").value, null)
+    A.check("t1/neg-context-declined", t2s.get("contextLen").state, "absent")
+    A.check("t1/zero-ubatch-declined", t2s.get("ubatch").state, "absent")
+    A.check("t1/cacheK-defaults-f16-with-no-flags", t2s.get("cacheK").value, "f16")
+
+    // Idempotent: the 1 Hz poll must not churn the store version.
+    var vBefore = t1s.version()
+    s._applyTier1([entry1, entry2])
+    A.check("t1/poll-is-idempotent", t1s.version(), vBefore)
+
+    // Pruned to the loaded set, so an unloaded model cannot keep its derived
+    // graph alive for the rest of the session.
+    A.ok("prune/live-survives", s._stores["/m/store-t1/a.gguf"] !== undefined)
+    A.ok("prune/new-store-created", s._stores["/m/store-t1/b.gguf"] !== undefined)
+    s._pruneStores([entry1])
+    A.ok("prune/live-kept", s._stores["/m/store-t1/a.gguf"] !== undefined)
+    A.check("prune/unloaded-dropped", s._stores["/m/store-t1/b.gguf"], undefined)
+    A.check("prune/unloaded-version-dropped", s._storeVersions["/m/store-t1/b.gguf"], undefined)
+
+    // ── Tier 2 producer: what the GGUF header can answer ───────────────
+    var entry3 = {
+      name: "c", modelPath: "/m/store-t2/c.gguf", draftPath: "",
+      sizeBytes: 16000000000, contextLen: 4096, nParams: 8000000000,
+      ngl: "20", nglDraft: "", specType: "", cacheK: "", cacheV: "",
+      noKvOffload: false, ubatch: 512, parallel: 1,
+      swaFull: false, noKvUnified: false }
+    s._pruneStores([entry3])
+    s._applyTier1([entry3])
+    var t3s = s._storeFor("/m/store-t2/c.gguf")
+    // With no header parsed yet, tier 2 has not answered AND has not declined:
+    // an undecided field stays pending rather than exhausting to "—".
+    A.check("t2/no-header-pending", t3s.get("totalLayers").state, "pending")
+    A.check("t2/no-header-ftype-pending", t3s.get("ftype").state, "pending")
+    // A dense llama-family header: 32 layers, 32 heads, 8 KV heads, 4096 embd,
+    // swa declared 0 (every layer dense). head dim = 4096/32 = 128, so
+    // kLen = vLen = 8*128 = 1024 and cells = the full context.
+    // arch is REQUIRED, not decoration: an untemplated namespace declines rather
+    // than describing a shape from key names nobody has verified for it. A
+    // fixture with no arch is not a real header — _finishGguf always sets one.
+    var hdrDense = { arch: "llama", bc: 32, hc: 32, hckv: 8, embd: 4096, swa: 0, ft: 15, npl: 0 }
+    s._tier2ToEntryStore(entry3, hdrDense)
+    A.check("t2/totalLayers", t3s.get("totalLayers").value, 32)
+    A.check("t2/totalLayers-tier", t3s.get("totalLayers").tier, 2)
+    A.check("t2/totalLayers-exact", t3s.get("totalLayers").state, "exact")
+    A.check("t2/ftype", t3s.get("ftype").value, 15)
+    // An absent nextn_predict_layers is a READING of 0 draft layers, not a gap.
+    A.check("t2/no-draft-means-zero-mtp", t3s.get("mtpLayers").value, 0)
+    A.check("t2/kvDescribed", t3s.get("kvDescribed").value, true)
+    A.check("t2/kvBlockAligned", t3s.get("kvBlockAligned").value, true)
+    // The whole graph follows from the header alone.
+    A.check("t2/mainLayers", t3s.get("mainLayers").value, 32)
+    A.check("t2/mainGpu-from-ngl", t3s.get("mainGpu").value, 20)
+    A.check("t2/mainCpu", t3s.get("mainCpu").value, 12)
+    A.check("t2/coreSize", t3s.get("coreSize").value, 16000000000)
+    // 32 layers × (1024×2 B K + 1024×2 B V) × 4096 cells.
+    A.check("t2/kvBytes", t3s.get("kvBytes").value, 536870912)
+    A.check("t2/kvBytes-state", t3s.get("kvBytes").state, "exact")
+    A.check("t2/kvBytes-tier-is-weakest-input", t3s.get("kvBytes").tier, 2)
+    A.ok("t2/kvBytes-derived", t3s.get("kvBytes").derived)
+    A.ok("t2/tier6-skipped-for-aligned-shape", !s.checkTier6Values(t3s))
+    A.check("t2/weightGpu-estimated",
+            t3s.get("weightGpu").state, "estimated")
+    A.check("t2/weightGpu", t3s.get("weightGpu").value,
+            Math.round(16000000000 * 20 / 32))
+
+    // ── An undescribable shape is a FALSE answer, and it escalates ─────
+    // No window key, no recurrent declaration: the file does not say what its
+    // attention layers are, so only the engine can. Stated as false, never as a
+    // pending field, because tier 2 has genuinely run and answered.
+    var entry4 = {
+      name: "d", modelPath: "/m/store-t2/d.gguf", draftPath: "",
+      sizeBytes: 1000000000, contextLen: 8192, nParams: 4000000000,
+      ngl: "all", nglDraft: "", specType: "", cacheK: "", cacheV: "",
+      noKvOffload: false, ubatch: 512, parallel: 1,
+      swaFull: false, noKvUnified: false }
+    var hdrVague = { arch: "llama", bc: 40, hc: 32, hckv: 8, embd: 4096, ft: 2, npl: 0 }
+    s._applyTier1([entry4])
+    var t4s = s._storeFor("/m/store-t2/d.gguf")
+    s._tier2ToEntryStore(entry4, hdrVague)
+    A.check("t2/undescribable-is-false", t4s.get("kvDescribed").value, false)
+    A.check("t2/undescribable-tier", t4s.get("kvDescribed").tier, 2)
+    A.check("t2/no-spec-no-alignment-claim", t4s.get("kvBlockAligned").state, "absent")
+    A.ok("t2/tier6-runs-for-undescribable", s.checkTier6Values(t4s))
+    A.check("t2/kvBytes-still-pending", t4s.get("kvBytes").state, "pending")
+    // Tier 6 answers it exactly, and the derivation refuses to overwrite a
+    // stronger answer with a weaker one.
+    A.ok("t2/tier6-commit", t4s.commit("kvBytes", 1234567, "exact", 6))
+    s.applyDerivation(t4s)
+    A.check("t2/tier6-value-stands", t4s.get("kvBytes").value, 1234567)
+    A.check("t2/tier6-value-exact", t4s.get("kvBytes").state, "exact")
+    A.ok("t2/tier6-gate-closes", !s.checkTier6Values(t4s))
+
+    // ── Gate 2: qwen35moe settles from the header alone ───────────────
+    // The shipped qwen3.6-35b-a3b. Header read directly from the file on this
+    // machine: block_count 40, embedding_length 2048, head_count 16,
+    // head_count_kv 2, key_length 256, value_length 256, and
+    // full_attention_interval 4 at the ARCH ROOT — not under `attention.`, which
+    // is where a symmetric suffix table would have looked. No
+    // attention.sliding_window and no pattern key at all: the file declares a
+    // hybrid, so the 30 non-(4th) layers are recurrent and only 10 hold KV.
+    // The 10-layer answer is the whole point: a 40-layer reading is a ~20 GiB
+    // cache on a 16 GiB card, which is precisely the bug Gate 1 guards.
+    var entry6 = {
+      name: "f", modelPath: "/m/store-t2/f.gguf", draftPath: "",
+      sizeBytes: 17730509792, contextLen: 262144, nParams: 35000000000,
+      ngl: "all", nglDraft: "", specType: "", cacheK: "", cacheV: "",
+      noKvOffload: false, ubatch: 512, parallel: 1,
+      swaFull: false, noKvUnified: false }
+    var hdrQwen = {
+      arch: "qwen35moe", bc: 40, hc: 16, hckv: 2, hckvArr: null, embd: 2048,
+      npl: -1, fai: 4, kl: 256, vl: 256, klswa: -1, vlswa: -1, swa: -1,
+      sharedKv: -1, swaPattern: -1, swaPatternArr: null, recurrentArr: null,
+      kvLoraRank: -1, ropeDim: 64, sz: -1, ft: -1 }
+    s._applyTier1([entry6])
+    var t6s = s._storeFor("/m/store-t2/f.gguf")
+    s._tier2ToEntryStore(entry6, hdrQwen)
+    A.check("gate2/qwen35moe-described", t6s.get("kvDescribed").value, true)
+    A.check("gate2/qwen35moe-aligned", t6s.get("kvBlockAligned").value, true)
+    // The shape itself: 10 KV-holding layers, each 2 heads wide, each row
+    // kvHeads × key_length = 2 × 256.
+    var spec6 = s._buildKvLayers(hdrQwen, 40, 262144, {})
+    A.check("gate2/kv-layer-count", spec6 ? spec6.layers.length : -1, 10)
+    A.check("gate2/kv-heads", spec6 ? spec6.layers[0].kvHeads : -1, 2)
+    A.check("gate2/k-row-width", spec6 ? spec6.layers[0].kLen : -1, 512)
+    A.check("gate2/v-row-width", spec6 ? spec6.layers[0].vLen : -1, 512)
+    // 10 × 262144 cells × (512 + 512) f16 elements. The 40-layer figure is four
+    // times this, and is what the absent template used to produce.
+    var qwen40 = 40 * 262144 * 2048
+    A.check("gate2/kvBytes-is-the-10-layer-figure", t6s.get("kvBytes").value,
+            10 * 262144 * 2048)
+    A.check("gate2/kvBytes-state", t6s.get("kvBytes").state, "exact")
+    // Gate 1, asserted as the plan states it: the VALUE, and nothing else.
+    A.ok("gate1/qwen35moe-kv-under-16gib",
+         t6s.get("kvBytes").value > 0 && t6s.get("kvBytes").value < 16 * 1024 * 1024 * 1024)
+    A.ok("gate1/qwen35moe-not-the-40-layer-reading",
+         t6s.get("kvBytes").value !== qwen40)
+    // Gate 2's other half: the tier-6 gate never opens, so no 3–45 s subprocess
+    // is spent on a model the header already sizes.
+    A.ok("gate2/tier6-gate-never-opens", !s.checkTier6Values(t6s))
+
+    // ── The decline path, which is what makes an absent template safe ──
+    // A SYNTHETIC namespace, so this cannot accidentally pass because the file's
+    // real arch happens to be templated. Same geometry as qwen35moe, so the only
+    // difference the test measures is the namespace.
+    var entry7 = {
+      name: "g", modelPath: "/m/store-t2/g.gguf", draftPath: "",
+      sizeBytes: 16000000000, contextLen: 8192, nParams: 8000000000,
+      ngl: "20", nglDraft: "", specType: "", cacheK: "", cacheV: "",
+      noKvOffload: false, ubatch: 512, parallel: 1,
+      swaFull: false, noKvUnified: false }
+    var hdrUnknown = {
+      arch: "totally-made-up-arch", bc: 40, hc: 16, hckv: 2, hckvArr: null,
+      embd: 2048, npl: -1, fai: 4, kl: 256, vl: 256, klswa: -1, vlswa: -1,
+      swa: -1, sharedKv: -1, swaPattern: -1, swaPatternArr: null,
+      recurrentArr: null, kvLoraRank: -1, ropeDim: 64, sz: -1, ft: -1 }
+    s._applyTier1([entry7])
+    var t7s = s._storeFor("/m/store-t2/g.gguf")
+    s._tier2ToEntryStore(entry7, hdrUnknown)
+    A.check("gate1/untemplated-declines", t7s.get("kvDescribed").value, false)
+    A.ok("gate1/untemplated-opens-tier6", s.checkTier6Values(t7s))
+    A.check("gate1/untemplated-no-guessed-bytes", t7s.get("kvBytes").state, "pending")
+    // And the decline is the arch gate, not the recurrent rule: the identical
+    // geometry under a templated namespace DOES describe. If this pair ever
+    // diverges, the gate stopped being about the namespace.
+    A.ok("gate1/decline-is-about-namespace-not-shape",
+         s._buildKvLayers(hdrQwen, 40, 8192, {}) !== null)
+
+    // ── Bounded versus decline: a positive window with recurrence ──────
+    // A templated file that declares recurrent layers (fai > 1) AND a positive
+    // sliding window is deliberately left unknown: only lfm2 derives a pattern
+    // from the window among the hybrids, lfm2moe/bailingmoe3 ignore it, so
+    // answering would be a one-architecture table in disguise. Unknown → null →
+    // tier 6, rather than a bounded "~" that would look like a measurement.
+    var hdrWindowedHybrid = {
+      arch: "lfm2", bc: 40, hc: 16, hckv: 2, hckvArr: null, embd: 2048,
+      npl: -1, fai: 4, kl: 256, vl: 256, klswa: -1, vlswa: -1, swa: 2048,
+      sharedKv: -1, swaPattern: -1, swaPatternArr: null, recurrentArr: null,
+      kvLoraRank: -1, ropeDim: 64, sz: -1, ft: -1 }
+    A.ok("kvshape/positive-window-plus-recurrence-declines",
+         s._buildKvLayers(hdrWindowedHybrid, 40, 8192, {}) === null)
+    // A declared dense stack (sliding_window 0) with the same recurrence IS
+    // describable: the file stated its layer type, so nothing is guessed.
+    var hdrDenseHybrid = {
+      arch: "qwen35", bc: 40, hc: 16, hckv: 2, hckvArr: null, embd: 2048,
+      npl: -1, fai: 4, kl: 256, vl: 256, klswa: -1, vlswa: -1, swa: 0,
+      sharedKv: -1, swaPattern: -1, swaPatternArr: null, recurrentArr: null,
+      kvLoraRank: -1, ropeDim: 64, sz: -1, ft: -1 }
+    var specDense = s._buildKvLayers(hdrDenseHybrid, 40, 8192, {})
+    A.check("kvshape/dense-hybrid-describes", specDense ? specDense.layers.length : -1, 10)
+
+    // ── A draft header supersedes the base header's MTP keys ──────────
+    var entry5 = {
+      name: "e", modelPath: "/m/store-t2/e.gguf", draftPath: "/m/store-t2/e-d.gguf",
+      sizeBytes: 16000000000, contextLen: 4096, nParams: 8000000000,
+      ngl: "40", nglDraft: "3", specType: "", cacheK: "", cacheV: "",
+      noKvOffload: false, ubatch: 512, parallel: 1,
+      swaFull: false, noKvUnified: false }
+    s._applyTier1([entry5])
+    var t5s = s._storeFor("/m/store-t2/e.gguf")
+    s._tier2ToEntryStore(entry5, hdrDense)
+    A.check("t2/mtpLayers-undecided-while-draft-pending", t5s.get("mtpLayers").state, "pending")
+    // The draft header arrives through _applyGgufDraft in production; parked
+    // directly here so the test does not have to build a running-models array.
+    t5s.ctx.draftGguf = { bc: 3, sz: 900000000 }
+    s._applyTier2To(t5s)
+    s._settle(t5s)
+    A.check("t2/draft-header-wins-mtpLayers", t5s.get("mtpLayers").value, 3)
+    A.check("t2/draft-header-size", t5s.get("draftSizeBytes").value, 900000000)
+    A.check("t2/draft-exact-size-beats-uniform", t5s.get("mtpSizeBytes").value, 900000000)
+    A.check("t2/draft-exact-size-state", t5s.get("mtpSizeBytes").state, "exact")
+    // A separate draft file's 3 layers were NEVER in the base file's 32, so the
+    // main stack is all 32. Subtracting them made the panel claim a 29-layer
+    // model it never loaded; only a BUILT-IN MTP stack reduces totalLayers.
+    A.check("t2/mainLayers-separate-draft-keeps-base", t5s.get("mainLayers").value, 32)
+    // -ngld 3 over a 3-layer draft: all of it, counted over the draft's own stack
+    // rather than the base file's 32 (where 3 < 32 - 3 would have read as zero).
+    A.check("t2/mtpGpu", t5s.get("mtpGpu").value, 3)
+    A.check("t2/mainGpu-separate-draft", t5s.get("mainGpu").value, 32)
+    A.check("t2/coreSize-keeps-whole-base-file", t5s.get("coreSize").value, 16000000000)
+
+    // ── Revision: a live tier supersedes its own reading ───────────────
+    var rv = s.createFieldStore("/m/store-rev/a.gguf")
+    rv.commit("soleAttribution", "measured", "exact", 4)
+    A.ok("rev/revise-same-tier", rv.revise("soleAttribution", "unattributable", "exact", 4))
+    A.check("rev/value-updated", rv.get("soleAttribution").value, "unattributable")
+    A.ok("rev/tier-unchanged", rv.get("soleAttribution").tier === 4)
+    // A DIFFERENT tier may not revise: that is commit()'s effective-tier rule.
+    A.ok("rev/other-tier-cannot-revise",
+         !rv.revise("soleAttribution", "measured", "exact", 5))
+    A.check("rev/value-survives-refused-revision",
+            rv.get("soleAttribution").value, "unattributable")
+    // No-op when nothing changed, so a 1 Hz poll cannot churn the version.
+    var vNow = rv.version()
+    A.ok("rev/identical-is-noop", !rv.revise("soleAttribution", "unattributable", "exact", 4))
+    A.check("rev/noop-keeps-version", rv.version(), vNow)
+
+    // ── Derived answers follow their inputs ───────────────────────────
+    // The reported regression: a corrected cache size left the panel reading
+    // "on GPU" because the location had been written once and could not move.
+    var dl = s.createFieldStore("/m/store-rev/b.gguf")
+    s._t4(dl, "soleAttribution", "measured")
+    s._t4(dl, "noKvOffload", false)
+    s._t4(dl, "kvBytes", 2 * 1073741824)
+    s._t4(dl, "memBytes", 0)
+    s._t4(dl, "vramBytes", 8 * 1073741824)
+    s._settle(dl)
+    A.check("deriv/location-initially", dl.get("kvLocation").value, "GPU")
+    // Host anon at 4 GiB is now LARGER than the cache: rung 3 cannot separate the
+    // cache from the weights, so the honest answer is not "GPU" any more.
+    dl.revise("memBytes", 4 * 1073741824, "estimated", 4)
+    s._settle(dl)
+    A.check("deriv/location-withdrawn-on-unsupported-revisit",
+            dl.get("kvLocation").state, "absent")
+    // ...and back down again, to prove the revision is not one-way.
+    dl.revise("memBytes", 0, "estimated", 4)
+    s._settle(dl)
+    A.check("deriv/location-revised-back", dl.get("kvLocation").value, "GPU")
+    // An unchanged input set must NOT re-commit (no churn on every settle).
+    var vLoc = dl.version()
+    s.applyDerivation(dl)
+    A.check("deriv/unchanged-inputs-no-churn", dl.version(), vLoc)
+
+    // ── Tier 4 producer: a missing reading is pending, never "—" ───────
+    var t4s = s.createFieldStore("/m/store-t4/a.gguf")
+    s._t4(t4s, "memBytes", -1)
+    A.check("t4/missing-reading-stays-pending", t4s.get("memBytes").state, "pending")
+    t4s.markSettled()
+    A.check("t4/missing-reading-not-absent", t4s.get("memBytes").state, "pending")
+    s._t4(t4s, "memBytes", 400000000)
+    A.check("t4/later-reading-commits", t4s.get("memBytes").value, 400000000)
+    A.check("t4/readings-are-estimated", t4s.get("memBytes").state, "estimated")
+    A.check("t4/readings-are-tier4", t4s.get("memBytes").tier, 4)
+    s._t4(t4s, "memBytes", 900000000)
+    A.check("t4/newer-reading-supersedes", t4s.get("memBytes").value, 900000000)
+
+    // ── Tier 4 projection: attribution follows the loaded set ──────────
+    s.runningModels = [{ modelPath: "/m/store-t4/a.gguf" },
+                       { modelPath: "/m/store-t4/b.gguf" }]
+    s._pruneStores(s.runningModels)
+    s.serviceMemoryBytes = 400000000
+    s.serviceVramBytes = 8 * 1024 * 1024 * 1024
+    s._applyTier4()
+    var p1 = s._storeFor("/m/store-t4/a.gguf"), p2 = s._storeFor("/m/store-t4/b.gguf")
+    A.check("t4/two-models-unattributable",
+            p1.get("soleAttribution").value, "unattributable")
+    A.check("t4/both-stores-projected", p2.get("memBytes").value, 400000000)
+    // Unload one and the attribution becomes measurable — a same-tier revision,
+    // which is the only way a live reading is allowed to correct itself.
+    s.runningModels = [{ modelPath: "/m/store-t4/a.gguf" }]
+    s._applyTier4()
+    A.check("t4/one-model-measured", p1.get("soleAttribution").value, "measured")
+    A.check("t4/attribution-revision-keeps-tier", p1.get("soleAttribution").tier, 4)
+    // ...and the ladder fires only then: unattributable declined the placement,
+    // and a stronger answer is required to replace it.
+    s.runningModels = []
+    s.serviceMemoryBytes = -1
+    s.serviceVramBytes = -1
+
+    // ── Tier 3 producer: the RAW token, and `auto` answers nothing ─────
+    s._presetCache = s._parseIniLines("[*]\nfit = on\nn-gpu-layers = all\n")
+    var e6 = { name: "f", modelPath: "/m/store-t3/a.gguf",
+               draftPath: "", sizeBytes: 9200000000, contextLen: 131072,
+               nParams: -1, ngl: "", nglDraft: "", specType: "",
+               cacheK: "", cacheV: "", noKvOffload: false, ubatch: 512,
+               parallel: 1, swaFull: false, noKvUnified: false }
+    var t3v = s.createFieldStore("/m/store-t3/a.gguf")
+    s._applyTier3(e6, t3v)
+    A.check("t3/preset-token-from-globals", t3v.get("presetNgl").value, "all")
+    A.check("t3/preset-tier", t3v.get("presetNgl").tier, 3)
+    // The token feeds mainGpu, and a stated count is exact.
+    t3v.commit("totalLayers", 80, "exact", 2)
+    t3v.commit("mtpLayers", 0, "exact", 2)
+    s._settle(t3v)
+    A.check("t3/preset-drives-mainGpu", t3v.get("mainGpu").value, 80)
+    A.check("t3/preset-derived-mainGpu-exact", t3v.get("mainGpu").state, "exact")
+    // `auto` is a stated intent but not a stated COUNT, so it answers nothing:
+    // tier 3 declines rather than handing on a token _mtpSplit would reject.
+    var t3w = s.createFieldStore("/m/store-t3/b.gguf")
+    s._presetCache = s._parseIniLines("[*]\nfit = auto\nn-gpu-layers = auto\n")
+    s._applyTier3({ modelPath: "/m/store-t3/b.gguf" }, t3w)
+    t3w.markSettled()
+    A.check("t3/auto-token-answers-nothing", t3w.get("presetNgl").state, "absent")
+    s._presetCache = null
+
+    // ── Tier 5: llama-fit-params ───────────────────────────────────────
+    // The argv group pins the flags that must NEVER vary, and they live in the
+    // script rather than in the argv precisely so these can byte-compare them.
+    var fs = s.kvFitScript
+    A.ok("fit/argv-fit-off", fs.indexOf("--fit off") >= 0)
+    A.ok("fit/argv-fit-print-on", fs.indexOf("--fit-print on") >= 0)
+    A.ok("fit/argv-explicit-ngl", fs.indexOf('-ngl "$ngl"') >= 0)
+    A.notok("fit/argv-no-fit-target", fs.indexOf("-fitt") >= 0 || fs.indexOf("--fit-target") >= 0)
+    A.notok("fit/argv-no-flash-attn", fs.indexOf("--flash-attn") >= 0)
+    // The model path is its own quoted positional ($3), never interpolated: a
+    // path containing `;` stays one argument.
+    A.ok("fit/argv-model-path-slot", fs.indexOf('model="$3"') >= 0 && fs.indexOf('-m "$model"') >= 0)
+    // `shift 3` is the idiom that keeps the wrapper from emitting its own leading
+    // arguments twice.
+    A.ok("fit/argv-shift-3", fs.indexOf("shift 3") >= 0)
+    // 97 is "not installed" and must not collide with kvProbeScript's 98,
+    // which means "retry later".
+    A.ok("fit/script-exit-97", fs.indexOf("exit 97") >= 0)
+    A.ok("fit/script-97-not-98", s.kvProbeScript.indexOf("exit 98") >= 0 && fs.indexOf("exit 98") < 0)
+    A.ok("fit/timeout-watchdog-gap", s.kvFitWatchdogMs > s.kvFitTimeoutSec * 1000)
+
+    var fa = s._buildFitArgv("/m/a b;c.gguf", 40, "q8_0", "q4_0", 32768)
+    A.check("fit/argv-binary-slot", fa[0], "/usr/bin/llama-fit-params")
+    A.check("fit/argv-ngl-slot", fa[1], "40")
+    A.check("fit/argv-model-slot", fa[2], "/m/a b;c.gguf")
+    A.check("fit/argv-ctk", fa[3], "-ctk")
+    A.check("fit/argv-ctv", fa[5], "-ctv")
+    A.check("fit/argv-context", fa[7], "-c")
+    // An unsupported dtype is dropped rather than passed: an invalid value is an
+    // immediate exit-1 that would be indistinguishable from a real abort.
+    var fb = s._buildFitArgv("/m/a.gguf", 0, "nope", "f16", 0)
+    A.notok("fit/argv-bad-dtype-dropped", fb.indexOf("-ctk") >= 0)
+    A.notok("fit/argv-no-context-without-one", fb.indexOf("-c") >= 0)
+
+    // ── The parser, driven from the golden fixture ─────────────────────
+    var fdir = "@TESTS_DIR@/fixtures/fit_params/cuda-1/"
+    var fixture = readFixture(fdir + "ngl40-q8_0-ctx32768.txt")
+    A.ok("fit/fixture-present", fixture.indexOf("CUDA0") >= 0)
+    A.ok("fit/parse-header-line",
+         s._fitIsPreamble("llama_fit_params: printing estimated memory in MiB to stdout (device, model, context, compute) ..."))
+    A.check("fit/parse-preamble-skipped",
+            s._parseFitRow("llama_fit_params: printing estimated memory in MiB to stdout (device, model, context, compute) ..."), null)
+    A.check("fit/parse-trailing-space", s._parseFitRow("CUDA0 1 2 3 ") !== null, true)
+    A.check("fit/parse-total-row", s._parseFitRow("total 1 2 3"), null)
+    A.check("fit/parse-malformed", s._parseFitRow("CUDA0 1 2"), null)
+    A.check("fit/parse-malformed-not-zero-filled", s._parseFitRow("CUDA0 1 x 3"), null)
+    A.check("fit/parse-empty-stdout", s.parseFitParams(""), null)
+    A.check("fit/parse-abort", s.parseFitParams(""), null)
+    A.check("fit/parse-unknown-device-is-device", s._parseFitRow("Vulkan0 1 2 3").host, false)
+    A.check("fit/parse-host-row", s._parseFitRow("Host 1 2 3").host, true)
+    // Column order is device model context compute; the `context` column is the
+    // KV bytes, and the cells are integer MiB converted exactly once.
+    var rowA = s._parseFitRow("CUDA0 8692 767 551 ")
+    A.check("fit/parse-cuda-row-model", rowA.modelMiB, 8692)
+    A.check("fit/parse-cuda-row-context", rowA.contextMiB, 767)
+    A.check("fit/parse-cuda-row-compute", rowA.computeMiB, 551)
+    // A zero cell is a real reading, not a missing one.
+    var rowZ = s._parseFitRow("CUDA0 0 0 4 ")
+    A.check("fit/parse-zero-column", rowZ.modelMiB, 0)
+    A.ok("fit/parse-zero-column-survives", rowZ !== null)
+    A.check("fit/parse-mib-to-bytes", s._fitMibToBytes(2), 2097152)
+    A.check("fit/parse-mib-to-bytes-rounds", s._fitMibToBytes(0.5), 524288)
+    var two = s.parseFitParams("CUDA0 10 20 30\nCUDA1 5 7 11\nHost 1 2 3\n")
+    A.check("fit/parse-two-devices", two.deviceRows.length, 2)
+    A.check("fit/parse-two-devices-summed", two.deviceTotal.context, 27 * 1048576)
+    A.check("fit/parse-host-total", two.hostTotal.context, 2 * 1048576)
+
+    // ── Which N to decompose at: cheapest definitive first ──────────────
+    var n1 = s.createFieldStore("/m/fit/a.gguf")
+    n1.commit("ngl", "20", "exact", 1)
+    n1.commit("presetNgl", "all", "exact", 3)
+    n1.commit("totalLayers", 80, "exact", 2)
+    A.check("fit/ngl-source-explicit", s._fitNglFor(n1), 20)
+    A.check("fit/ngl-auto-is-not-a-count", s._fitNglFor(s.createFieldStore("/m/fit/none.gguf")), null)
+    var n2 = s.createFieldStore("/m/fit/b.gguf")
+    n2.commit("presetNgl", "33", "exact", 3)
+    A.check("fit/ngl-source-preset", s._fitNglFor(n2), 33)
+    var n3 = s.createFieldStore("/m/fit/c.gguf")
+    n3.commit("presetNgl", "all", "exact", 3)
+    n3.commit("totalLayers", 80, "exact", 2)
+    A.check("fit/ngl-preset-all-becomes-a-count", s._fitNglFor(n3), 80)
+    var n4 = s.createFieldStore("/m/fit/d.gguf")
+    n4.commit("mainGpu", 12, "estimated", 4)
+    A.check("fit/ngl-source-estimate", s._fitNglFor(n4), 12)
+    // An EXACT mainGpu is not a supplied N — only the estimate stands in.
+    var n5 = s.createFieldStore("/m/fit/e.gguf")
+    n5.commit("mainGpu", 12, "exact", 1)
+    A.check("fit/ngl-source-exact-mainGpu-not-used", s._fitNglFor(n5), null)
+
+    // The signature covers everything that changes the answer.
+    var n6 = s.createFieldStore("/m/fit/f.gguf")
+    n6.commit("ngl", "20", "exact", 1)
+    n6.commit("cacheK", "q8_0", "exact", 1)
+    n6.commit("cacheV", "q8_0", "exact", 1)
+    n6.commit("contextLen", 32768, "exact", 1)
+    s._stores["/m/fit/f.gguf"] = n6
+    var sig0 = s._fitSignatureFor("/m/fit/f.gguf")
+    A.ok("fit/signature-covers-inputs",
+         sig0 === "/m/fit/f.gguf|20|q8_0|q8_0|32768")
+
+    // ── The commit: three fields, permanently estimated ────────────────
+    s.runningModels = [{ modelPath: "/m/fit/f.gguf" }, { modelPath: "/m/fit/g.gguf" }]
+    s._pruneStores(s.runningModels)
+    s._kvFitRunning = 0
+    s._tier5Available = true
+    s._kvFitCache = ({})
+    s._kvFitQueue = []
+    s._kvFitSig = sig0
+    s._kvFitPath = "/m/fit/f.gguf"
+    var rows = fixture.split("\n")
+    for (var fl = 0; fl < rows.length; fl++) if (rows[fl] !== "") s._onFitLine(rows[fl])
+    s._finishKvFit(0)
+    var fstore = s._storeFor("/m/fit/f.gguf")
+    A.check("fit/device-context", fstore.get("kvGpuBytes").value, 767 * 1048576)
+    A.check("fit/host-context", fstore.get("kvCpuBytes").value, 470 * 1048576)
+    A.check("fit/device-compute", fstore.get("computeBytes").value, 551 * 1048576)
+    A.check("fit/permanently-estimated", fstore.get("kvGpuBytes").state, "estimated")
+    A.check("fit/estimated-at-tier5", fstore.get("kvGpuBytes").tier, 5)
+    // The test that would have caught the fit-decider design: a projection must
+    // never report its own inputs back as findings.
+    A.check("fit/never-commits-kvBytes", fstore.get("kvBytes").state, "pending")
+    A.check("fit/never-commits-weightGpu", fstore.get("weightGpu").state, "pending")
+    A.check("fit/never-commits-mainGpu", fstore.get("mainGpu").state, "pending")
+
+    // ── Degradation: one attempt, then `—` ─────────────────────────────
+    s._kvFitSig = s._fitSignatureFor("/m/fit/g.gguf")
+    s._kvFitPath = "/m/fit/g.gguf"
+    s._kvFitBuffer = ""
+    s._finishKvFit(134)                       // the mmproj abort, verbatim
+    var gstore = s._storeFor("/m/fit/g.gguf")
+    A.check("fit/abort-declines-gpu", gstore.get("kvGpuBytes").state, "absent")
+    A.check("fit/abort-declines-cpu", gstore.get("kvCpuBytes").state, "absent")
+    A.check("fit/abort-declines-compute", gstore.get("computeBytes").state, "absent")
+    // No retry: the completed signature is cached, so the same inputs cannot
+    // re-queue a process.
+    A.check("fit/abort-not-cached-as-answer", s._kvFitCache[s._fitSignatureFor("/m/fit/g.gguf")].ok, false)
+    var qBefore = s._kvFitQueue.length
+    s._queueKvFit({ modelPath: "/m/fit/g.gguf" })
+    A.check("fit/no-retry-after-abort", s._kvFitQueue.length, qBefore)
+
+    // ── Gating and single-flight ───────────────────────────────────────
+    s._queueKvFit({ modelPath: "/m/fit/f.gguf" })
+    A.check("fit/gate-nothing-outstanding", s._kvFitQueue.length, 0)
+    // A store with outstanding tier-5 fields while one run is in flight must not
+    // enqueue the same signature.
+    var w = s.createFieldStore("/m/fit/h.gguf")
+    w.commit("ngl", "20", "exact", 1)
+    s._stores["/m/fit/h.gguf"] = w
+    s._kvFitRunning = 1
+    s._kvFitSig = s._fitSignatureFor("/m/fit/h.gguf")
+    s._queueKvFit({ modelPath: "/m/fit/h.gguf" })
+    A.check("fit/single-flight", s._kvFitQueue.length, 0)
+    // A store with nothing outstanding does not enqueue even mid-flight.
+    s._queueKvFit({ modelPath: "/m/fit/f.gguf" })
+    A.check("fit/gate-blocks-answered-store", s._kvFitQueue.length, 0)
+    s._kvFitRunning = 0
+    s._kvFitSig = ""
+    s._kvFitQueue = []
+
+    // ── Availability: 97 is permanent ──────────────────────────────────
+    s._tier5Available = true
+    var u = s.createFieldStore("/m/fit/i.gguf")
+    u.commit("ngl", "20", "exact", 1)
+    s._stores["/m/fit/i.gguf"] = u
+    s.runningModels = [{ modelPath: "/m/fit/i.gguf" }]
+    s._pruneStores(s.runningModels)
+    s._kvFitSig = "never-ran"
+    s._kvFitPath = "/m/fit/i.gguf"
+    s._finishKvFit(97)
+    A.check("fit/absent-binary-cached", s._tier5Available, false)
+    A.check("fit/absent-binary-declines", s._storeFor("/m/fit/i.gguf").get("kvGpuBytes").state, "absent")
+    // And it never spawns again: the queue stays empty on every later refresh.
+    s._queueKvFit({ modelPath: "/m/fit/i.gguf" })
+    A.check("fit/absent-binary-no-respawn", s._kvFitQueue.length, 0)
+    s._tier5Available = true
+    s._kvFitCache = ({})
+
+    // ── Tier 1's context: /slots n_ctx, and only /slots ─────────────────
+    // `--ctx-size 0` means "let fit decide", so argv cannot say what the context
+    // actually is; /slots reports the value llama.cpp resolved (measured here:
+    // qwen3.8-27b-fast → 102912).
+    s.runningModels = [{ modelPath: "/m/slots/a.gguf", id: "slots-model" }]
+    s._pruneStores(s.runningModels)
+    var cst = s._storeFor("/m/slots/a.gguf")
+    cst.commit("contextLen", 262144, "exact", 1)     // what argv claimed
+    s._slotsModelId = "slots-model"
+    s._slotsBuffer = '[{"n_ctx":102912,"is_processing":false,"id_task":3}]'
+    s._finishSlots()
+    A.check("slots/resolved-context-wins", cst.get("contextLen").value, 102912)
+    A.check("slots/context-still-exact", cst.get("contextLen").state, "exact")
+    A.check("slots/context-still-tier1", cst.get("contextLen").tier, 1)
+    // The same reading twice must not churn the store version (1 Hz poll).
+    var vCtx = cst.version()
+    s._slotsBuffer = '[{"n_ctx":102912,"is_processing":false,"id_task":3}]'
+    s._finishSlots()
+    A.check("slots/unchanged-context-no-churn", cst.version(), vCtx)
+    // A slot with no usable n_ctx answers nothing at all.
+    s._slotsBuffer = '[{"is_processing":false,"id_task":4}]'
+    s._finishSlots()
+    A.check("slots/absent-n-ctx-answers-nothing", cst.get("contextLen").value, 102912)
+    // An id that matches no loaded model must not touch any store.
+    s._slotsModelId = "someone-else"
+    s._slotsBuffer = '[{"n_ctx":4096}]'
+    s._finishSlots()
+    A.check("slots/unknown-id-ignored", cst.get("contextLen").value, 102912)
+    // The KV geometry follows the corrected context, because it is derived from it.
+    s._applySlotsContext("slots-model", 32768)
+    A.check("slots/context-revisable", cst.get("contextLen").value, 32768)
+    s._slotsBuffer = ""
+    s._slotsModelId = ""
+    s.runningModels = []
 
     A.finish()
   }

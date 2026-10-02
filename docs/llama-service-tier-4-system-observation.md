@@ -358,10 +358,9 @@ why the bug survived. Under the plan:
 2. **A `"GPU/CPU"` return value** from `_kvPlacement`, plus the totals logic in
    `ModelsSection.qml:211,215` that must handle it.
 3. ~~**The corroboration gate and its calibration.**~~ **Dropped, not
-   deferred.** Tier 5 does not exist to be gated yet, and when it does the gate
-   will not be built — see §6 and
-   [`concern-4-p2-plan.md`](../concern-4-p2-plan.md) for the decision and the six
-   preconditions that would reopen it.
+   deferred.** Tier 5 is now built, and the gate was **not** built with it — see
+   §6 and [`concern-4-p2-plan.md`](../concern-4-p2-plan.md) for the decision and
+   the six preconditions that would reopen it.
 4. **Unload eviction** of the observation snapshot. Under the plan a
    re-load re-measures (~20 ms), which is the right trade.
 5. **The `MemoryCurrent` path should be marked `~`** rather than exact, since
