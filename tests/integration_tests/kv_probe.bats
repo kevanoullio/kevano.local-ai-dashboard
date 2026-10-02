@@ -98,7 +98,7 @@ run_probe() {
 
 @test "kv probe wrapper: the engine's own KV lines survive the wrapper" {
   # The parse in Service.qml keys on these exact prefixes; if the wrapper
-  # swallowed or rewrote stdout the Tier-3.5 field would silently go unknown.
+  # swallowed or rewrote stdout the tier-6 field would silently go unknown.
   cat > "$SB/bin/logging-llama-cli" <<'SH'
 #!/bin/bash
 cat >&2 <<'LOG'

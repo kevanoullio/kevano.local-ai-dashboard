@@ -84,7 +84,7 @@ Item {
   Component.onCompleted: {
     s = A.service("@SERVICE_QML_PATH@", root, "llama.cpp")
     if (!s) return
-    A.ok("arc/service-created", s !== null, true)
+    A.ok("arc/service-created", s !== null)
     phase = 1
   }
 

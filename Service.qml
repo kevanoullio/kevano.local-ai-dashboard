@@ -611,7 +611,7 @@ systemctl --user stop "$1" 2>&1 | head -c "$2"`
   readonly property int watchdogMs: 12000          // backup watchdog for regular commands
   readonly property int startWatchdogMs: 20000     // backup watchdog for start
 
-  // ── Tier 3.5: engine KV accounting probe ─────────────────────────
+  // ── Tier 6: engine KV accounting probe ───────────────────────────
   // llama.cpp already reports the exact KV allocation for the context it
   // builds (bytes, per-cache layer count, cache dtypes, compute-buffer
   // reserve) in its own startup log — for EVERY architecture, including the
@@ -675,6 +675,54 @@ if [ "$avail" -gt 0 ] && [ "$want" -gt "$avail" ] && [ "$want" -gt "$(( avail * 
   exit 98;
 fi;
 exec "$cli" "$@"`
+
+  // ── Tier 5: llama-fit-params ────────────────────────────────────────────
+  // An OFFLINE decomposition of a model's memory at a SUPPLIED offload count.
+  //
+  // `--fit off` is the load-bearing flag, and it lives in the SCRIPT rather than
+  // in the argv so a BATS test can byte-compare it against the exact string the
+  // panel runs. `--fit` defaults to `on`, and on it *chooses* an offload count
+  // against `-fitt`'s target margin; with it off the tool only reports the layout
+  // for the `-ngl` it was handed, which is what makes tier 5 a decomposer and
+  // never a decider. `-fitt` and `--flash-attn` are absent deliberately: the
+  // first would inflate the projection with a margin, the second is the draft's
+  // recorded abort.
+  //
+  // `shift 3` + named variables, copied from kvProbeScript above, because that is
+  // the only shape in this file that does not re-emit its own leading arguments:
+  // a single `shift` would leave `-ngl` and `-m` inside "$@" and the exec below
+  // would print them twice. Nothing is ever interpolated — every value is a
+  // quoted "$var", so a model path with spaces or `;` stays one argument.
+  //
+  // Exit 97 is NEW and deliberately not 98: 98 above is "skipped, not enough
+  // MemAvailable" and means *retry when conditions change*, while 97 means "the
+  // tool is not installed" and means *never try again*. Collapsing the two would
+  // make a machine without llama-fit-params respawn a process per model per
+  // refresh, forever.
+  //
+  // `--help` is the only question this binary answers truthfully: a no-arg run
+  // exits 1 with `error: --model is required` on stderr and empty stdout, so the
+  // obvious "run it and look for exit 0" availability probe reports "absent" on
+  // every machine including this one. `ulimit -v` is NOT repeated here, for the
+  // reason recorded above it.
+  readonly property string kvFitScript: `
+set -o pipefail;
+ulimit -c 0 2>/dev/null || true;
+fit="$1"; ngl="$2"; model="$3"; shift 3;
+if [ ! -x "$fit" ] || ! "$fit" --help >/dev/null 2>&1; then
+  printf 'kvfit: binary unavailable\\n' >&2;
+  exit 97;
+fi;
+exec "$fit" --fit off --fit-print on -ngl "$ngl" -m "$model" "$@"`
+
+  readonly property string kvFitBinary: "/usr/bin/llama-fit-params"
+
+  // Its own timeout, not processTimeoutSec's 8: this reads a WHOLE model header
+  // (~555 ms typical, several seconds for a 30 B model on a cold page cache).
+  // The watchdog is strictly greater so `timeout` always wins and the QML timer
+  // is only the backup that reaps a wedged child.
+  readonly property int kvFitTimeoutSec: 20
+  readonly property int kvFitWatchdogMs: (kvFitTimeoutSec + 2) * 1000
 
 
   function setting(name, fallback) {
@@ -813,11 +861,1061 @@ exec "$cli" "$@"`
        case "q8_0": return 8.5
        case "q6_k": return 6.5625
        case "q5_1": return 5.5
-       case "q5_0": return 5.25
-       case "q4_1": case "q4_0": return 4.5
-       default: return -1
-     }
-   }
+case "q5_0": return 5.25
+        case "q4_1": case "q4_0": return 4.5
+        default: return -1
+      }
+    }
+
+    // ══ Six-tier field store ═══════════════════════════════════════════
+    //
+    // One plain-JS object per loaded model, owned here and keyed by modelPath.
+    // No QML component: cheaper per model, and the display layer never has to
+    // instantiate one. Every value enters through commit(), which is the only
+    // place that can enforce "never commit an unknown field".
+
+    // Certainty. `marker` was a 2-valued string with "—" smuggled in by
+    // markExhausted(), which made pending and absent indistinguishable — both
+    // rendered "—" — so the display keyed "no value" off the -1 sentinel instead.
+    // state is a real 4-valued enum and the glyph is derived from it in exactly
+    // one place, so the mapping cannot drift.
+    readonly property var stateEnum: ({ PENDING: "pending", EXACT: "exact",
+                                    ESTIMATED: "estimated", ABSENT: "absent" })
+
+    // The only place a state becomes a glyph.
+    readonly property var stateGlyph: ({ pending: "…", exact: "",
+                                          estimated: "~", absent: "—" })
+
+    // Certainty order. A derivation can be no better than its worst input or its
+    // own floor, so this is a max over a two-value domain rather than string
+    // comparison. pending and absent are deliberately OUTSIDE it: they are
+    // lifecycle, not certainty. Neither can be an input's contribution to
+    // another field's state — a derivation reading a pending input cannot run
+    // yet, and one reading an absent input has nothing to propagate — so
+    // refusing to promote is the guard that stops a lifecycle state leaking
+    // into a number.
+    readonly property var stateRank: ({ exact: 0, estimated: 1 })
+
+    function worseState(a, b) {
+      if (a === undefined) return b
+      if (b === undefined) return a
+      var ra = stateRank[a], rb = stateRank[b]
+      if (ra === undefined || rb === undefined) return "estimated"   // never promote
+      return ra >= rb ? a : b
+    }
+
+    // A derivation's "I cannot answer this" — distinct from a value, so
+    // {value: null} can never be mistaken for one.
+    readonly property var decline: ({ decline: true })
+
+    // Per-field value type. This is what makes validity decidable per field: the
+    // four sentinels are -1, null, "" and false, and they are not all invalid
+    // everywhere. false is the real answer for isCloud and noKvOffload and a
+    // sentinel for a byte count, so a blanket predicate would either refuse the
+    // booleans or let false into a byte count.
+    readonly property var fieldTypes: ({
+      // "num"  — finite, >= 0. -1, NaN and undefined are sentinels.
+      // "str"  — non-empty string. "" is the sentinel.
+      // "bool" — true / false. Neither is a sentinel.
+      sizeBytes: "num", contextLen: "num", nParams: "num", ubatch: "num",
+      parallel: "num", mainGpu: "num", mainCpu: "num", mtpGpu: "num",
+      mtpCpu: "num", totalLayers: "num", mainLayers: "num", mtpLayers: "num",
+      kvBytes: "num", kvGpuBytes: "num", kvCpuBytes: "num", computeBytes: "num",
+      weightGpu: "num", weightCpu: "num", memBytes: "num", vramBytes: "num",
+      coreSize: "num", mtpSizeBytes: "num", draftSizeBytes: "num", ftype: "num",
+      ngl: "str", nglDraft: "str", cacheK: "str", cacheV: "str",
+      modelPath: "str", draftPath: "str", specType: "str", kvLocation: "str",
+      presetNgl: "str", soleAttribution: "str",
+      isCloud: "bool", noKvOffload: "bool", swaFull: "bool", noKvUnified: "bool",
+      kvBlockAligned: "bool", kvDescribed: "bool"
+    })
+
+    function isValidValue(name, v) {
+      var t = fieldTypes[name]
+      if (t === undefined) return false          // an unknown field cannot be committed
+      if (t === "num")  return typeof v === "number" && isFinite(v) && v >= 0
+      if (t === "str")  return typeof v === "string" && v !== ""
+      if (t === "bool") return v === true || v === false
+      return false
+    }
+
+    // Field → the tiers that can answer it. Derivation is NOT here and has its
+    // own registry below; a field listed under several tiers is one several
+    // rungs can attempt, and that is what makes the exhaustion join work.
+    readonly property var capabilities: ({
+      // 1 — Server API: GET /v1/models incl. status.args, plus GET /slots
+      1: ["name", "sizeBytes", "contextLen", "nParams", "modelPath", "draftPath",
+          "isCloud", "ngl", "nglDraft", "cacheK", "cacheV", "noKvOffload",
+          "ubatch", "parallel", "swaFull", "noKvUnified", "specType"],
+      // 2 — Model file: bounded 16 KiB GGUF header
+      2: ["ftype", "totalLayers", "mtpLayers", "draftSizeBytes",
+          "kvDescribed", "kvBlockAligned"],
+      // 3 — Preset config: models.ini section over [*] globals
+      3: ["presetNgl"],
+      // 4 — System observation: per-PID device memory + cgroup anon+shmem
+      4: ["memBytes", "vramBytes", "soleAttribution"],
+      // 5 — Engine projection: llama-fit-params --fit off --fit-print on -ngl N
+      5: ["kvGpuBytes", "kvCpuBytes", "computeBytes"],
+      // 6 — Deep engine observation: llama-cli --verbose oracle
+      6: ["kvBytes"]
+    })
+
+    // Every field the store can hold, with the tiers that may answer it.
+    readonly property var fieldTiers: ({
+      name: [1], sizeBytes: [1], contextLen: [1], nParams: [1], modelPath: [1],
+      draftPath: [1], isCloud: [1], ngl: [1], nglDraft: [1], cacheK: [1],
+      cacheV: [1], noKvOffload: [1], ubatch: [1], parallel: [1], swaFull: [1],
+      noKvUnified: [1], specType: [1],
+      ftype: [2], totalLayers: [2], mtpLayers: [2], draftSizeBytes: [2],
+      kvDescribed: [2], kvBlockAligned: [2],
+      presetNgl: [3],
+      memBytes: [4], vramBytes: [4], soleAttribution: [4],
+      kvGpuBytes: [5], kvCpuBytes: [5], computeBytes: [5],
+      kvBytes: [6]
+    })
+
+    // The tiers still able to answer `name`, in walk order.
+    function wantedTiers(name) { return fieldTiers[name] || [] }
+
+    function createFieldStore(modelPath) {
+      // name -> { value, state, tier, derived, answeredBy }
+      var fields = ({})
+      var version = 0          // bumped on every accepted commit / decline / settle
+      // Side-channel for values a derivation needs but that are not store
+      // fields: the parsed GGUF header, and the tier-1 flags _buildKvLayers
+      // reads. Deliberately NOT fields — the KV geometry is re-read from the
+      // header rather than flattened into twenty store entries.
+      var ctx = ({})
+
+      function entry(name) {
+        if (!fields[name]) {
+          fields[name] = { value: null, state: stateEnum.PENDING, tier: null,
+                           derived: false, answeredBy: [] }
+        }
+        return fields[name]
+      }
+
+      // Field-set seed: every declared field exists and is pending from the
+      // moment the store is created, so needsMore() is answerable before any
+      // tier has run.
+      for (var seed in fieldTiers) entry(seed)
+      for (var dseed in derivations) entry(dseed)
+
+      // A commit is the only way a value enters the store.
+      //
+      // `tier` is 1-6 for a read. For a derivation it is the WEAKEST of its
+      // inputs, because the answer can be no better than its worst input, and
+      // `derived` is what distinguishes the two cases. The two are orthogonal to
+      // `state`: a derived value can be exact, and a read value can be estimated.
+      //
+      // The effective-tier rule ("a commit is accepted only when no better-ranked
+      // tier has already answered") replaces first-commit-wins, which made
+      // precedence an emergent property of table order and let a weak derivation
+      // permanently block a stronger rung.
+      //
+      // ONE exception, and it is the revisability the placement ladder needs: a
+      // derived answer may be REPLACED when its inputs changed (a different `sig`).
+      // It is the same law over better evidence, so refusing it would freeze the
+      // first reading forever — which is exactly how a corrected ~2.5 GB cache
+      // still rendered "on GPU" while the cache sat in host RAM. A real read is
+      // never revised this way; only its own tier can revise it, via revise().
+      function commit(name, value, state, tier, derivesFrom, floor, sig) {
+        var e = entry(name)
+        if (!isValidValue(name, value)) return false
+        var derived = !!derivesFrom
+        if (derived) {
+          var weakest = 0, worst = undefined
+          for (var i = 0; i < derivesFrom.length; i++) {
+            var dep = fields[derivesFrom[i]]
+            if (!dep || dep.tier === null) return false   // an input is unattributed
+            if (dep.tier > weakest) weakest = dep.tier
+            worst = worseState(worst, dep.state)
+          }
+          // There is no tier 0: a derivation always has inputs, and an
+          // unattributable one is refused rather than filed under tier 0.
+          if (weakest <= 0) return false
+          var rederive = (e.derived === true) && sig !== undefined
+            && e.sig !== undefined && sig !== e.sig
+          if (!rederive && e.tier !== null && e.tier <= weakest) return false
+          // The derivation's own law: an explicit state from compute() beats the
+          // registry's floor, because one field can have two laws and one floor
+          // cannot express both. mainGpu is the case — an --n-gpu-layers token is
+          // exact arithmetic on a stated count, while the measured-VRAM estimate
+          // is an approximate model of reality. Falling back to the floor would
+          // render "~20 layers" for a flag the engine was started with.
+          var law = (state === stateEnum.EXACT || state === stateEnum.ESTIMATED)
+            ? state : (floor || stateEnum.EXACT)
+          state = worseState(worst, law)
+          tier = weakest
+          e.sig = sig
+        } else {
+          if (state !== stateEnum.EXACT && state !== stateEnum.ESTIMATED) return false
+          if (typeof tier !== "number" || tier < 1 || tier > 6) return false
+          if (e.tier !== null && e.tier <= tier) return false            // better answered
+        }
+
+        e.value = value
+        e.state = state
+        e.tier = tier
+        e.derived = derived
+        if (e.answeredBy.indexOf(tier) < 0) e.answeredBy.push(tier)
+        version++
+        return true
+      }
+
+      // A LIVE tier supersedes its own earlier reading. Only tier 4's probes take
+      // this path (they measure every refresh), and only for the same tier: a
+      // reading is superseded by a later reading of the same producer, never by a
+      // different producer. Anything else goes through commit(), where the
+      // effective-tier rule applies. No-op when nothing changed, so a 1 Hz poll
+      // cannot churn the version.
+      function revise(name, value, state, tier) {
+        var e = entry(name)
+        if (!isValidValue(name, value)) return false
+        if (e.tier !== tier) return false
+        if (e.value === value && e.state === state) return false
+        e.value = value
+        e.state = state
+        version++
+        return true
+      }
+
+      // "This tier ran and cannot answer this field." Different from a field
+      // still being looked for: it removes that tier from the field's wanted set,
+      // which is what eventually lets the field go absent instead of hanging as
+      // pending.
+      function decline(name, tier) {
+        var e = entry(name)
+        if (e.answeredBy.indexOf(tier) < 0) e.answeredBy.push(tier)
+        version++
+      }
+
+      // Settled ⟺ every tier that could answer this field has either committed it
+      // or declined it. This is the whole termination rule.
+      //
+      // Note what this must NOT do: return false just because the field is still
+      // pending. Termination is a join over answeredBy vs the wanted set, and it
+      // is markSettled() that decides whether a still-pending field may be
+      // converted. Folding the pending test in here made the two mutually
+      // exclusive, so absent was unreachable for every field in the store.
+      function isSettled(name) {
+        var e = fields[name]
+        if (!e) return false
+        if (e.state !== stateEnum.PENDING) return true
+        var w = wantedTiers(name)
+        if (!w.length && !derivations[name]) return false  // nobody declares it
+        for (var i = 0; i < w.length; i++) {
+          if (e.answeredBy.indexOf(w[i]) < 0) return false
+        }
+        return true
+      }
+
+      // A derived field is settled only once no derivation can still supply it:
+      // every REQUIRED input is settled, and any absent input kills it outright.
+      // Only required inputs count: an optional input is by definition allowed to
+      // be absent, so letting it block would make the field pending forever.
+      function derivationSettled(name) {
+        var d = derivations[name]
+        if (!d) return true
+        var anyPending = false
+        for (var i = 0; i < d.inputs.length; i++) {
+          var dep = fields[d.inputs[i]]
+          if (!dep || dep.state === stateEnum.PENDING) { anyPending = true; continue }
+          if (dep.state === stateEnum.ABSENT) return true
+        }
+        return !anyPending
+      }
+
+      // `pending` is a promise, and a promise names someone: the lowest tier that
+      // declared the field and has not answered yet.
+      function pendingAt(name) {
+        var e = fields[name]
+        if (!e || e.state !== stateEnum.PENDING) return null
+        var w = wantedTiers(name)
+        for (var i = 0; i < w.length; i++) {
+          if (e.answeredBy.indexOf(w[i]) < 0) return w[i]
+        }
+        return null                     // everyone answered, but not yet settled
+      }
+
+      function markSettled() {
+        for (var name in fields) {
+          var e = fields[name]
+          if (e.state !== stateEnum.PENDING) continue
+          if (!isSettled(name) || !derivationSettled(name)) continue
+          e.state = stateEnum.ABSENT
+          e.value = null
+          version++
+        }
+      }
+
+      function get(name) {
+        var e = fields[name]
+        if (!e) return null
+        return { value: e.value, state: e.state, tier: e.tier, derived: e.derived,
+                 sig: e.sig }
+      }
+
+      // The display's one accessor. Everything the view needs for a field,
+      // including the glyph, without knowing the enum exists.
+      function read(name) {
+        var g = get(name)
+        if (!g) return { value: null, state: stateEnum.PENDING, tier: null,
+                         derived: false, glyph: stateGlyph.pending }
+        return { value: g.value, state: g.state, tier: g.tier, derived: g.derived,
+                 glyph: stateGlyph[g.state] }
+      }
+
+      // A derived answer loses its support when its inputs change. Sending it
+      // back to `pending` is the honest move: the old number is not wrong, but it
+      // was derived from data that is no longer current, and leaving it would be
+      // worse — this is what stopped a corrected cache size from ever moving the
+      // panel's placement. `pending` is also recoverable: the next settle either
+      // re-derives it or takes it to `absent` ("—"), which is the correct display
+      // for "the machine does not account for it".
+      function invalidate(name) {
+        var e = fields[name]
+        // Nothing to withdraw from an already-absent field, and refusing here is
+        // what keeps a still-unsupported derivation from flipping absent →
+        // pending → absent (and bumping the version) on every single settle.
+        if (!e || e.state === stateEnum.PENDING || e.state === stateEnum.ABSENT) return false
+        e.value = null
+        e.state = stateEnum.PENDING
+        e.tier = null
+        e.derived = false
+        e.sig = undefined
+        version++
+        return true
+      }
+
+      // True while the field is still unanswered. This is what the display and
+      // the probe queues gate on, so a resolved value can never re-enter pending.
+      function needsMore(name) {
+        var e = fields[name]
+        return !!e && e.state === stateEnum.PENDING
+      }
+
+      function reset() { fields = ({}); version++ }
+
+      return { path: modelPath, ctx: ctx, get: get, read: read,
+               commit: commit, decline: decline, revise: revise,
+               invalidate: invalidate,
+               needsMore: needsMore, isSettled: isSettled,
+               pendingAt: pendingAt, markSettled: markSettled,
+               version: function () { return version }, reset: reset }
+    }
+
+    // ── Derivation registry ───────────────────────────────────────────
+    // Each entry is a pure function of already-stored values, run after every
+    // commit and every decline. No I/O, never in capabilities.
+    //   inputs : REQUIRED fields. Rank, state propagation and the "can this run
+    //            yet" test all come from this list, so it must be complete — an
+    //            omitted input silently drops that input's estimated state.
+    //   optional: fields that MAY be absent or pending. They are passed as
+    //            undefined when they are, which is what lets a measurement-based
+    //            derivation still answer from the values that did land. An
+    //            optional input is excluded from both the "can run yet" test and
+    //            derivationSettled().
+    //   floor  : the worst state this derivation's law produces, when compute()
+    //            does not state one itself. "" = the arithmetic is the law.
+    //            "~" = the arithmetic is right but the model of reality is not
+    //            (weightGpu's equal-layer assumption). This is the distinction
+    //            from `derived`: a derived value can still be exact.
+    //   compute: (values, store) -> { value, state? } | decline
+
+    // Optional-input read. `undefined` (or any non-number) is the documented
+    // "not available", never a zero — the same sentinel discipline the ladder uses.
+    function _optNum(v, name, dflt) {
+      var x = v[name]
+      return (typeof x === "number" && isFinite(x)) ? x : dflt
+    }
+
+    // A separate --model-draft file is a DIFFERENT MODEL with its own layer
+    // count. Everything that splits a stack has to know which of the two counting
+    // rules applies, because they disagree about what "the stack" is: for the
+    // base model, -ngl counts over the base file alone; for a built-in MTP stack,
+    // nextn_predict_layers are counted INSIDE the base header's block_count, so
+    // the draft sits on top of the main stack and the counts overlap.
+    function _hasSeparateDraft(v) {
+      return typeof v.draftPath === "string" && v.draftPath !== ""
+    }
+
+    function _deriveMainLayers(v) {
+      if (!(v.totalLayers >= 0)) return decline
+      var total = Math.round(v.totalLayers)
+      // A separate --model-draft file is a DIFFERENT file: its block_count is its
+      // own, and it was never part of the base file's count, so subtracting it
+      // would invent a main stack one layer short. `mtpLayers` reduces
+      // `totalLayers` only for a BUILT-IN MTP stack, whose nextn_predict_layers
+      // are counted in the base header.
+      if (_hasSeparateDraft(v)) return { value: total }
+      var mtp = (v.mtpLayers >= 0) ? Math.min(Math.round(v.mtpLayers), total) : 0
+      return { value: Math.max(0, total - mtp) }
+    }
+
+    function _deriveCoreSize(v) {
+      if (!(v.sizeBytes > 0)) return decline
+      var sb = Math.round(v.sizeBytes)
+      // A separate --model-draft file is a DIFFERENT file: its bytes are not
+      // inside the base file, so the base core is the whole file. Built-in MTP
+      // (nextn_predict_layers) lives inside the base file, so those layers' bytes
+      // come off — which is why draftSizeBytes is not an input and mtpSizeBytes is.
+      //
+      // draftPath is OPTIONAL here, so during the window before tier 1 reports it
+      // this answers as if the MTP were built in, and the signature change when
+      // draftPath lands re-derives it. Waiting instead would mean coreSize
+      // depends on an unrelated tier's timing.
+      var separate = (typeof v.draftPath === "string" && v.draftPath !== "")
+      if (!separate && v.mtpLayers > 0 && v.mtpSizeBytes >= 0)
+        return { value: Math.max(0, sb - Math.round(v.mtpSizeBytes)) }
+      return { value: sb }
+    }
+
+    function _deriveMtpSize(v) {
+      if (v.draftSizeBytes >= 0)
+        return { value: Math.round(v.draftSizeBytes), state: stateEnum.EXACT }
+      if (!(v.mtpLayers > 0) || !(v.sizeBytes > 0) || !(v.totalLayers > 0)) return decline
+      // Uniform-layer assumption: an approximate model of reality, so "~".
+      return { value: Math.round(v.sizeBytes / v.totalLayers * v.mtpLayers) }
+    }
+
+    function _deriveMainGpu(v) {
+      var total = Math.round(v.totalLayers)
+      if (!(total > 0)) return decline
+      var mtp = (v.mtpLayers >= 0) ? Math.min(Math.round(v.mtpLayers), total) : 0
+      // A stated offload count is exact: llama.cpp counts layers from the
+      // bottom. API flags first, then the preset's own key.
+      var tok = _isPresetSplitToken(v.ngl) ? String(v.ngl).trim()
+            : (_isPresetSplitToken(v.presetNgl) ? String(v.presetNgl).trim() : "")
+      if (tok !== "") {
+        // `total` is the base file's block_count. For a built-in MTP stack the
+        // draft's layers are inside it, so the main stack is total - mtp and the
+        // offload count has to climb past them. For a separate draft the base
+        // count IS the main stack, and handing total - mtp to _mtpSplit would
+        // report a main stack three layers short of the file it came from.
+        var stack = _hasSeparateDraft(v) ? total + mtp : total
+        var s = _mtpSplit(tok, stack, mtp)
+        if (s.mainGpu === null) return decline
+        return { value: s.mainGpu, state: stateEnum.EXACT }
+      }
+      // Nothing stated the count, so measure: the service's per-PID device
+      // memory minus whatever of it the cache holds, scaled by the model's own
+      // core bytes. Always "~"; the clamp to [0, main] is the only guesswork.
+      var vram = _optNum(v, "vramBytes", -1)
+      if (!(vram >= 0) || !(v.coreSize > 0)) return decline
+      var kv = _optNum(v, "kvBytes", -1)
+      var on = _kvLocationOf(v.noKvOffload === true, null, kv, {
+        memBytes: _optNum(v, "memBytes", -1), vramBytes: vram,
+        sole: v.soleAttribution === "measured" })
+      var est = _estimateSplitFromProbes(v.coreSize, total, vram,
+        (on === "GPU" && kv > 0) ? kv : 0, _optNum(v, "computeBytes", -1))
+      if (!est) return decline
+      return { value: Math.min(est.gpuLayers, total - mtp) }
+    }
+
+    function _deriveMainCpu(v) {
+      if (!(v.mainLayers > 0)) return decline
+      return { value: Math.max(0, Math.round(v.mainLayers) - Math.round(v.mainGpu)) }
+    }
+
+    function _deriveMtpGpu(v) {
+      var mtp = Math.round(v.mtpLayers)
+      if (!(mtp > 0)) return { value: 0, state: stateEnum.EXACT }   // no draft: nothing offloaded
+      // `-ngld` when it is there. When it is not, the draft follows the MAIN
+      // stack's `-ngl`: a built-in MTP stack (nextn_predict_layers in the base
+      // file) has no separate draft model at all, and llama.cpp defaults
+      // --gpu-layers-draft to -ngl when the flag is omitted. Either way the draft
+      // rides the main stack's setting, so an absent `-ngld` is not an unknown —
+      // reading it as one dropped the badge to "—" for the commonest case.
+      var token = String(v.nglDraft == null ? "" : v.nglDraft).trim()
+      if (token === "") token = String(v.ngl == null ? "" : v.ngl).trim()
+      // Counted over the stack -ngl counts over, which is not always the base
+      // file. A BUILT-IN MTP stack lives inside the base header, so the MTP block
+      // sits ON TOP of the main stack and -ngl 30 over 65 layers with 1 MTP leaves
+      // all 30 in the main stack and none on the draft; splitting the draft's own
+      // 1-layer stack against 30 would call it fully offloaded — the opposite
+      // answer, from the same token. A SEPARATE draft model is its own stack:
+      // -ngld 3 over a 3-layer draft means all three, and passing the base file's
+      // 32 instead would report zero, because 3 < 32 - 3.
+      var total = Math.round(v.totalLayers)
+      if (!(total > 0)) return decline
+      var s = _mtpSplit(token, _hasSeparateDraft(v) ? mtp : total, mtp)
+      if (s.mtpGpu === null) return decline
+      return { value: s.mtpGpu, state: stateEnum.EXACT }
+    }
+
+    function _deriveMtpCpu(v) {
+      if (!(v.mtpLayers >= 0)) return decline
+      return { value: Math.max(0, Math.round(v.mtpLayers) - Math.round(v.mtpGpu)) }
+    }
+
+    // coreSize × (share of layers on the device). Byte-exact arithmetic over
+    // values that can all be exact, and still "~": it assumes every layer's
+    // weights are the same size, and none of these models has uniform layers (an
+    // IQ4_XS mix, an MoE expert stack, a differing mmproj). Multiplying exact
+    // numbers by an approximate model of reality does not produce an exact
+    // number. `coreSize` and not `sizeBytes`, so the main model's budget is not
+    // charged for the draft model's weights.
+    function _deriveWeightGpu(v) {
+      if (!(v.coreSize > 0) || !(v.mainLayers > 0)) return decline
+      if (!(v.mainGpu >= 0)) return decline
+      return { value: Math.round(v.coreSize * Math.round(v.mainGpu) / Math.round(v.mainLayers)) }
+    }
+
+    function _deriveWeightCpu(v) {
+      if (!(v.coreSize > 0) || !(v.mainLayers > 0)) return decline
+      if (!(v.mainCpu >= 0)) return decline
+      return { value: Math.round(v.coreSize * Math.round(v.mainCpu) / Math.round(v.mainLayers)) }
+    }
+
+    // The KV cache size. The only derivation that has to decide whether it KNOWS
+    // something, so it has three outcomes rather than two:
+    //   undescribable  → decline, and tier 6 answers
+    //   describable but block-unaligned → a value, "~", tier 6 does NOT run
+    //   describable and block-aligned     → a value, exact, tier 6 does NOT run
+    // A described shape is still describable when it is unaligned, so it keeps
+    // the "~" and never pays the 3-45 s oracle. Only an undescribable shape
+    // escalates, and those two outcomes must not collapse into one.
+    function _deriveKvBytes(v, store) {
+      if (v.kvDescribed !== true) return decline        // tier 2 already said no
+      var g = (store && store.ctx && store.ctx.gguf) ? store.ctx.gguf : null
+      if (!g) return decline
+      var ctx = Math.round(v.contextLen)
+      if (!(ctx > 0)) return decline
+      var c = (store.ctx && store.ctx.flags) ? store.ctx.flags : ({})
+      var spec = _buildKvLayers(g, Math.round(v.mainLayers), ctx, {
+        ubatch: (c.ubatch > 0) ? c.ubatch : 512,
+        parallel: (c.parallel > 0) ? c.parallel : 1,
+        swaFull: c.swaFull === true,
+        kvUnified: v.noKvUnified !== true })
+      if (!spec) return decline
+      var bytes = _kvEstimateBytesArch(spec, _kvDtypeBits(v.cacheK), _kvDtypeBits(v.cacheV))
+      if (!(bytes > 0)) return decline
+      return { value: bytes,
+               state: (v.kvBlockAligned === true) ? stateEnum.EXACT : stateEnum.ESTIMATED }
+    }
+
+    // Where the cache lives: no source at tiers 1-4 states it plainly (b10729
+    // /props is near-empty and /slots carries no KV field), so the location is
+    // arithmetic over tiers 1/2/4/5 — which is what makes it revisable. When
+    // tier 4 owned this write, a corrected ~2.5 GB cache could not revise a
+    // committed location, and the panel kept showing GPU while the cache was in
+    // host RAM.
+    function _deriveKvLocation(v) {
+      var res = _kvPlacement({
+        memBytes: _optNum(v, "memBytes", -1),
+        vramBytes: _optNum(v, "vramBytes", -1),
+        kvBytes: _optNum(v, "kvBytes", -1),
+        soleAttribution: v.soleAttribution,
+        noKvOffload: v.noKvOffload === true,
+        ngl: v.ngl,
+        answered: null })
+      if (res.action !== "commit" || res.value === "") return decline
+      return { value: res.value,
+               state: (res.marker === "~") ? stateEnum.ESTIMATED : stateEnum.EXACT }
+    }
+
+    readonly property var derivations: ({
+      mainLayers:  { inputs: ["totalLayers", "mtpLayers"],
+                     optional: ["draftPath"], floor: "",
+                     compute: _deriveMainLayers },
+      coreSize:    { inputs: ["sizeBytes"],
+                     optional: ["mtpSizeBytes", "mtpLayers", "draftPath"], floor: "",
+                     compute: _deriveCoreSize },
+      mtpSizeBytes:{ inputs: ["mtpLayers"],
+                     optional: ["draftSizeBytes", "sizeBytes", "totalLayers"],
+                     floor: "~", compute: _deriveMtpSize },
+      mainGpu:     { inputs: ["totalLayers", "mtpLayers"],
+                     optional: ["draftPath", "ngl", "presetNgl", "coreSize",
+                                "vramBytes", "memBytes", "kvBytes",
+                                "computeBytes", "noKvOffload",
+                                "soleAttribution"],
+                     floor: "~", compute: _deriveMainGpu },
+      mainCpu:     { inputs: ["mainGpu", "mainLayers"], floor: "~",
+                     compute: _deriveMainCpu },
+      mtpGpu:      { inputs: ["mtpLayers", "totalLayers"],
+                     optional: ["draftPath", "nglDraft", "ngl"], floor: "~",
+                     compute: _deriveMtpGpu },
+      mtpCpu:      { inputs: ["mtpGpu", "mtpLayers"], floor: "~",
+                     compute: _deriveMtpCpu },
+      weightGpu:   { inputs: ["coreSize", "mainGpu", "mainLayers"], floor: "~",
+                     compute: _deriveWeightGpu },
+      weightCpu:   { inputs: ["coreSize", "mainCpu", "mainLayers"], floor: "~",
+                     compute: _deriveWeightCpu },
+      kvBytes:     { inputs: ["kvDescribed", "kvBlockAligned", "mainLayers",
+                              "contextLen", "cacheK", "cacheV", "noKvUnified"],
+                     floor: "", compute: _deriveKvBytes },
+      kvLocation:  { inputs: ["soleAttribution", "noKvOffload", "kvBytes"],
+                     optional: ["memBytes", "vramBytes", "ngl"], floor: "~",
+                     compute: _deriveKvLocation }
+    })
+
+    // ── The resolver ──────────────────────────────────────────────────
+    //
+    // There is no linear resolveAll() loop: tiers 2, 4, 5 and 6 are async QML
+    // processes and tier 6 takes 3-45 s, so a synchronous walk over [1..6] would
+    // block the QML thread on first load. The resolver is instead a field-set
+    // seed at store creation, a commit/decline pass inside each tier's own async
+    // callback followed by applyDerivation() + markSettled(), and a per-field
+    // join for termination.
+    //
+    // A derivation is RETRIED, never scheduled: it is attempted on every settle
+    // and declines while an input is unsettled, so there is no ordering
+    // constraint between tiers and derivations. It cannot promote certainty
+    // (commit recomputes the state from the inputs and the law) and it cannot
+    // displace a better answer (commit's effective-tier rule).
+    function applyDerivation(store) {
+      // Run to a FIXED POINT rather than in registry order: one derivation can
+      // feed another (kvBytes needs mainLayers, which needs totalLayers), and an
+      // object's key order is not a dependency order — relying on it made the
+      // answer depend on how the registry happened to be written. The pass count
+      // is bounded by the registry size, so a cyclic registry cannot hang the QML
+      // thread; it just stops making progress.
+      //
+      // A derived field is not revisited on every pass: it is revisited when its
+      // INPUT SIGNATURE changes, which is what keeps the placement ladder (and
+      // everything above it) revisable without letting a settled answer churn.
+      var names = []
+      for (var n in derivations) names.push(n)
+      for (var round = 0; round <= names.length; round++) {
+        var progress = false
+        for (var i = 0; i < names.length; i++) {
+          var name = names[i]
+          var cur = store.get(name)
+          // A field is reconsidered when it is unanswered, when it already holds
+          // a DERIVED answer (its inputs may have moved), or when it settled as
+          // absent but is derivable — the withdrawal path above sends a stale
+          // answer back through settle, and a settled "—" must be able to become
+          // an answer again when a corrected reading arrives.
+          var revisit = (cur !== null && cur.derived === true)
+          if (!revisit && !store.needsMore(name)) {
+            if (!(cur !== null && cur.state === stateEnum.ABSENT && derivations[name]))
+              continue
+            revisit = true
+          }
+          var d = derivations[name]
+          var v = ({}), ready = true
+          for (var j = 0; j < d.inputs.length; j++) {
+            var e = store.get(d.inputs[j])
+            if (!e || e.state === stateEnum.PENDING || e.state === stateEnum.ABSENT) { ready = false; break }
+            v[d.inputs[j]] = e.value
+          }
+          if (!ready) continue
+          var opt = d.optional || []
+          for (var k = 0; k < opt.length; k++) {
+            var oe = store.get(opt[k])
+            v[opt[k]] = (oe && oe.state !== stateEnum.PENDING && oe.state !== stateEnum.ABSENT)
+              ? oe.value : undefined
+          }
+          // The signature is what makes a derived answer revisable: it names the
+          // inputs AND their states, so a value that happens to be the same number
+          // at a weaker certainty still counts as a change.
+          var sig = ""
+          for (var s1 = 0; s1 < d.inputs.length; s1++)
+            sig += d.inputs[s1] + "=" + String(v[d.inputs[s1]]) + "/" + store.get(d.inputs[s1]).state + ";"
+          for (var s2 = 0; s2 < opt.length; s2++)
+            sig += (v[opt[s2]] !== undefined) ? opt[s2] + "=" + String(v[opt[s2]]) + ";" : ""
+          if (revisit && cur.sig === sig) continue
+          var out = d.compute(v, store)
+          if (!out || out === decline) {
+            // A revisit that can no longer answer is not a no-op: the previous
+            // answer was derived from inputs that no longer hold, so it is
+            // withdrawn rather than left standing as a stale "GPU".
+            if (revisit) store.invalidate(name)
+            continue                            // else: stays pending for a real tier
+          }
+          if (store.commit(name, out.value, out.state, null, d.inputs, d.floor, sig))
+            progress = true
+        }
+        if (!progress) return
+      }
+    }
+
+    function _anyPending(store, names) {
+      for (var i = 0; i < names.length; i++) if (store.needsMore(names[i])) return true
+      return false
+    }
+
+    // Per tier: do I have anything to do for this store? Only real fields, never
+    // a derived one — a derivation is not something a tier can be asked for.
+    function checkTier1Values(store) { return _anyPending(store, capabilities[1]) }
+    function checkTier2Values(store) { return _anyPending(store, capabilities[2]) }
+    function checkTier3Values(store) { return _anyPending(store, capabilities[3]) }
+    function checkTier4Values(store) { return _anyPending(store, capabilities[4]) }
+    function checkTier5Values(store) { return _anyPending(store, capabilities[5]) }
+
+    // The gate. Two booleans, no null-object ambiguity: the oracle runs only when
+    // the header could not describe the shape, or could not prove it block
+    // aligned. A described, aligned shape is settled by derivation and must never
+    // pay 3-45 s.
+    function checkTier6Values(store) {
+      var desc = store.get("kvDescribed"), aligned = store.get("kvBlockAligned")
+      return store.needsMore("kvBytes")
+          && (!desc || desc.value !== true)
+          && (!aligned || aligned.value !== true)
+    }
+
+    // Tier 4 is service-global, so its wanted set is the union across stores and
+    // the ladder runs once per refresh, projecting to each model.
+    function checkTier4ValuesAny(stores) {
+      for (var i = 0; i < stores.length; i++) if (checkTier4Values(stores[i])) return true
+      return false
+    }
+
+    property var _stores: ({})            // modelPath -> field store
+    property var _storeVersions: ({})     // modelPath -> version last painted
+
+    function _storeFor(path) {
+      if (path === undefined || path === null || String(path) === "") return null
+      var p = String(path)
+      if (!_stores[p]) _stores[p] = createFieldStore(p)
+      return _stores[p]
+    }
+
+    // Per-model, not global. One _storeVersion cannot serve N models: a commit on
+    // model A would paint A's version, and model B's later commit would compare
+    // against A's number and be skipped. Keyed by path, so each model repaints
+    // when its own store moves.
+    function _republish(store) {
+      if (!store) return
+      var p = store.path
+      if (_storeVersions[p] === store.version()) return
+      _storeVersions[p] = store.version()
+      runningModels = (runningModels || []).slice()
+    }
+
+    // The one hook each tier installs. Called after every commit and every
+    // decline, so derivation and settlement both stay current.
+    function _settle(store) {
+      if (!store) return
+      applyDerivation(store)
+      store.markSettled()
+      _republish(store)
+    }
+
+    // ── Tier 1 producer: GET /v1/models + GET /slots ───────────────────
+    //
+    // One writer, one shape. Every value is OFFERED to commit() and the store
+    // decides: a valid value is committed, anything else is a decline. That is
+    // the whole point of commit() being the only door — a producer cannot leave
+    // a sentinel behind as though it were a reading, which is how a 0-byte
+    // file (the API's stand-in for an unknown size) used to become a real 0.
+    //
+    // Idempotent: an already-answered field is left alone, so the 1 Hz /v1/models
+    // poll cannot churn the store version or repaint on every tick.
+    function _t1(store, name, value) {
+      if (!store || !store.needsMore(name)) return
+      if (isValidValue(name, value)) store.commit(name, value, stateEnum.EXACT, 1)
+      else store.decline(name, 1)
+    }
+
+    // The one tier-1 field whose value can legitimately move under a live store:
+    // `contextLen`, because /slots reports the RESOLVED context and a reload at a
+    // different one is the same producer reporting a different number — not a
+    // stronger source, so commit()'s effective-tier rule would refuse it and the
+    // panel would show a context the engine is not using. Everything else at tier 1
+    // is fixed for the life of the model and still commits once.
+    function _t1update(store, name, value) {
+      if (!store) return
+      if (store.needsMore(name)) { _t1(store, name, value); return }
+      var cur = store.get(name)
+      if (cur && cur.tier === 1) store.revise(name, value, stateEnum.EXACT, 1)
+    }
+
+    function _applyTier1(entries) {
+      var list = entries || []
+      for (var i = 0; i < list.length; i++) {
+        var e = list[i]
+        if (!e) continue
+        var st = _storeFor(e.modelPath)
+        if (!st) continue                        // no path: the store cannot be keyed
+        _t1(st, "name", e.name)
+        _t1(st, "modelPath", e.modelPath)
+        _t1(st, "draftPath", e.draftPath)
+        _t1(st, "sizeBytes", e.sizeBytes > 0 ? e.sizeBytes : null)
+        _t1(st, "contextLen", e.contextLen > 0 ? e.contextLen : null)
+        _t1(st, "nParams", e.nParams >= 0 ? e.nParams : null)
+        _t1(st, "isCloud", false)                // llama.cpp is never cloud
+        _t1(st, "ngl", e.ngl)
+        _t1(st, "nglDraft", e.nglDraft)
+        _t1(st, "specType", e.specType)
+        // An absent --cache-type-* MEANS f16 in llama.cpp, so the empty string is
+        // normalized rather than declined: "" is the str sentinel, and committing
+        // it would leave the dtype looking absent while the engine runs f16.
+        _t1(st, "cacheK", String(e.cacheK == null ? "" : e.cacheK).trim() || "f16")
+        _t1(st, "cacheV", String(e.cacheV == null ? "" : e.cacheV).trim() || "f16")
+        _t1(st, "noKvOffload", e.noKvOffload === true)
+        _t1(st, "swaFull", e.swaFull === true)
+        _t1(st, "noKvUnified", e.noKvUnified === true)
+        _t1(st, "ubatch", e.ubatch > 0 ? e.ubatch : null)
+        _t1(st, "parallel", e.parallel > 0 ? e.parallel : null)
+        // The header may already be parsed: the KV geometry facts it decides need
+        // this tier's context and dtypes, so re-run tier 2 now that they exist.
+        if (st.ctx.gguf) _applyTier2To(st)
+        _settle(st)
+      }
+    }
+
+    // A store outlives the model it describes unless something removes it, and a
+    // dashboard polls forever: an unloaded model would keep its derived numbers
+    // (and its whole derived graph) alive for the session. Pruned on every
+    // rebuild, so the store set is exactly the loaded set.
+    function _pruneStores(entries) {
+      var live = ({}), list = entries || []
+      for (var i = 0; i < list.length; i++) {
+        var p = list[i] ? list[i].modelPath : ""
+        if (p !== undefined && p !== null && String(p) !== "") live[String(p)] = true
+      }
+      for (var path in _stores) {
+        if (!live[path]) { delete _stores[path]; delete _storeVersions[path] }
+      }
+    }
+
+    // ── Tier 2 producer: the GGUF header ──────────────────────────────
+    //
+    // Idempotent like _t1, and re-run whenever the header OR the context lands,
+    // because the KV geometry facts below cannot be decided without the allocated
+    // context — and the allocated context is tier 1's, not the file's. The
+    // trained context_length in the header is NOT a substitute: it is the model's
+    // capacity, which can exceed the running allocation many times over.
+    function _t2(store, name, value) {
+      if (!store || !store.needsMore(name)) return
+      if (isValidValue(name, value)) store.commit(name, value, stateEnum.EXACT, 2)
+      else store.decline(name, 2)
+    }
+
+    function _applyTier2To(st) {
+      if (!st) return
+      var g = st.ctx.gguf
+      if (!g) return
+      _t2(st, "ftype", (isFinite(g.ft) && g.ft >= 0) ? Math.round(g.ft) : null)
+      _t2(st, "totalLayers", (g.bc > 0) ? Math.round(g.bc) : null)
+
+      // Which FILE owns the MTP count depends on whether a separate draft was
+      // started: --model-draft's block_count IS the count, and the base header's
+      // nextn_predict_layers is only the built-in fallback. Resolving that before
+      // the draft path is known would commit the base header's 0 — and a commit
+      // cannot be replaced by a later one at the same tier, so the real count
+      // would then be un-committable for the life of the model. Undecided, so
+      // pending; not declined.
+      var d = st.ctx.draftGguf || null
+      var dp = st.get("draftPath")
+      if (dp.state === stateEnum.PENDING) {
+        // Left alone on purpose.
+      } else if (dp.value) {
+        // A separate draft file: its header owns the count and the weight size.
+        if (d) {
+          _t2(st, "mtpLayers", (d.bc > 0) ? Math.round(d.bc) : null)
+          _t2(st, "draftSizeBytes", (isFinite(d.sz) && d.sz > 0) ? Math.round(d.sz) : null)
+        }
+      } else {
+        // No separate draft. An ABSENT key is a reading, not a gap: llama.cpp's
+        // default is 0 draft layers, and mainLayers = total - mtpLayers cannot be
+        // computed from a missing count, so declining here would block the whole
+        // main/draft placement graph on a model that simply has no draft.
+        var npl = (isFinite(g.npl) && g.npl > 0) ? Math.round(g.npl) : 0
+        _t2(st, "mtpLayers", Math.min(npl, (g.bc > 0) ? Math.round(g.bc) : npl))
+        _t2(st, "draftSizeBytes", null)
+      }
+
+      // The two KV geometry facts are NOT decided here when the allocated context
+      // or the cache dtypes are still missing: an undecided field is left PENDING
+      // rather than declined, because a decline is an answer, and answering "the
+      // shape is undescribable" from a file we have not finished reading would
+      // exhaust the field and send tier 6's oracle to a model that never needed it.
+      var ctxE = st.get("contextLen"), ck = st.get("cacheK"), cv = st.get("cacheV")
+      var answered = (ctxE.state === stateEnum.EXACT || ctxE.state === stateEnum.ESTIMATED)
+        && ck.state !== stateEnum.PENDING && ck.state !== stateEnum.ABSENT
+        && cv.state !== stateEnum.PENDING && cv.state !== stateEnum.ABSENT
+      if (!answered) return
+      // _buildKvLayers falls back to the header's own block_count when the main
+      // layer count is not derived yet, which is sound for a per-layer fact: the
+      // two geometry questions below (describable? block-aligned?) do not depend
+      // on how many layers there are.
+      var spec = _buildKvLayers(g, -1, Math.round(ctxE.value), {
+        ubatch: (st.get("ubatch").value > 0) ? st.get("ubatch").value : 512,
+        parallel: (st.get("parallel").value > 0) ? st.get("parallel").value : 1,
+        swaFull: st.get("swaFull").value === true,
+        kvUnified: st.get("noKvUnified").value !== true })
+      _t2(st, "kvDescribed", spec ? true : false)
+      // With no spec there is nothing to assess, so alignment is declined rather
+      // than claimed: a false here would read as "we checked and it is not
+      // aligned", which is a different and stronger claim than "not checked".
+      _t2(st, "kvBlockAligned", spec ? _kvBlockAligned(spec, ck.value, cv.value) : null)
+    }
+
+    // ── Tier 3 producer: models.ini ────────────────────────────────────
+    function _t3(store, name, value) {
+      if (!store || !store.needsMore(name)) return
+      if (isValidValue(name, value)) store.commit(name, value, stateEnum.EXACT, 3)
+      else store.decline(name, 3)
+    }
+
+    // Tier 3 acquires the RAW token and computes nothing: `all` / an integer is a
+    // stated offload count that mainGpu can turn into layers, while `auto` answers
+    // nothing at all — so `auto` is declined here rather than handed on as a
+    // string that _mtpSplit would have to reject.
+    //
+    // It needs no header and no probe, so it runs on every refresh for every
+    // loaded model rather than waiting for the GGUF read.
+    function _applyTier3(entry, store) {
+      var st = store || _storeFor(entry ? entry.modelPath : "")
+      if (!st) return
+      var sec = _presetSectionFor(entry)
+      var tok = (sec && sec["n-gpu-layers"] !== undefined) ? sec["n-gpu-layers"] : ""
+      _t3(st, "presetNgl", _isPresetSplitToken(tok) ? String(tok).trim() : null)
+    }
+
+    // ── Tier 4 producer: measured device/host memory ───────────────────
+    // Estimated, never exact: the probe samples the whole process, so its
+    // attribution is a model of the machine's accounting, not a reading of it.
+    function _t4(store, name, value) {
+      if (!store) return
+      if (!store.needsMore(name)) {
+        // Same-tier revision. The probe takes a fresh reading every refresh, and
+        // a later reading of the same producer supersedes the earlier one — the
+        // only way a live measurement can correct itself.
+        if (store.get(name).tier === 4) store.revise(name, value, stateEnum.ESTIMATED, 4)
+        return
+      }
+      if (isValidValue(name, value)) store.commit(name, value, stateEnum.ESTIMATED, 4)
+      // NOT declined on a missing reading. -1 here means "not measured yet", and
+      // the probe runs again: declining would exhaust the field to a durable "—"
+      // for a source that has not finished its first reading. Pending is the
+      // honest state, and it is also what the plan's `soleAttribution: "pending"`
+      // means.
+    }
+
+    // `list` is passed in rather than read from `runningModels`: this runs INSIDE
+    // the rebuild that produces runningModels, so reading the property here sees
+    // the PREVIOUS poll's set — and sole attribution is exactly the fact that
+    // changes when the loaded set changes. A stale length reported a lone model
+    // as "measured" on the poll that introduced a second one.
+    function _applyTier4(list) {
+      var l = list || runningModels || []
+      var sole = (l.length === 1)
+      for (var i = 0; i < l.length; i++) {
+        var st = _storeFor(l[i] ? l[i].modelPath : "")
+        if (!st) continue
+        _t4(st, "memBytes", serviceMemoryBytes)
+        _t4(st, "vramBytes", serviceVramBytes)
+        _t4(st, "soleAttribution", sole ? "measured" : "unattributable")
+        _settle(st)
+      }
+    }
+
+    function _t5(store, name, value) {
+      if (!store || !store.needsMore(name)) return
+      if (isValidValue(name, value)) store.commit(name, value, stateEnum.ESTIMATED, 5)
+      else store.decline(name, 5)
+    }
+
+    function _t6(store, name, value) {
+      if (!store || !store.needsMore(name)) return
+      if (isValidValue(name, value)) store.commit(name, value, stateEnum.EXACT, 6)
+      else store.decline(name, 6)
+    }
+
+    // ── KV architecture templates + block alignment ───────────────────
+    // GGUF keys are namespaced by architecture, so a header reader that hardcodes
+    // llama.block_count reads NOTHING from a model that does not use the llama
+    // prefix. A survey of the model set found seven distinct namespaces and in
+    // every one the geometry keys use the SAME suffixes, so the template is one
+    // suffix set against a set of prefixes. `qwen35moe` was then re-read
+    // directly: 17.7 GB header, 40 blocks, 2 KV heads, 256-wide K and V, and
+    // `full_attention_interval = 4` at the arch root — the last is what makes it
+    // a 10-layer KV cache rather than a 40-layer one, which is the whole reason
+    // it was once believed to be undescribable.
+    // The suffix set, spelled exactly as the reader above looks it up: the two
+    // period/pattern keys are NOT symmetric with the rest, and writing them as
+    // though they were is how a reader ends up looking for a key the converter
+    // never writes. `full_attention_interval` sits at the ARCH ROOT
+    // (`qwen35moe.full_attention_interval`, verified in that model's header)
+    // while the pattern list sits under `attention.` — see KS[5] and KS[12].
+    // This table is the allowlist TOKEN, not a lookup: the names below are the
+    // contract the reader in KS[]/NM[] implements.
+    readonly property var kvKeySuffixes: ({
+      blocks:     "block_count",
+      kvHeads:    "attention.head_count_kv",
+      kLen:       "attention.key_length",
+      vLen:       "attention.value_length",
+      embd:       "embedding_length",
+      swa:        "attention.sliding_window",
+      swaPattern: "attention.sliding_window_pattern",
+      fai:        "full_attention_interval",
+      recurrent:  "attention.recurrent_layers"
+    })
+
+    // An untemplated namespace → the derivation cannot describe the shape, and
+    // says so. It does not guess, and it does not fall back to a uniform-layer
+    // assumption: that produces a number which looks authoritative and is wrong,
+    // which is strictly worse than "~", because "~" tells the reader to disbelieve
+    // it. Coverage is a data question, not a correctness one.
+    //
+    // The list is the set of namespaces whose KV key semantics have been READ, and
+    // it is deliberately wider than the seven the original survey found on this
+    // machine. `_buildKvLayers` already carries per-architecture findings by name
+    // — `head_count_kv == 0` declares a cacheless layer for lfm2 / lfm2moe /
+    // bailingmoe3, and llama4 / cohere2 ship no window key yet still get a 4-layer
+    // SWA pattern — and a namespace cannot be reasoned about by name here while
+    // being declined as unknown there. Adding one is a data change: verify the
+    // suffixes against the file, then add the prefix.
+    readonly property var kvArchTemplates: [
+      // Surveyed on this machine (concern-1 §5.2.1).
+      "llama", "qwen35", "qwen35moe", "gemma4", "gemma4-assistant",
+      "muse-glimmer", "dflash", "phi3",
+      // Named in this file's own per-architecture reasoning, above.
+      "gemma3", "llama4", "cohere2", "lfm2", "lfm2moe", "bailingmoe3",
+      "deepseek2"]
+
+    function _kvArchTemplate(arch) {
+      var a = String(arch == null ? "" : arch).trim()
+      return kvArchTemplates.indexOf(a) >= 0 ? kvKeySuffixes : null
+    }
+
+    // Bytes per quant BLOCK (not per element). A q8_0 tensor of 128 elements is
+    // 136 bytes: 4 blocks × (2 B scale + 32 int8). A q8_0 tensor of 256 elements
+    // is 272 bytes. Testing the element count against these numbers would report
+    // alignment for shapes that are not aligned, which is the entire failure mode
+    // the gate exists to prevent.
+    readonly property var kvBlockSizeBytes: ({
+      f32: 4, f16: 2, bf16: 2,
+      q8_0: 34, q6_k: 210, q5_1: 24, q5_0: 22, q4_1: 20, q4_0: 18,
+      iq4_nl: 18, iq4_xs: 18, q3_k: 110, q2_k: 84
+    })
+
+    function _kvBlockBytes(t) {
+      var s = String(t == null ? "" : t).trim()
+      if (s === "") return 2                 // llama.cpp's f16 default
+      var b = kvBlockSizeBytes[s]
+      return (b === undefined) ? -1 : b       // unknown quant: cannot judge
+    }
+
+    // Every term of the sum is a whole number of its dtype's quant block,
+    // assessed per layer AND per tensor. K and V are separate tensors with
+    // separate dtypes and separate block sizes, so they are tested separately:
+    // testing their sum against one block size can report alignment when neither
+    // is aligned — and q5_0 K with q4_0 V is exactly the case where they differ.
+    function _kvBlockAligned(spec, cacheK, cacheV) {
+      if (!spec || !spec.layers || !spec.layers.length) return false
+      var kb = _kvBlockBytes(cacheK), vb = _kvBlockBytes(cacheV)
+      if (kb < 0 || vb < 0) return false
+      var kBits = _kvDtypeBits(cacheK), vBits = _kvDtypeBits(cacheV)
+      if (!(kBits > 0) || !(vBits > 0)) return false
+      var mult = (spec.kvUnified !== false)
+        ? 1 : ((isFinite(spec.parallel) && spec.parallel > 0) ? Math.round(spec.parallel) : 1)
+      for (var i = 0; i < spec.layers.length; i++) {
+        var L = spec.layers[i]
+        if (!(L.cells > 0) || !(L.kLen > 0)) return false
+        var kBytes = L.kLen * L.cells * kBits / 8 * mult
+        if (!(kBytes % kb === 0)) return false
+        if (L.hasV === false) continue         // MLA: K-only
+        if (!(L.vLen > 0)) return false
+        var vBytes = L.vLen * L.cells * vBits / 8 * mult
+        if (!(vBytes % vb === 0)) return false
+      }
+      return true
+    }
 
     // llama.cpp ftype enum → human label. Table verified against the installed
     // llama.h (build 10729); the value arrives via the GGUF header's
@@ -903,7 +2001,7 @@ exec "$cli" "$@"`
     // source is a snapshot of one upstream commit and wrong for every
     // architecture it misses (and stale the day upstream changes it), so the
     // header path below treats a missing pattern as unknown → null → "—", and
-    // the engine probe (Tier 3.5) answers instead. It knows every layout
+    // the engine probe (tier 6) answers instead. It knows every layout
     // because it IS the layout's owner.
 
     // Cell count for one KV layer (llama.cpp allocation law). Full-attention and
@@ -968,6 +2066,25 @@ exec "$cli" "$@"`
     // reuse earlier KV and are skipped; recurrent layers carry no context KV.
     function _buildKvLayers(g, mainLayers, ctx, args) {
       if (!g || !isFinite(ctx) || ctx <= 0) return null
+      // An UNTEMPLATED namespace declines. The header reader is prefix-generic —
+      // it looks up `<arch>.<suffix>` for whatever architecture the file declares,
+      // so the keys ARE found for an unknown namespace — but finding a key is not
+      // the same as knowing what it means. `attention.head_count_kv` is a KV-head
+      // count because the llama-family converters define it that way; a namespace
+      // nobody has templated may use the same suffix for a different quantity, and
+      // a number computed from it looks authoritative while being wrong, which is
+      // strictly worse than "~" because "~" tells the reader to disbelieve it.
+      //
+      // This is the same reason the reader must not fall back to a uniform-layer
+      // assumption: a guessed layout for a file whose layout is unknown is the
+      // failure this whole design exists to prevent. Declining routes to tier 6,
+      // which answers from the engine itself.
+      //
+      // The check lives HERE rather than at the call site so every present and
+      // future caller is gated by one rule; kvArchTemplates is otherwise dead
+      // code, and dead code that documents an intent nothing enforces is worse
+      // than no code at all.
+      if (_kvArchTemplate(g.arch) === null) return null
       var m = (isFinite(mainLayers) && mainLayers > 0) ? Math.round(mainLayers)
             : ((isFinite(g.bc) && g.bc > 0) ? Math.round(g.bc) : -1)
       if (m <= 0) return null
@@ -1108,56 +2225,161 @@ exec "$cli" "$@"`
       return Math.round(bytes)
     }
 
-    // Where the KV cache — and the context it holds — physically lives:
-    // "GPU", "CPU" or "" (unknown, caller keeps its own fallback).
+    // ── KV-cache placement: the tier-4 ladder ───────────────────────────
+    // Where the KV cache — and the context it holds — physically lives.
     //
     // Every branch is either a direct statement from the configuration or a
     // measured fact, never a model of the engine's placement heuristic:
-    //   noKvOffload  Tier 1, exact — --no-kv-offload pins the cache to host RAM.
-    //   gpuLayers===0 Tier 1, exact — a stack with no layer on the device has no
-    //                            cache there either.
-    //   a fully offloaded stack (gpuLayers >= mainLayers) is deliberately NOT a
-    //   branch: it looks like the mirror of gpuLayers===0, but the running
-    //   gemma-4-26b-a4b-qat worker here has all 30 layers on the device with its
-    //   2,879 MiB cache in host RAM, because llama.cpp sizes the KV buffer
-    //   against its own fit budget rather than following the layer buffers. Only
-    //   a measurement can place that cache, so partial and total offload both
-    //   fall through to the branches below.
-    //   memBytes >= kvBytes
-    //               Direct measurement. The cache is one contiguous allocation
-    //               that lives either in a device buffer or in anonymous host
-    //               memory (llama.cpp maps model weights with CPU_Mapped and the
-    //               KV cache with plain CPU buffers, so a KV-sized anon+shmem
-    //               block can only be the cache). Finding one proves host RAM.
-    //   vramBytes > 0
-    //               The cache is in no host block that big, and the service does
-    //               hold device memory, so it is on the device. Proved by
-    //               exhaustion over those two possibilities — deliberately NOT
-    //               by comparing free VRAM against kv+fit-target, which needs
-    //               llama.cpp's internal fit budget (larger and version-specific
-    //               than any --fit-target we can read) and misreports models it
-    //               deliberately kept on the host.
-    //   sole=false     Multi-model router: the DRAM/VRAM readings are the whole
-    //               cgroup's, so neither measurement can be attributed to this
-    //               model and only the exact branches above may answer.
-    // Pure: any missing input → "" (unknown), never throws.
-    function _kvPlacement(noKvOffload, gpuLayers, mainLayers, kvBytes, p) {
-      if (noKvOffload === true) return "CPU"
-      var g = Number(gpuLayers)
-      var main = Number(mainLayers)
-      if (isFinite(main) && main > 0 && isFinite(g) && g === 0) return "CPU"
-      var kv = Number(kvBytes)
-      if (!(isFinite(kv) && kv > 0)) return ""
-      p = p || {}
-      if (p.sole === false) return ""
-      var mem = Number(p.memBytes)
-      if (isFinite(mem) && mem >= 0) {
-        if (mem >= kv) return "CPU"
-        var v = Number(p.vramBytes)
-        if (isFinite(v) && v > 0) return "GPU"
-        return "CPU"                     // no device context: the cache is in RAM
+    //   noKvOffload / -ngl 0   Tier 1, exact — flags that pin the cache to host
+    //                            RAM. A fact from configuration, not an
+    //                            inference, so it needs no attribution and is
+    //                            answered before the attribution gate.
+    //   mem === 0 && vram >= kv Tier 4, exact — nothing in host at all and the
+    //                            device holds a cache's worth. The ONLY exact
+    //                            "GPU": every other GPU answer needs a bound.
+    //   vram === 0 && mem >= kv Tier 4, exact — the mirror. vram === 0 is a
+    //                            *successful reading of zero*, which is why it is
+    //                            unreachable on a machine with no NVIDIA device:
+    //                            there the script prints nothing and the value
+    //                            stays -1.
+    //   0 < mem < kv && vram > 0
+    //                            Tier 4, "~" — a split is proven, its ratio is
+    //                            not. At most `mem` of the cache can be in host,
+    //                            at least `kv - mem` must be on the device.
+    //   mem >= kv && vram > 0  Tier 4, declined — the device holds memory and
+    //                            host anon holds at least a whole cache, but the
+    //                            reading cannot separate the cache from the
+    //                            weights. This is the gemma case, and the old
+    //                            `if (mem >= kv) return "CPU"` compared a
+    //                            threshold rather than making a measurement.
+    //   mem < 0 or vram < 0    not yet, not a zero — "wait", never a placement.
+    //   soleAttribution
+    //                            Multi-model router: the DRAM/VRAM readings are
+    //                            the whole cgroup's, so neither can be
+    //                            attributed to this model. Only the flag branches
+    //                            may answer.
+    //
+    // A fully offloaded stack (ngl === "all", or every layer on the device) is
+    // deliberately NOT a branch: it looks like the mirror of -ngl 0, but the
+    // running gemma-4-26b-a4b-qat worker here has all 30 layers on the device
+    // with its 2,879 MiB cache in host RAM, because llama.cpp sizes the KV buffer
+    // against its own fit budget rather than following the layer buffers.
+    //
+    // PURE: reads a readings record, returns { value, marker, action } and never
+    // touches the store, so every ladder test is a plain object literal with no
+    // harness and no async waiting. `""` is not an answer — it is "indeterminate",
+    // and the marker says how indeterminate.
+    //   r = { memBytes, vramBytes, kvBytes, soleAttribution, noKvOffload, ngl,
+    //         answered }
+    // Returns { value: "GPU" | "CPU" | "GPU/CPU" | "",
+    //           marker: "" | "~" | "—",
+    //           action: "commit" | "decline" | "wait" }
+    function _kvPlacement(r) {
+      r = r || ({})
+
+      // Already answered: echoing the existing answer keeps this total and is
+      // safe because the store's effective-tier rule refuses a weaker commit.
+      if (r.answered) return { value: r.answered.value,
+                              marker: r.answered.marker, action: "commit" }
+
+      // Branch 0 — a flag answers without needing any attribution.
+      var br = _flagBranchKVLocation(r)
+      if (br) return { value: br, marker: "", action: "commit" }
+
+      // Branch 1 — attribution gate. Both closed states render "~" *now*; the
+      // difference is the action, and a declined field only becomes a durable "—"
+      // once the store exhausts it. "pending" is the one that must stay open.
+      var att = r.soleAttribution
+      if (!att || att === "pending" || att === "unattributable")
+        return { value: "", marker: "~",
+                 action: (att === "unattributable") ? "decline" : "wait" }
+
+      // Sentinel discipline: -1 means "not measured" and is carried through as
+      // -1, so it can never compare equal to 0 in a rung and fake a reading.
+      var mem  = _num(r, "memBytes", -1)
+      var vram = _num(r, "vramBytes", -1)
+      var kv   = _num(r, "kvBytes", -1)
+
+      if (kv <= 0) return { value: "", marker: "—", action: "decline" }
+
+      // Rung 1a — nothing in host RAM at all, and the device is holding at least
+      // a cache's worth. The only exact GPU.
+      if (mem === 0 && vram >= kv) return { value: "GPU", marker: "", action: "commit" }
+
+      // Rung 1b — the mirror of 1a. The device read SUCCEEDED and returned zero,
+      // so there is no device to hold the cache; host anon is at least a whole
+      // cache. NOT reachable on a machine with no NVIDIA device: there the script
+      // prints nothing and vram stays -1, so it never reaches this branch.
+      if (vram === 0 && mem >= kv) return { value: "CPU", marker: "", action: "commit" }
+
+      // Contradiction — nothing in host at all, and the device is not holding
+      // even a whole cache, so the cache is in neither place we can see. One of
+      // the two readings is wrong; the honest answer is that we do not know.
+      if (mem === 0 && vram < kv) return { value: "", marker: "—", action: "decline" }
+
+      // Contradiction — the device provably holds nothing, and host anon is
+      // provably SMALLER than the cache, so again it is in neither place.
+      if (vram === 0 && mem > 0 && mem < kv)
+        return { value: "", marker: "—", action: "decline" }
+
+      // Rung 2 — host anon is smaller than the cache, so the cache is provably
+      // not all in host, and it is provably not all on the device either (a
+      // device reading of zero is already excluded above). A genuine split,
+      // bounded but not stated. Deliberately does NOT divide: putting `mem` in
+      // the CPU total and `kv - mem` in the GPU total is not an estimate of
+      // where the cache is, because mem also holds the CPU-resident weights, the
+      // compute buffers and the allocator slack.
+      //
+      // vram is NOT required. A -1 device reading is a missing measurement, not
+      // a zero, so it cannot contradict anything; host anon alone already proves
+      // the split.
+      if (mem > 0 && mem < kv)
+        return { value: "GPU/CPU", marker: "~", action: "commit" }
+
+      // Rung 3 — a device IS holding memory, and host anon is at least a whole
+      // cache. Not "CPU": the reading cannot separate the cache from the weights.
+      if (mem >= kv && vram > 0)
+        return { value: "", marker: "—", action: "decline" }
+
+      // No reading (mem < 0, vram < 0). NOT a placement. "wait", not "decline":
+      // a sentinel is a missing measurement, and declining would let the field
+      // exhaust to a durable "—" while the probe is still out.
+      return { value: "", marker: "~", action: "wait" }
+    }
+
+    // Same readings record, so this stays pure too. Kept separate only because it
+    // is separately testable: the flag branch must answer even when attribution is
+    // unattributable, which is a property of the branch, not a rung.
+    function _flagBranchKVLocation(r) {
+      if (r && r.noKvOffload === true) return "CPU"
+      // "auto" and "all" are NOT 0. parseInt("all") is NaN and would pass a naive
+      // `!== 0` test; the explicit exclusion is the guard.
+      var n = r ? r.ngl : undefined
+      if (n !== undefined && n !== null && n !== "" && n !== "auto" && n !== "all") {
+        if (parseInt(n, 10) === 0 && _num(r, "kvBytes", -1) > 0) return "CPU"
       }
-      return ""
+      return null
+    }
+
+    // Sentinel-preserving read. A missing key and a -1 reading are both "no
+    // measurement" and both stay -1, so a rung can never mistake absence for 0.
+    function _num(r, name, dflt) {
+      var v = (r || ({}))[name]
+      return (typeof v === "number" && isFinite(v)) ? v : dflt
+    }
+
+    // The ladder's readings record from the entry-shaped inputs the pre-store
+    // call sites still hold. Deleted with the legacy resolver: once the store
+    // owns these values, the derivation builds the record itself.
+    function _kvLocationOf(noKvOffload, gpuLayers, kvBytes, p) {
+      p = p || {}
+      var att = (p.sole === false) ? "unattributable" : "measured"
+      var res = _kvPlacement({
+        memBytes: p.memBytes, vramBytes: p.vramBytes, kvBytes: kvBytes,
+        soleAttribution: att, noKvOffload: noKvOffload === true,
+        ngl: (isFinite(Number(gpuLayers)) && Number(gpuLayers) === 0) ? "0" : null,
+        answered: null })
+      return res.action === "commit" ? res.value : ""
     }
 
     // GPU/CPU weight bytes for display. Prefer the exact layer-ratio split when the
@@ -1211,55 +2433,97 @@ exec "$cli" "$@"`
     // 5", and the `~`-when-any-input-was-`~` rule are unit-testable in one
     // place. entry = a loaded-model entry; p = { vramBytes, memBytes,
     // presetSection } (all optional). Pure — never throws, never probes.
+    // The DISPLAY's reader, and nothing but a reader.
+    //
+    // It used to be the resolver: it re-derived the split from `entry.ngl`, the
+    // preset and the live VRAM reading, and re-implemented the KV byte fallback —
+    // so the view and the resolver could disagree, and neither owned precedence.
+    // Now every field comes from `store.read(name)`, which means:
+    //
+    //  - `pending` and `absent` reach the view as DIFFERENT states. They used to
+    //    collapse into one "—" because this function invented its own markers;
+    //    "…" (in flight) and "—" (looked for, not found) are now distinguishable,
+    //    which is the only reason a probe still running can render honestly.
+    //  - The glyph is mapped once, in the store. This function never builds one.
+    //  - A store that does not exist yet (the model's first render, before any
+    //    tier has answered) reads as pending, not as an error.
+    //
+    // Shape is unchanged, so ModelsSection.qml keeps calling it unchanged.
     function _resolveFieldSources(entry, p) {
       var e = entry || {}
-      p = p || {}
+      var st = _stores[String(e.modelPath == null ? "" : e.modelPath)] || null
       var r = {}
-      // Quant row: params = Tier-1 meta.n_params (exact), quant = Tier-2 GGUF
-      // general.file_type (exact).
-      r.params = e.nParams >= 0
-        ? { tier: 1, value: e.nParams, marker: "" }
-        : { tier: null, value: -1, marker: "\u2014" }
-      r.quant = e.ftype >= 0
-        ? { tier: 2, value: e.ftype, marker: "" }
-        : { tier: null, value: -1, marker: "\u2014" }
-      // Total layers: Tier-2 GGUF block_count (exact).
-      r.totalLayers = e.totalLayers >= 0
-        ? { tier: 2, value: e.totalLayers, marker: "" }
-        : { tier: null, value: -1, marker: "\u2014" }
-      // GPU/CPU split: Tier 1 (api) -> Tier 5 (preset) -> Tier 3 (probe) -> "—".
-      // A stored api/preset split is authoritative; a stored probe split and an
-      // unresolved entry both take the live Tier-3 estimate so a fresh VRAM
-      // reading renders without waiting for the next /v1/models poll.
-      var ngl = String(e.ngl == null ? "" : e.ngl).trim()
-      if (ngl !== "" && e.mainGpu !== null) {
-        r.gpuSplit = { tier: e._gpuSplitSource === "probe" ? 3
-                     : e._gpuSplitSource === "preset" ? 5 : 1,
-                       value: { mainGpu: e.mainGpu, mainCpu: e.mainCpu },
-                       marker: e._gpuSplitSource === "probe" ? "~" : "" }
-      } else if (p.presetSection && _isPresetSplitToken(p.presetSection["n-gpu-layers"])) {
-        r.gpuSplit = { tier: 5, value: null, marker: "" }   // resolved in _applyGguf
-      } else if (p.vramBytes >= 0) {
-        var kv = _resolveKvBytes(e)
-        var on = _kvPlacement(e.noKvOffload === true, e.mainGpu, e.mainLayers, kv.value, p)
-        var est = _estimateSplitFromProbes(
-          e.sizeBytes > 0 ? e.sizeBytes : 0,
-          e.totalLayers, p.vramBytes,
-          on === "GPU" ? kv.value : 0, e.computeBytes)
-        r.gpuSplit = est
-          ? { tier: 3,
-              value: { mainGpu: est.gpuLayers, mainCpu: est.cpuLayers },
-              marker: "~" }
-          : { tier: null, value: null, marker: "\u2014" }
-      } else {
-        r.gpuSplit = { tier: null, value: null, marker: "\u2014" }
+      // -1 is the display's "no reading"; a null store value becomes -1 here.
+      // That coercion is display-side on purpose: it is not a store value.
+      function numOr(v) { return (typeof v === "number" && isFinite(v)) ? v : -1 }
+      function f(name) {
+        if (st) return st.read(name)
+        return { value: null, state: stateEnum.PENDING, tier: null,
+                 derived: false, glyph: stateGlyph.pending }
       }
-      // Weights follow the split; the marker stays "~" whenever any input was "~".
-      r.weightBytes = _resolveWeights(e, r.gpuSplit, p)
-      // KV cache: Tier 3.5 when llama.cpp's own accounting answered (exact, no
-      // marker), else the Tier-4 header derivation ("~"), else "\u2014".
-      r.kvBytes = _resolveKvBytes(e)
-      r.kvDtype = { tier: 1, value: { k: e.cacheK, v: e.cacheV }, marker: "" }
+      function shaped(x, dflt) {
+        return { tier: x.tier, state: x.state, marker: x.glyph, glyph: x.glyph,
+                 derived: x.derived, value: numOr(x.value, dflt) }
+      }
+      // The string fields (a placement, a dtype, a spec type) keep their VALUE:
+      // numOr would turn every one of them into the -1 the numeric rows use.
+      function shapedStr(x) {
+        return { tier: x.tier, state: x.state, marker: x.glyph, glyph: x.glyph,
+                 derived: x.derived,
+                 value: (x.value === null || x.value === undefined) ? "" : String(x.value) }
+      }
+
+      r.params      = shaped(f("nParams"), -1)
+      r.quant       = shaped(f("ftype"), -1)
+      r.totalLayers = shaped(f("totalLayers"), -1)
+      r.mainLayers  = shaped(f("mainLayers"), -1)
+      r.mtpLayers   = shaped(f("mtpLayers"), -1)
+      r.coreSize    = shaped(f("coreSize"), -1)
+      r.mtpSizeBytes = shaped(f("mtpSizeBytes"), -1)
+      r.draftSizeBytes = shaped(f("draftSizeBytes"), -1)
+      r.sizeBytes   = shaped(f("sizeBytes"), -1)
+      r.contextLen  = shaped(f("contextLen"), -1)
+      r.kvBytes     = shaped(f("kvBytes"), -1)
+      r.kvLocation  = shapedStr(f("kvLocation"))
+      r.mainGpu     = shaped(f("mainGpu"), -1)
+      r.mainCpu     = shaped(f("mainCpu"), -1)
+      r.mtpGpu      = shaped(f("mtpGpu"), -1)
+      r.mtpCpu      = shaped(f("mtpCpu"), -1)
+      r.cacheK      = shapedStr(f("cacheK"))
+      r.cacheV      = shapedStr(f("cacheV"))
+      // Tier 5's per-device cache split. Kept beside the cache size because the
+      // totals below cannot split a cache without it.
+      r.kvGpuBytes  = shaped(f("kvGpuBytes"), -1)
+      r.kvCpuBytes  = shaped(f("kvCpuBytes"), -1)
+      r.computeBytes = shaped(f("computeBytes"), -1)
+      r.vramBytes   = shaped(f("vramBytes"), -1)
+      r.memBytes    = shaped(f("memBytes"), -1)
+      // Spec type is a string the Draft row shows verbatim.
+      r.specType = shapedStr(f("specType"))
+
+      // gpuSplit is a COMPOSITE, so it carries its own worst-of state rather than
+      // borrowing one field's: a GPU count that is exact next to a CPU count that
+      // is estimated renders "~" for both.
+      var g = r.mainGpu, c = r.mainCpu
+      var splitState = worseState(g.state === stateEnum.PENDING ? undefined : g.state,
+                                  c.state === stateEnum.PENDING ? undefined : c.state)
+      r.gpuSplit = { tier: g.tier, state: splitState, marker: stateGlyph[splitState],
+                     glyph: stateGlyph[splitState],
+                     derived: g.derived || c.derived,
+                     value: (g.value < 0) ? null : { mainGpu: g.value, mainCpu: c.value } }
+
+      var wg = f("weightGpu"), wc = f("weightCpu")
+      r.weightBytes = { gpu: numOr(wg.value), cpu: numOr(wc.value),
+                        gpuState: wg.state, cpuState: wc.state,
+                        gpuMarker: wg.glyph, cpuMarker: wc.glyph }
+      // The dtype pair is a composite too: a block that renders on one resolved
+      // dtype and vanishes on the other makes the row's SHAPE depend on the data.
+      var ck = r.cacheK, cv = r.cacheV
+      r.kvDtype = { tier: ck.tier, state: ck.state,
+                    marker: (ck.state === stateEnum.ABSENT && cv.state === stateEnum.ABSENT)
+                      ? stateGlyph.absent : stateGlyph.pending,
+                    value: { k: (ck.state === stateEnum.ABSENT) ? "" : String(ck.value),
+                             v: (cv.state === stateEnum.ABSENT) ? "" : String(cv.value) } }
       return r
     }
 
@@ -1523,10 +2787,35 @@ exec "$cli" "$@"`
           if (cachedDraft !== undefined) _applyGgufDraft(e, cachedDraft)
           else _queueGguf(e.draftPath)
         }
-        // Tier 3.5: queue the engine's own KV accounting for this model. Runs off
-        // the API-reported flags (context size, cache dtypes, ubatch, parallel)
-        // because those, not the header, are what define the allocation.
-        _queueKvProbe(e)
+      }
+      // The store is the resolver's own state, keyed by path: prune to the loaded
+      // set, then let tier 1 offer its readings. Tier 1 runs FIRST here so the
+      // values it commits are already whole (a _applyGguf above may have filled a
+      // field this poll did not carry) and the derivations that settle below see
+      // the API flags. Tiers 3 and 4 follow: both are refresh-rate sources that
+      // never wait for a header.
+      _pruneStores(out)
+      _applyTier1(out)
+      for (var t3i = 0; t3i < out.length; t3i++) _applyTier3(out[t3i], null)
+      _applyTier4(out)
+      // Tier 6 (the engine's own KV accounting) and tier 5 (the projection
+      // runner) are QUEUED here rather than in the loop above: both read the
+      // store, and both settle permanently when an input is missing, so a queue
+      // that ran before tier 1 committed would judge them against an empty store.
+      // On a model's very first poll that is the only poll they get. The probe's
+      // gate would merely skip and retry a poll later; the fit's would answer
+      // "no projection point" for a model that was about to have one, and that
+      // answer is permanent.
+      for (var qi = 0; qi < out.length; qi++) {
+        var qe = out[qi]
+        if (!qe || qe.modelPath === "") continue
+        // Tier 6 runs off the API-reported flags (context size, cache dtypes,
+        // ubatch, parallel) because those, not the header, define the allocation.
+        _queueKvProbe(qe)
+        // Tier 5. Queued, not called: the gate is inside _queueKvFit, because a
+        // process per model per refresh is the failure mode this whole tier has
+        // to be able to decline.
+        _queueKvFit(qe)
       }
       return out
     }
@@ -1743,23 +3032,29 @@ exec "$cli" "$@"`
     return false
   }
 
-  // ── Idle tracking (issue #6 auto-unload source) ────────────────────
-  // `firstLoadedId` is the id of the first model /v1/models reports loaded
+// ── Idle tracking (issue #6 auto-unload source) ────────────────────
+// `firstLoadedId` is the id of the first model /v1/models reports loaded
   // ("" = none). The inactivity baseline starts at first observation of a
   // model and only advances on observed activity (is_processing true, or an
-  // id_task change between polls) — never backwards. Disabled (0) or nothing
-  // loaded → tracking is reset and no /slots poll runs.
+  // id_task change between polls) — never backwards.
+  //
+  // The /slots poll is no longer only an idle-tracking source: its `n_ctx` is
+  // tier 1's exact, authoritative answer for the ALLOCATED context, which argv
+  // cannot give — `--ctx-size 0` means "let fit decide", and this machine's
+  // `qwen3.8-27b-fast` really does report a resolved 102912. So the poll runs
+  // whenever a model is loaded, with auto-unload on or off; only the activity
+  // bookkeeping is conditional on it.
   function _syncIdleTracking(firstLoadedId) {
     var id = String(firstLoadedId == null ? "" : firstLoadedId)
-    if (id !== "" && !/^[A-Za-z0-9._\-/]+$/.test(id)) id = ""
-    if (unloadInactivitySec <= 0 || id === "") {
+    if (!/^[A-Za-z0-9._\-/]+$/.test(id)) id = ""
+    if (id === "") {
       _resetIdleTracking()
       return
     }
     if (id !== _slotsModelId) {
       _slotsModelId = id
       _lastSig = ""
-      _lastActivityMs = Date.now()
+      _lastActivityMs = (unloadInactivitySec > 0) ? Date.now() : -1
     }
     if (!slotsProcess.running) launch(slotsProcess, slotsWatchdog)
   }
@@ -1944,7 +3239,7 @@ exec "$cli" "$@"`
             mtpGpu: 0,
             mtpCpu: 0,
             kvCacheBytes: -1,      // Tier 4: derived from the GGUF header
-            kvBytesExact: -1,      // Tier 3.5: llama.cpp's own accounting
+            kvBytesExact: -1,      // tier 6: llama.cpp's own accounting
             kvLayersExact: -1,     //   ...including how many layers it cached
             computeBytes: -1,      //   device graph reserve, same source
             until: "loaded"
@@ -1973,7 +3268,7 @@ exec "$cli" "$@"`
   // ── GGUF header read (llama.cpp): totalLayers + KV-cache inputs ──────
   // Bounded no-load read of the model file's own metadata. Results are cached
   // by path so a running model is re-resolved synchronously on every later
-  // ── Tier 3.5: engine KV accounting probe ─────────────────────────
+  // ── Tier 6: engine KV accounting probe ───────────────────────────
   // One short `llama-cli` run per (model, KV-flag signature) answers what no
   // file header can: the exact KV allocation this engine actually builds for
   // this architecture, at this context size, with these cache dtypes. llama.cpp
@@ -2053,6 +3348,13 @@ exec "$cli" "$@"`
     if (backend !== "llama.cpp") return
     var sig = _kvProbeSignatureFor(entry)
     if (sig === "") return
+    // Need-gating: the oracle is 3-45 s of subprocess, so it runs only for a
+    // shape the header could not describe or could not prove block-aligned. A
+    // described, aligned shape is settled by derivation and must never pay for
+    // the probe — which is the whole reason `kvDescribed`/`kvBlockAligned` are
+    // committed rather than kept private.
+    var st = _storeFor(entry.modelPath)
+    if (st && !checkTier6Values(st)) return
     if (_kvProbeCache[sig] !== undefined) return          // known: exact or already failed
     if (_kvProbeSignature === sig) return                 // already queued/running
     for (var i = 0; i < _kvProbeQueue.length; i++)
@@ -2234,8 +3536,310 @@ exec "$cli" "$@"`
       // measured split estimate, so recompute it now that they are known.
       _applyProbeSplit(e, e.totalLayers)
       changed = true
+      // Tier 6 on the store: the engine's own accounting is exact, and it is the
+      // fallback producer for a shape the header could not describe.
+      var st = _storeFor(e.modelPath)
+      if (st) {
+        _t6(st, "kvBytes", res.kvBytes)
+        _settle(st)
+      }
     }
     if (changed) runningModels = arr.slice()
+  }
+
+  // ── Tier 5: engine projection (llama-fit-params) ────────────────────
+  //
+  // Three fields, and only three: kvGpuBytes, kvCpuBytes, computeBytes. It does
+  // NOT commit weightGpu/weightCpu (those are derivations over coreSize and the
+  // split — a projection reporting its own input back as a finding) and it does
+  // NOT commit kvBytes (that belongs to the tier-2 derivation and tier 6, and
+  // freezing it here would pin it at a 1 MiB-rounded projection).
+  property bool _fitProbed: false
+  property bool _tier5Available: true     // optimistic until exit 97 says otherwise
+  property var _kvFitCache: ({})          // signature -> { ok, parsed }
+  property var _kvFitQueue: []            // model paths waiting, FIFO
+  property int _kvFitRunning: 0           // single-flight guard
+  property string _kvFitPath: ""          // model of the projection in flight
+  property string _kvFitSig: ""
+  property int _kvFitNgl: -1
+  property var _kvFitTail: []             // the args that vary, after the model
+  property string _kvFitBuffer: ""
+
+  // The tool's cache dtypes. An invalid value is an immediate exit-1 parse error
+  // that would be indistinguishable from a real abort, so an unsupported dtype is
+  // DROPPED rather than passed — the projection then sizes at f16, which is
+  // visibly an estimate rather than a hard failure.
+  readonly property var fitCacheTypes: ["f32", "f16", "bf16", "q8_0", "q4_0",
+                                        "q4_1", "iq4_nl", "q5_0", "q5_1"]
+
+  function _fitCacheTypeOk(v) {
+    var s = String(v == null ? "" : v).trim()
+    if (s === "") return false
+    for (var i = 0; i < fitCacheTypes.length; i++)
+      if (fitCacheTypes[i] === s) return true
+    return false
+  }
+
+  function _fitInt(v) {
+    var s = String(v == null ? "" : v).trim()
+    if (!/^-?[0-9]+$/.test(s)) return null
+    var n = parseInt(s, 10)
+    return isFinite(n) ? n : null
+  }
+
+  // Which N to decompose at. Cheapest definitive first, and tier 5 NEVER chooses
+  // one -- with `--fit off` it has no offload count of its own, only the one it is
+  // given. `all` becomes the layer count rather than the literal token, because
+  // `-ngl` must always be an exact integer.
+  function _fitNglFor(store) {
+    if (!store) return null
+    var n = store.get("ngl")
+    if (n && n.state !== stateEnum.PENDING && n.state !== stateEnum.ABSENT) {
+      var t1 = _fitInt(n.value)                       // "auto" → null, correctly
+      if (t1 !== null && t1 >= 0) return t1
+    }
+    var p = store.get("presetNgl")
+    if (p && p.state !== stateEnum.PENDING && p.state !== stateEnum.ABSENT) {
+      var tok = String(p.value == null ? "" : p.value).trim()
+      if (tok === "all") {
+        var tl = store.get("totalLayers")
+        if (tl && tl.state === stateEnum.EXACT) return _fitInt(tl.value)
+      } else {
+        var t3 = _fitInt(tok)
+        if (t3 !== null && t3 >= 0) return t3
+      }
+    }
+    // The measured estimate is the only N there usually is: tier 5 is a
+    // PRECONDITION of the estimate, not a fallback after it, because there is no
+    // N to fail from when nothing else supplied one.
+    var g = store.get("mainGpu")
+    if (g && g.state === stateEnum.ESTIMATED) {
+      var est = _fitInt(g.value)
+      if (est !== null && est >= 0) return est
+    }
+    return null
+  }
+
+  function _fitDtype(store, name) {
+    var e = store ? store.get(name) : null
+    var v = (e && e.state !== stateEnum.PENDING && e.state !== stateEnum.ABSENT)
+      ? e.value : ""
+    return _fitCacheTypeOk(v) ? String(v).trim() : ""
+  }
+
+  function _fitCtxFor(store) {
+    var e = store ? store.get("contextLen") : null
+    var n = (e && e.state !== stateEnum.PENDING && e.state !== stateEnum.ABSENT)
+      ? parseInt(String(e.value), 10) : NaN
+    return isFinite(n) && n > 0 ? n : 0
+  }
+
+  // Everything that changes the answer, and therefore the cache key: the same
+  // shape as _kvProbeSignatureFor. A model is re-projected only when one of these
+  // actually moved.
+  function _fitSignatureFor(path) {
+    var st = _storeFor(path)
+    var n = st ? _fitNglFor(st) : null
+    return [String(path), (n === null ? "none" : n),
+            _fitDtype(st, "cacheK"), _fitDtype(st, "cacheV"),
+            _fitCtxFor(st)].join("|")
+  }
+
+  // The tail the wrapper receives after `bash -c kvFitScript dash`:
+  // $1 binary, $2 -ngl, $3 -m model, then whatever varies. --fit off,
+  // --fit-print on and -ngl are the script's, deliberately.
+  function _buildFitArgv(modelPath, ngl, cacheK, cacheV, ctx) {
+    var a = [kvFitBinary, String(ngl), String(modelPath)]
+    if (_fitCacheTypeOk(cacheK)) a.push("-ctk", String(cacheK).trim())
+    if (_fitCacheTypeOk(cacheV)) a.push("-ctv", String(cacheV).trim())
+    if (ctx > 0) a.push("-c", String(ctx))
+    // NOT passed: -fitt/--fit-target (its default is a margin and would inflate
+    // the projection) and --flash-attn (the draft's recorded abort).
+    return a
+  }
+
+  // ── The output format, captured on this machine (llama.cpp b10729) ────
+  //   llama_fit_params: printing estimated memory in MiB to stdout (device, model, context, compute) ...
+  //   CUDA0 3997 5160 1860
+  //   Host 7140 11373 286
+  // Integer MiB per cell, devices CUDA0 (and CUDA1 on a second card) plus Host.
+  // A 4096-token f16 cache printing `context` = 2 is the proof that the column is
+  // the KV bytes and not something else.
+  function _fitIsPreamble(s) {
+    return String(s == null ? "" : s).trim().indexOf("llama_fit_params:") === 0
+  }
+
+  // A total/summary row is recognised so it can never be double-counted with the
+  // per-device rows: a total that also summed the devices would be silently wrong
+  // rather than loudly wrong.
+  function _fitIsTotalRow(dev) {
+    var s = String(dev).toLowerCase()
+    return s === "total" || s === "totals" || s === "all" || s === "sum"
+  }
+
+  // Only `Host` is host. An UNRECOGNISED name defaults to the device side, and
+  // the asymmetry is deliberate: a device row mis-counted as host is an
+  // unrecoverable split error, while a host row mis-counted as a device shows up
+  // immediately as an implausible device total.
+  function _fitIsHost(dev) {
+    return String(dev) === "Host"
+  }
+
+  function _fitRowMib(s) {
+    if (!/^[0-9]+(\.[0-9]+)?$/.test(String(s))) return null
+    var m = parseFloat(String(s))
+    return isFinite(m) ? m : null
+  }
+
+  // One line in, one row out, or null. A short row or a non-numeric cell is
+  // SKIPPED, never zero-filled: an invented 0 would read as "nothing on the
+  // device" and is worse than no row at all.
+  function _parseFitRow(line) {
+    var s = String(line == null ? "" : line).trim()
+    if (s === "" || _fitIsPreamble(s)) return null
+    var t = s.split(/\s+/)
+    if (t.length < 4) return null
+    if (_fitIsTotalRow(t[0])) return null
+    var m = _fitRowMib(t[1]), c = _fitRowMib(t[2]), k = _fitRowMib(t[3])
+    if (m === null || c === null || k === null) return null
+    return { device: t[0], host: _fitIsHost(t[0]),
+             modelMiB: m, contextMiB: c, computeMiB: k }
+  }
+
+  // The ONLY MiB→bytes conversion in the tier-5 path. Everything downstream — the
+  // store, the ladder, the per-device totals — is bytes, exactly as tier 6 does
+  // it. Two unit systems meeting twice is how the draft ended up comparing MiB
+  // against serviceVramBytes.
+  function _fitMibToBytes(v) { return Math.round(v * 1048576) }
+
+  function parseFitParams(text) {
+    var lines = String(text == null ? "" : text).split("\n")
+    var rows = []
+    for (var i = 0; i < lines.length; i++) {
+      var r = _parseFitRow(lines[i])
+      if (r) rows.push(r)
+    }
+    if (rows.length === 0) return null
+    var deviceRows = [], hostRows = []
+    var dm = 0, dc = 0, dk = 0, hm = 0, hc = 0, hk = 0
+    for (var j = 0; j < rows.length; j++) {
+      if (rows[j].host) {
+        hostRows.push(rows[j])
+        hm += rows[j].modelMiB; hc += rows[j].contextMiB; hk += rows[j].computeMiB
+      } else {
+        deviceRows.push(rows[j])
+        dm += rows[j].modelMiB; dc += rows[j].contextMiB; dk += rows[j].computeMiB
+      }
+    }
+    return { rows: rows, deviceRows: deviceRows, hostRows: hostRows,
+             deviceTotal: { model: _fitMibToBytes(dm), context: _fitMibToBytes(dc),
+                            compute: _fitMibToBytes(dk) },
+             hostTotal:   { model: _fitMibToBytes(hm), context: _fitMibToBytes(hc),
+                            compute: _fitMibToBytes(hk) } }
+  }
+
+  function _declineTier5(store) {
+    if (!store) return
+    var names = capabilities[5]
+    for (var i = 0; i < names.length; i++) _t5(store, names[i], null)
+    _settle(store)
+  }
+
+  // Gated, not unconditional: an unguarded refresh spawns a process per model per
+  // refresh, and every model asks for its own run.
+  function _queueKvFit(entry) {
+    if (!entry || entry.modelPath === "") return
+    if (backend !== "llama.cpp") return
+    var st = _storeFor(entry.modelPath)
+    if (!st) return
+    if (_tier5Available === false) { _declineTier5(st); return }
+    if (!checkTier5Values(st)) return                  // nothing outstanding
+    var ngl = _fitNglFor(st)
+    if (ngl === null) { _declineTier5(st); return }   // no projection point
+    var sig = _fitSignatureFor(entry.modelPath)
+    if (_kvFitCache[sig] !== undefined) return         // known: answer or declined
+    if (_kvFitRunning === 1 && _kvFitSig === sig) return
+    for (var i = 0; i < _kvFitQueue.length; i++)
+      if (_kvFitQueue[i] === entry.modelPath) return
+    var q = _kvFitQueue.slice()
+    q.push(entry.modelPath)
+    _kvFitQueue = q
+    _pumpKvFit()
+  }
+
+  function _pumpKvFit() {
+    if (_kvFitRunning === 1) return
+    while (_kvFitQueue.length > 0) {
+      var q = _kvFitQueue.slice()
+      var path = q.shift()
+      _kvFitQueue = q
+      var st = _storeFor(path)
+      if (!st) continue
+      var sig = _fitSignatureFor(path)
+      if (sig === "" || _kvFitCache[sig] !== undefined) continue
+      var ngl = _fitNglFor(st)
+      if (ngl === null) { _declineTier5(st); continue }
+      _kvFitPath = path
+      _kvFitSig = sig
+      _kvFitNgl = ngl
+      _kvFitTail = _buildFitArgv(path, ngl, _fitDtype(st, "cacheK"),
+                                 _fitDtype(st, "cacheV"), _fitCtxFor(st))
+      _kvFitBuffer = ""
+      _kvFitRunning = 1
+      launch(kvFitProcess, kvFitWatchdog)
+      return
+    }
+  }
+
+  function _onFitLine(line) {
+    if (_kvFitBuffer.length + String(line).length + 1 <= _kvProbeBufferMax)
+      _kvFitBuffer += line + "\n"
+  }
+
+  function _finishKvFit(exitCode) {
+    var path = _kvFitPath, sig = _kvFitSig, out = _kvFitBuffer
+    _kvFitRunning = 0
+    _kvFitPath = ""
+    _kvFitSig = ""
+    _kvFitNgl = -1
+    _kvFitTail = []
+    _kvFitBuffer = ""
+    if (sig === "") { _pumpKvFit(); return }
+
+    // 97 is definitive and permanent: the tool is not installed. Cache it once and
+    // decline every tier-5 field for every store, because without that the three
+    // fields would hang at `…` forever — the one thing the store must never do.
+    if (exitCode === 97) {
+      _tier5Available = false
+      _fitProbed = true
+      var list = runningModels || []
+      for (var i = 0; i < list.length; i++)
+        _declineTier5(_storeFor(list[i] ? list[i].modelPath : ""))
+      _pumpKvFit()
+      return
+    }
+
+    // Only a clean 0 is a projection; the `timeout` wrapper answers 124 on expiry
+    // and 137 after SIGKILL. Everything else — an unknown flag, a backend with no
+    // common_fit_print, an out-of-memory abort — is an answer of "no", and there
+    // is exactly ONE attempt per signature: a model-header parse plus a fit print
+    // is not cheap, so a retry loop only produces a slower panel and a hot loop.
+    var parsed = (exitCode === 0) ? parseFitParams(out) : null
+    _kvFitCache[sig] = { ok: !!(parsed && parsed.deviceRows.length > 0), parsed: parsed }
+    var st = _storeFor(path)
+    if (st) {
+      if (parsed && parsed.deviceRows.length > 0) {
+        _t5(st, "kvGpuBytes", parsed.deviceTotal.context)
+        _t5(st, "kvCpuBytes", parsed.hostTotal.context)
+        _t5(st, "computeBytes", parsed.deviceTotal.compute)
+      } else {
+        _t5(st, "kvGpuBytes", null)
+        _t5(st, "kvCpuBytes", null)
+        _t5(st, "computeBytes", null)
+      }
+      _settle(st)
+    }
+    _pumpKvFit()
   }
 
   // Tier 3: when the API and the preset both left ngl unknown, derive the layer
@@ -2251,8 +3855,8 @@ exec "$cli" "$@"`
     // A split we already own (Tier 3) may be refreshed; an API/preset one never.
     if (entry.mainGpu !== null && entry._gpuSplitSource !== "probe") return
     var kv = _resolveKvBytes(entry)
-    var on = _kvPlacement(entry.noKvOffload === true, entry.mainGpu, entry.mainLayers,
-                          kv.value, _placementMeasurements())
+    var on = _kvLocationOf(entry.noKvOffload === true, entry.mainGpu, kv.value,
+                          _placementMeasurements())
     var probe = _estimateSplitFromProbes(
       entry.sizeBytes > 0 ? entry.sizeBytes : 0, total, serviceVramBytes,
       on === "GPU" ? kv.value : 0, entry.computeBytes)
@@ -2271,7 +3875,7 @@ exec "$cli" "$@"`
              sole: (runningModels || []).length === 1 }
   }
 
-  // KV size for an entry, with the tier that answered: Tier 3.5 (the engine's
+  // KV size for an entry, with the tier that answered: tier 6 (the engine's
   // own accounting — exact, no marker) → Tier 4 (derivation from the header,
   // "~") → nothing ("—"). Never a fabricated number.
   function _resolveKvBytes(entry) {
@@ -2346,7 +3950,7 @@ exec "$cli" "$@"`
     var ctx = (isFinite(entry.contextLen) && entry.contextLen > 0) ? entry.contextLen : -1
     // Tier 4 BLOCK: per-layer KV allocation derived from the header (SWA /
     // recurrent / shared / MLA). Unknown shape → -1, and the engine probe
-    // (Tier 3.5) is what answers for architectures whose files don't describe
+    // (tier 6) is what answers for architectures whose files don't describe
     // their own layout. _resolveKvBytes picks whichever of the two exists.
     entry.kvCacheBytes = _kvEstimateBytesArch(_buildKvLayers(g, entry.mainLayers, ctx, {
       ubatch: (isFinite(entry.ubatch) && entry.ubatch > 0) ? entry.ubatch : 512,
@@ -2360,6 +3964,18 @@ exec "$cli" "$@"`
     _applyProbeSplit(entry, total)
     if (entry._gpuSplitSource !== "preset" && entry._gpuSplitSource !== "probe")
       entry._gpuSplitSource = "api"
+    _tier2ToEntryStore(entry, g)
+  }
+
+  // The header has arrived for this model: park it on the store and let tier 2
+  // answer what the file can answer. Separate from the legacy entry fold above so
+  // the store never depends on which legacy field happened to be written first.
+  function _tier2ToEntryStore(entry, g) {
+    var st = _storeFor(entry ? entry.modelPath : "")
+    if (!st || !g) return
+    st.ctx.gguf = g
+    _applyTier2To(st)
+    _settle(st)
   }
 
   // Fold the parsed DRAFT (MTP) model header into its running-model entry: the
@@ -2376,6 +3992,13 @@ exec "$cli" "$@"`
     var split = _mtpSplit(entry.nglDraft, mtpLayers, mtpLayers)
     entry.mtpGpu = split.mtpGpu
     entry.mtpCpu = split.mtpCpu
+    var st = _storeFor(entry ? entry.modelPath : "")
+    if (st) {
+      st.ctx.draftGguf = g
+      // The draft header supersedes the base header's built-in MTP keys.
+      _applyTier2To(st)
+      _settle(st)
+    }
   }
 
   // Apply a freshly-parsed header to the matching running model and republish
@@ -2478,19 +4101,47 @@ exec "$cli" "$@"`
     if (!slot || typeof slot !== "object") {
       // Unparseable / empty / error response: assume busy so an in-flight
       // request is never unloaded on bad data.
-      _lastActivityMs = Date.now()
+      if (unloadInactivitySec > 0) _lastActivityMs = Date.now()
       return
     }
+    // First slot only, and that is not a shortcut: `?model=<id>` filters to that
+    // model's slots and they all share one n_ctx.
+    _applySlotsContext(_slotsModelId, parseInt(String(slot.n_ctx == null ? "" : slot.n_ctx), 10))
     var proc = (slot.is_processing === true) ? "1" : "0"
     var task = String(slot.id_task == null ? "" : slot.id_task)
     var sig = proc + ":" + task
     if (proc === "1") {
-      _lastActivityMs = Date.now()
+      if (unloadInactivitySec > 0) _lastActivityMs = Date.now()
     } else if (task !== "" && sig !== _lastSig) {
       // id_task advanced since the last poll → a request completed between polls.
-      _lastActivityMs = Date.now()
+      if (unloadInactivitySec > 0) _lastActivityMs = Date.now()
     }
     _lastSig = sig
+  }
+
+  // /slots `n_ctx` → tier 1's authoritative contextLen.
+  //
+  // It supersedes the argv-derived value because argv cannot say what the context
+  // ACTUALLY is: `--ctx-size 0` withholds it entirely, and `fit = on` is exactly
+  // that case. It is the only tier-1 source that is exact for such a model. When
+  // /slots declines (unloaded, no slot), the field is left pending for tier 2 —
+  // and NOT filled from the header's trained `context_length`, which is the
+  // model's capacity and can exceed the running allocation many times over.
+  function _applySlotsContext(id, nCtx) {
+    if (id === "" || !(isFinite(nCtx) && nCtx > 0)) return
+    var arr = runningModels || []
+    for (var i = 0; i < arr.length; i++) {
+      var e = arr[i]
+      if (!e || String(e.id == null ? "" : e.id) !== id) continue
+      var st = _storeFor(e.modelPath)
+      if (!st) return
+      // A server that reloads at a different resolved context answers with a
+      // different n_ctx, and that is a same-tier correction rather than a new
+      // answer — which is why this is the one tier-1 field that may revise.
+      _t1update(st, "contextLen", Math.round(nCtx))
+      _settle(st)
+      return
+    }
   }
 
   // ollama ps → running models
@@ -2637,6 +4288,11 @@ exec "$cli" "$@"`
     } else {
       serviceTotalBytes = -1
     }
+    // Every probe completion lands here, which makes it the one place a new
+    // measurement has to be projected into the stores. The current loaded set is
+    // the argument here: this fires outside the rebuild, so runningModels is
+    // current and the sole-attribution fact it carries is the right one.
+    _applyTier4(runningModels)
   }
 
   // ── Config file → JSON → state ──────────────────────────────────────
@@ -3009,7 +4665,7 @@ exec "$cli" "$@"`
     }
   }
 
-  // llama.cpp → Tier 3.5 engine KV accounting probe. The model's own
+  // llama.cpp → tier 6 engine KV accounting probe. The model's own
   // KV-relevant flags are replayed against `llama-cli` with -ngl 0 under an
   // address-space cap (kvProbeScript), and llama.cpp's own log lines are parsed
   // for the exact cache bytes, cache layer count and device graph reserve. The
@@ -3039,6 +4695,25 @@ exec "$cli" "$@"`
       // The `timeout` wrapper exits 124 on expiry and 137 after SIGKILL; only a
       // clean 0 means llama.cpp got through load, one turn and teardown.
       _finishKvProbe(exitCode === 0)
+    }
+  }
+
+  // llama.cpp → the model's own memory decomposition at a supplied -ngl
+  // (Tier 5). `--fit off --fit-print on` and `-ngl` are inside the script, so
+  // the argv below carries only what varies: the binary, the count, the path and
+  // the dtypes. One process at a time (llama-fit-params is CPU- and IO-heavy and
+  // every model wants its own run); the model path arrives only as a positional
+  // argument, so a path with spaces or `;` cannot become shell.
+  Process {
+    id: kvFitProcess
+    running: false
+    command: ["timeout", "-k", "2", "" + root.kvFitTimeoutSec,
+              "bash", "-c", root.kvFitScript, "dash"].concat(root._kvFitTail)
+    stdout: SplitParser { onRead: function(line) { root._onFitLine(line) } }
+    stderr: SplitParser { onRead: function(line) { root._onFitLine(line) } }
+    onExited: function(exitCode) {
+      kvFitWatchdog.stop()
+      _finishKvFit(exitCode)
     }
   }
 
@@ -3364,6 +5039,21 @@ exec "$cli" "$@"`
       reap(kvProbeProcess, kvProbeWatchdog)
       root._kvProbeAcc = { kvBytes: 0, kvLayers: 0, computeBytes: -1, blocks: [], compute: ({}), computeSeen: [] }
       root._finishKvProbe(false)
+    }
+  }
+
+  // Backup watchdog for the tier-5 projection. Strictly longer than the script's
+  // own `timeout`, so `timeout` always wins and this only reaps a wedged child.
+  Timer {
+    id: kvFitWatchdog
+    interval: root.kvFitWatchdogMs
+    repeat: false
+    onTriggered: {
+      reap(kvFitProcess, kvFitWatchdog)
+      // A projection that overran its timeout is "no answer", never a partial
+      // row: clearing the buffer first makes _finishKvFit decline, which settles
+      // the three fields to `—` rather than leaving them at `…`.
+      root._finishKvFit(124)
     }
   }
 

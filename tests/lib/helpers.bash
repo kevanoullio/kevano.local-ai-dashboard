@@ -17,7 +17,8 @@ GG="$(lconst ggufScript)"          # no-load GGUF header read
 MI="$(lconst modelsIniScript)"     # bounded models.ini preset read (Tier 5)
 UL="$(lconst unloadScriptLlama)"   # POST /models/unload
 SL="$(lconst slotsScriptLlama)"    # GET /slots?model=<id>
-KP="$(lconst kvProbeScript)"       # Tier 3.5 engine KV accounting probe wrapper
+KP="$(lconst kvProbeScript)"       # tier 6 engine KV accounting probe wrapper
+KF="$(lconst kvFitScript)"         # Tier 5 llama-fit-params projection wrapper
 
 # ---- sandbox ------------------------------------------------------------
 SB=""

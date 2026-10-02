@@ -1,6 +1,6 @@
 # Tier 5 — Engine projection
 
-**Cost** ~555 ms measured · **Role** decomposition · **Status** **to build**
+**Cost** ~555 ms measured · **Role** decomposition · **Status** **built**
 
 This tier is part of the llama.cpp service acquisition ladder. The ollama
 backend does not use any of these tiers — it reads everything directly from the
@@ -24,8 +24,12 @@ promotion that has not been built yet; it is the final state. `kvGpuBytes`,
 `kvCpuBytes` and `computeBytes` are its only three fields, and there is no
 promotion path for any of them.
 
-**Nothing in this tier exists in the code yet.** Everything below is the
-specification.
+**This tier is built.** Its producers — `_queueKvFit` / `_pumpKvFit` /
+`parseFitParams` in `Service.qml`, gated by `_tier5Available` and the
+`checkTier5Values` need-gate — commit the three fields below as `estimated`; the
+corroboration gate in §5 is **withdrawn** and nothing promotes them. The
+specification text below is retained as the rationale and the recorded
+calibration; where it disagrees with the shipped names, §8 carries the mapping.
 
 ---
 
@@ -272,51 +276,47 @@ retired.
 - **Per-layer residency.** It gives per-*device* totals, and the panel's
   layer-count split from them is still a `~`.
 
-## 8. Where the code goes
+## 8. Where the code lives
 
-New, mirroring the `_kvProbe*` scaffold exactly:
+The shipped names differ from the original draft; the mapping:
 
-| Piece | Mirrors |
+| Piece | Shipped |
 |---|---|
-| `kvFitScript` | `kvProbeScript` (`Service.qml:667`), plus the exit-97 absence probe and `ulimit -c 0` |
-| `kvFitBinary`, `kvFitTimeoutSec` | `kvProbeBinary`, `kvProbeTimeoutSec` (`Service.qml:628-630`) |
-| `kvFitProcess` + watchdog | `kvProbeProcess`, `_kvProbeWatchdogMs` |
-| `_kvFitCache`, `_kvFitQueue` | `_kvProbeCache`, `_kvProbeQueue` (`Service.qml:1992-1993`) |
-| `_kvFitSignatureFor` | `_kvProbeSignatureFor` (`Service.qml:2009`) |
-| `_parseKvFitLine` | `_parseKvProbeLine` (`Service.qml:2090`) |
-| `classifyDevice` | new |
-| the corroboration gate | new |
+| process + watchdog | `kvFitProcess`, `_pumpKvFit` |
+| cache / queue | `_kvFitCache`, `_kvFitQueue` |
+| signature | `_fitSignatureFor` (includes `-ngl`, `ctx`, `np`, `cacheK`, `cacheV`) |
+| row parser | `_parseFitRow` |
+| whole-output parser | `parseFitParams` |
+| device classification | `_fitIsHost` (only `Host` is host; any other name is a device) |
+| MiB→bytes | `_fitMibToBytes` (the single conversion) |
+| field commits | `_t5`, `_declineTier5` |
+| need-gate | `checkTier5Values` |
+| binary / timeout | `kvFitBinary`, `kvFitTimeoutSec` |
+| script | `kvFitScript` (passed positional argv; `ulimit -c 0`) |
 
-**The signature must include `-ngl`.** Unlike the tier-6 probe, whose size is
+**The signature includes `-ngl`.** Unlike the tier-6 probe, whose size is
 device-independent, tier 5's answer *depends* on the offload count, so a
-change to `-ngl` must re-project. The signature is therefore
-`modelPath|ngl|ctx|np|batch|ubatch|cacheK|cacheV|swaFull|noKvUnified`.
+change to `-ngl` must re-project. This is `_fitSignatureFor`.
 
 ## 9. Tests
 
-- **`tst_derivation.qml`**, new groups:
-  - `fit/parse-*` — the verified output format, including the **trailing
-    space**, a **zero context column** on a real row, and an **empty stdout**
-    → no answer.
-  - `fit/classify-*` — `Host` → host, `CPU` → host, `CUDA0` / `CUDA1` /
-    `ROCM0` → device, an **unknown** name → device (never host).
-  - `fit/fold-*` — device rows summed across GPUs; `context` summed per class
-    separately from `model`, so a split survives the fold.
-  - `corroboration/accept` — the 12,815 vs 12,972 calibration → definitive.
-  - `corroboration/reject` — outside tolerance → `~`, observation wins.
-  - `corroboration/cannot-discriminate` — per-layer step below the offset
-    uncertainty → `~`, and the assertion that this is *not* recorded as a pass.
-  - `fit/argv-*` — `--fit off` and an explicit `-ngl` are always present;
-    `--flash-attn` is never present; `--cache-type-k/v` mirror the entry;
-    `ulimit -c 0` is present.
-- **A new `kv_fit.bats`**, modelled on `kv_probe.bats`: argv passes through
-  unchanged; **a hostile model path cannot run a command**; a missing engine
-  exits 97 without a hang and is not retried; a non-zero exit is "no answer";
-  the tool's own output survives the wrapper.
-- **`tests/support/dump_constants.qml`** gains `"kvFitScript"` to the dumped
-  names array, so `kv_fit.bats` executes the exact string the panel uses.
-  (`kvProbeScript` is already in that list; the `tests/README.md` inventory is
-  stale on this point.)
+- **`tests/unit_tests/tst_derivation.qml`** — `fit/parse-*` covers the verified
+  output format: the preamble line, a **trailing space**, a **zero column** on a
+  real row, a total row, a malformed row (`null`, not zero-filled), the
+  MiB→bytes conversion, the two-device fold, and empty stdout → `null`.
+  (`corroboration/*` is **not** tested because the gate was withdrawn; there is
+  nothing to accept or reject.)
+- **`tests/e2e_tests/e2e_preset.qml`** — `tier5/*` covers the per-device rows,
+  the device/host classification (including an unrecognised name defaulting to
+  device), the zero-context reading, `short-row-skipped` / `total-row-skipped`,
+  and that tier 5 commits `estimated` at tier 5 with no promotion by a weaker
+  tier.
+- **`tests/integration_tests/kv_fit.bats`** — modelled on `kv_probe.bats`:
+  argv passes through unchanged; a hostile model path cannot run a command; a
+  missing engine exits without a hang and is not retried; a non-zero exit is
+  "no answer"; the tool's own output survives the wrapper.
+- **`tests/support/dump_constants.qml`** dumps `kvFitScript` so `kv_fit.bats`
+  executes the exact string the panel uses (alongside `kvProbeScript`).
 
 ## 10. Open questions
 

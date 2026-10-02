@@ -70,7 +70,14 @@ Item {
     // Covered by e2e: e2e_llama_lifecycle.qml.
 
     // ── _finishSlots: idle-tracking state machine ────────────────────────
+    //
+    // The activity bookkeeping is conditional on auto-unload being enabled, but the
+    // POLL is not: /slots is also tier 1's exact source for the resolved context
+    // (argv cannot report it when the server was started with `--ctx-size 0`). So
+    // these cases set unloadInactivitySec explicitly, and the "tracking off" case
+    // is asserted separately below.
 
+    s.unloadInactivitySec = 300
     s._slotsModelId = "test-model"
     s._lastSig = ""
     s._lastActivityMs = 1000  // old baseline
@@ -131,14 +138,20 @@ Item {
 
     // ── _syncIdleTracking: baseline + reset logic ────────────────────────
 
+    // Disabled (0) + a loaded id → the poll STILL runs (its n_ctx is tier 1's
+    //  exact context), but the activity baseline is never started, so auto-unload
+    //  can never fire off a reading it is not tracking.
     s.unloadInactivitySec = 0
     s._slotsModelId = "old"
     s._lastSig = "x"
     s._lastActivityMs = 5000
     s._syncIdleTracking("any-id")
-    A.check("sync/disabled-resets-slots", s._slotsModelId, "")
-    A.check("sync/disabled-resets-sig", s._lastSig, "")
-    A.check("sync/disabled-resets-activity", s._lastActivityMs, -1)
+    A.check("sync/disabled-keeps-slots-id", s._slotsModelId, "any-id")
+    A.check("sync/disabled-no-activity-baseline", s._lastActivityMs, -1)
+    // ...and a poll that arrives with tracking off cannot advance anything.
+    s._slotsBuffer = '[{"is_processing":true,"id_task":7}]'
+    s._finishSlots()
+    A.check("sync/disabled-poll-does-not-advance", s._lastActivityMs, -1)
 
     // Enabled + new id → sets baseline
     s.unloadInactivitySec = 300

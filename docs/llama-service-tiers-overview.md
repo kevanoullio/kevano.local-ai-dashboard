@@ -52,11 +52,12 @@ answering badly.**
 | 2 | Model file | ~15 ms | definitive | bounded 16 KiB GGUF header | **exists** |
 | 3 | Preset config | ~5 ms | definitive | `models.ini` section over `[*]` → `presetNgl` | **exists** |
 | 4 | System observation | ~20 ms | measured | per-PID `nvidia-smi`/`rocm-smi`, cgroup `anon+shmem` | **exists** |
-| 5 | Engine projection | ~555 ms typical | decomposition | `llama-fit-params --fit off --fit-print on -ngl N` | **to build** |
-| 6 | Deep engine observation | 3–45 s | definitive | `llama-cli --verbose` | **partly exists** (as today’s "Tier 3.5" probe) |
+| 5 | Engine projection | ~555 ms typical | decomposition | `llama-fit-params --fit off --fit-print on -ngl N` | **exists** |
+| 6 | Deep engine observation | 3–45 s | definitive | `llama-cli --verbose` | **exists** (the KV accounting probe; there is no tier 3.5) |
 
-Tiers 1–4 are active in the shipped panel; **5 and 6 are planned and not yet
-built.**
+All six tiers are active in the shipped panel. Tier 5 answers only when no
+stronger rung has, and tier 6 only when the projection cannot describe
+the model at all (§8) — neither is on the hot path.
 
 Cost is wall-clock for one model, and is dominated by process spawn — hence
 "already one batched call" for tier 1 and "one 555 ms run per model, not per

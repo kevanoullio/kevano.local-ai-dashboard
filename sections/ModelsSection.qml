@@ -68,35 +68,61 @@ Item {
     var m = modelData || {}
     var s = root.service
     function num(v) { var n = Number(v); return (v !== undefined && v !== null && isFinite(n) && n >= 0) ? n : -1 }
-    var total = num(m.totalLayers)
-    var main = num(m.mainLayers)
-    var mtp = num(m.mtpLayers)
-    var mtpSize = num(m.mtpSizeBytes)
-    var mtpGpu = num(m.mtpGpu)
-    var mtpCpu = num(m.mtpCpu)
-    var ctxLen = num(m.contextLen)
-    var sizeBytes = num(m.sizeBytes)
-    var draftSize = num(m.draftSizeBytes)
 
-    // Single source of precedence: Service.qml's _resolveFieldSources tags every
-    // field with its winning Tier (1=API / 2=GGUF / 3=probe / 4=derivation /
-    // 5=preset) and its render marker ("", "~", "—") exactly once, so the
-    // decisions below consume resolved values instead of re-deriving the ladder.
-    // A VRAM reading that lands after the GGUF header still shows as a live
-    // Tier-3 estimate (via the resolver's gpuSplit) without waiting for the
-    // next /v1/models poll — same as the old inline estProbe.
+    // ONE reader, and it is a reader: Service._resolveFieldSources now returns
+    // store-resolved values with their STATE, so the block below renders what the
+    // resolver decided instead of re-deciding it. Three things follow from that:
+    //
+    //  - "…" (in flight) and "—" (looked for, not found) are different states
+    //    here, so a probe still running renders as waiting rather than as
+    //    missing. Before, both arrived as a single em-dash.
+    //  - A marker belongs to the FIELD it belongs to. The layer lines read
+    //    mainGpu's / mainCpu's own markers rather than the split composite's, so
+    //    an exact GPU count next to an estimated CPU count renders "~" on the CPU
+    //    line only.
+    //  - A per-device total is the worst of its inputs, not a hardcoded "~".
     var r = s._resolveFieldSources(m, {
       vramBytes: s.serviceVramBytes,
       memBytes: s.serviceMemoryBytes,
       presetSection: s._presetSectionFor(m)
     })
+    var PENDING = s.stateEnum.PENDING
+    var ABSENT = s.stateEnum.ABSENT
+    var EM = "\u2014"
+
+    var main = num(r.mainLayers.value)
+    var mtp = num(r.mtpLayers.value)
+    var mtpSize = num(r.mtpSizeBytes.value)
+    var draftSize = num(r.draftSizeBytes.value)
+    var ctxLen = num(r.contextLen.value)
+    var kvBytes = num(r.kvBytes.value)
     var gpuSplit = r.gpuSplit
     var gpu = gpuSplit.value ? num(gpuSplit.value.mainGpu) : -1
     var cpu = gpuSplit.value ? num(gpuSplit.value.mainCpu) : -1
 
-    function gb(b) { return b >= 0 ? s.formatGB(b) : "\u2014" }
-    function nn(n) { return n >= 0 ? String(n) : "\u2014" }
-    function nnP(n) { return n >= 0 ? (gpuSplit.marker === "~" ? "~" : "") + String(n) : "\u2014" }
+    function gb(b) { return b >= 0 ? s.formatGB(b) : EM }
+    // A value still in flight renders "…"; one that was looked for and not found
+    // renders "—". `field` carries both the value and its state, so this is the
+    // only place the distinction is made.
+    function val(field) {
+      if (!field) return EM
+      if (field.state === ABSENT) return EM
+      if (field.state === PENDING) return "\u2026"
+      return (typeof field.value === "number" && field.value >= 0) ? field.value : EM
+    }
+// A count with its OWN field's marker: exact → "", estimated → "~".
+    function nn(field) {
+      var v = val(field)
+      if (v === "…" || v === EM) return v
+      return (field.glyph === "~" ? "~" : "") + String(v)
+    }
+    // A dtype string: absent reads "—", still resolving reads "…".
+    function dtypeText(field) {
+      if (field.state === PENDING) return "…"
+      if (field.state === ABSENT) return EM
+      var t = String(field.value === null || field.value === undefined ? "" : field.value).trim()
+      return t === "" ? EM : t
+    }
     function comma(n) {
       var d = String(Math.round(n))
       var out = ""
@@ -108,112 +134,130 @@ Item {
     }
 
     // Core-only per-device weight bytes — what the layer lines show.
-    var coreGpuW = r.weightBytes.gpu
-    var coreCpuW = r.weightBytes.cpu
+    var coreGpuW = num(r.weightBytes.gpu)
+    var coreCpuW = num(r.weightBytes.cpu)
     // Combined per-device weights (core + draft/MTP share) — what the totals show.
+    var mtpGpu = num(r.mtpGpu.value), mtpCpu = num(r.mtpCpu.value)
     var gpuW = coreGpuW
     if (coreGpuW >= 0 && mtp > 0 && mtpGpu >= 0 && mtpSize > 0)
       gpuW += Math.round(mtpSize * mtpGpu / mtp)
     var cpuW = coreCpuW
     if (coreCpuW >= 0 && mtp > 0 && mtpCpu >= 0 && mtpSize > 0)
       cpuW += Math.round(mtpSize * mtpCpu / mtp)
-    var gpuEst = r.weightBytes.gpuMarker === "~"
-    var cpuEst = r.weightBytes.cpuMarker === "~"
+    function gbW(b, marker) {
+      return b >= 0 ? (marker === "~" ? "~" : "") + s.formatGB(b) : EM
+    }
 
-    function gbWg(b) { return b >= 0 ? (gpuEst ? "~" : "") + s.formatGB(b) : "\u2014" }
-    function gbWc(b) { return b >= 0 ? (cpuEst ? "~" : "") + s.formatGB(b) : "\u2014" }
     // Percent of the MAIN stack on each device; MTP/draft get their own Draft row.
+    // The percentage's marker is the WORST of the three inputs it is computed from,
+    // so a ratio built on an estimated count says so.
     var pGpu = -1
     var pCpu = -1
-    var pctEst = false
+    var pctEst = (r.mainGpu.glyph === "~" || r.mainCpu.glyph === "~" || r.mainLayers.glyph === "~")
     if (main > 0 && gpu >= 0 && cpu >= 0) {
       pGpu = s._percentLayersOnGPU(gpu, main)
       pCpu = s._percentLayersOnCPU(cpu, main)
-      pctEst = (gpuSplit.marker === "~")
     }
 
-    // Where the context/KV cache lives. `_kvPlacement` (Service.qml) is the only
-    // decider: `--no-kv-offload` and a zero offload count are exact, and the rest
-    // is a measurement — a KV-sized anonymous host block proves the cache is in
-    // RAM, and its absence from host RAM plus the presence of device memory
-    // proves it is on the device. Being offloaded does NOT mean the cache is on
-    // the GPU (llama.cpp's `--fit` drops it to host RAM when weights + KV no
-    // longer fit, which is exactly the Gemma4 case here), and neither does
-    // EVERY layer being offloaded — that is the same failure on a fully
-    // offloaded stack. "" = unknown: the Context and KV lines then omit the
-    // device and neither device total claims the cache.
-    var kv = r.kvBytes
-    var kvBytes = num(kv.value)
-    var ctxOn = s._kvPlacement(m.noKvOffload === true, gpu, main, kvBytes, {
-      memBytes: s.serviceMemoryBytes,
-      vramBytes: s.serviceVramBytes,
-      // Both service probes read the whole cgroup: with more than one model
-      // loaded neither reading belongs to this model alone.
-      sole: (s.runningModels.length === 1)
-    })
+    // Where the context/KV cache lives, straight from the resolver's placement
+    // ladder. Being offloaded does NOT mean the cache is on the GPU (llama.cpp's
+    // `--fit` drops it to host RAM when weights + KV no longer fit), and neither
+    // does EVERY layer being offloaded. "" = still deciding or unattributable: the
+    // Context and KV lines then omit the device and neither device total claims
+    // the cache.
+    var ctxOn = (r.kvLocation.state === ABSENT || r.kvLocation.state === PENDING)
+      ? "" : String(r.kvLocation.value || "")
 
     var lines = []
     // Quant label (gguf ftype enum from the GGUF header's general.file_type —
-    // Tier 2, exact) and param count (meta.n_params — Tier 1, exact). Each
-    // unknown renders "—"; the line is dropped when both quant and params are
-    // unknown. Rendered first, above Model Size.
-    if (r.params.value >= 0 || r.quant.value >= 0) {
-      var qLabel = (r.quant.value >= 0) ? s._ftypeLabel(r.quant.value) : -1
-      var pCount  = (r.params.value >= 0) ? s._formatCount(r.params.value) : -1
-      var q = (typeof qLabel === "string") ? qLabel : "\u2014"
-      var p = (typeof pCount  === "string") ? pCount  : "\u2014"
-      lines.push("Quant: " + q + " | " + p + " params")
-    }
-    // Model Size shows the main-stack layer count and CORE-only bytes (base
-    // minus built-in MTP; base file for separate draft) so it doesn't overlap
-    // the Draft row below.
-    var coreSize = -1
-    if (sizeBytes >= 0) {
-      if (draftSize > 0)                       coreSize = sizeBytes                       // separate draft: base file is pure main
-      else if (mtp > 0 && mtpSize > 0)        coreSize = Math.max(0, sizeBytes - mtpSize) // built-in MTP in one file
-      else                                    coreSize = sizeBytes
-    }
-    lines.push("Model Size: " + nn((main >= 0) ? main : total) + " layers | " + gb(coreSize))
-    var pctGpu = pGpu >= 0 ? (pctEst ? "~" : "") + pGpu + "%" : "\u2014"
-    var pctCpu = pCpu >= 0 ? (pctEst ? "~" : "") + pCpu + "%" : "\u2014"
-    lines.push("GPU Layers: " + nnP(gpu) + " | " + gbWg(coreGpuW) + " | " + pctGpu)
-    lines.push("CPU Layers: " + nnP(cpu) + " | " + gbWc(coreCpuW) + " | " + pctCpu)
+    // tier 2, exact) and param count (meta.n_params — tier 1, exact). Each half
+    // renders its OWN "…"/"—", and the line is never dropped: a row whose shape
+    // depends on which half is missing is a row no test can assert on.
+    var qLabel = (r.quant.state === PENDING) ? "\u2026" : ((r.quant.value >= 0) ? s._ftypeLabel(r.quant.value) : EM)
+    var pCount = (r.params.state === PENDING) ? "\u2026" : ((r.params.value >= 0) ? s._formatCount(r.params.value) : EM)
+    lines.push("Quant: " + qLabel + " | " + pCount + " params")
+    // Model Size shows the main-stack layer count and CORE-only bytes (base minus
+    // built-in MTP; the whole base file when the draft is a separate file) so it
+    // doesn't overlap the Draft row below.
+    lines.push("Model Size: " + nn(r.mainLayers.state === ABSENT ? r.totalLayers : r.mainLayers)
+               + " layers | " + gb(num(r.coreSize.value)))
+    var pctGpu = pGpu >= 0 ? (pctEst ? "~" : "") + pGpu + "%" : EM
+    var pctCpu = pCpu >= 0 ? (pctEst ? "~" : "") + pCpu + "%" : EM
+    lines.push("GPU Layers: " + nn(r.mainGpu) + " | " + gbW(coreGpuW, r.weightBytes.gpuMarker) + " | " + pctGpu)
+    lines.push("CPU Layers: " + nn(r.mainCpu) + " | " + gbW(coreCpuW, r.weightBytes.cpuMarker) + " | " + pctCpu)
     if (mtp > 0) {
-      var spec  = String(m.specType || "").trim()
+      var spec = String(r.specType.value || "").trim()
       var dType = (spec !== "") ? spec : "mtp"
       var dSize = (mtpSize > 0) ? mtpSize : ((draftSize > 0) ? draftSize : -1)
-      var dOn   = ""
+      var dOn = EM
       if (mtpGpu >= 0 && mtpCpu >= 0) {
-        if (mtpGpu >= mtp && mtpCpu === 0)       dOn = "on GPU"
+        if (mtpGpu >= mtp && mtpCpu === 0)      dOn = "on GPU"
         else if (mtpCpu >= mtp && mtpGpu === 0) dOn = "on CPU"
         else if (mtpGpu > 0 && mtpCpu > 0)      dOn = "on GPU/CPU"
         else if (mtpGpu > 0)                    dOn = "on GPU"
-        else if (mtpCpu > 0)                   dOn = "on CPU"
+        else if (mtpCpu > 0)                    dOn = "on CPU"
+        // Both exhausted stays "—": omitting the device entirely made the row look
+        // as though it had no badge at all.
       }
       var dLayers = (mtp === 1) ? "1 layer" : mtp + " layers"
-      lines.push("Draft: " + dType + " | " + dLayers + " | " + gb(dSize) + (dOn !== "" ? " " + dOn : ""))
+      // The badge keeps its slot when it cannot be decided ("—"), so the row's
+      // shape does not depend on what the draft placement turned out to be.
+      lines.push("Draft: " + dType + " | " + dLayers + " | " + gb(dSize) + " | " + dOn)
     }
-    var ctxLine = "Context: " + (ctxLen >= 0 ? comma(ctxLen) + " tok" : "\u2014")
+    var ctxLine = "Context: " + (ctxLen >= 0 ? comma(ctxLen) + " tok" : (r.contextLen.state === PENDING ? "\u2026" : EM))
     if (ctxOn !== "") ctxLine += " on " + ctxOn
     lines.push(ctxLine)
     var kvLine = "KV Cache: " + (kvBytes > 0
-      ? (kv.marker === "~" ? "~" : "") + s.formatGB(kvBytes) : "\u2014")
-    if (m.cacheK !== "" || m.cacheV !== "") {
-      kvLine += " (K " + (m.cacheK !== "" ? m.cacheK : "f16") + " / V " + (m.cacheV !== "" ? m.cacheV : "f16") + ")"
-    }
+      ? (r.kvBytes.glyph === "~" ? "~" : "") + s.formatGB(kvBytes)
+      : (r.kvBytes.state === PENDING ? "\u2026" : EM))
+    // The dtype block renders whenever either dtype is resolved, including the
+    // both-default case: `f16 / f16` is information (it says the default was not
+    // overridden), and a row whose shape changes with the data is not. A dtype
+    // still resolving renders "…" rather than hiding the block.
+    if (r.cacheK.state !== ABSENT || r.cacheV.state !== ABSENT)
+      kvLine += " (K " + dtypeText(r.cacheK) + " / V " + dtypeText(r.cacheV) + ")"
     if (ctxOn !== "") kvLine += " on " + ctxOn
     lines.push(kvLine)
-    // Per-device totals: the combined weights always show when known (including
-    // 0.0 GB for a fully-empty-but-known device), and KV is added only when the
-    // cache is colocated on that device. A split model therefore shows its CPU
-    // weight bytes even though the KV cache is on GPU.
-    var gpuTotal = -1
-    if (gpuW >= 0) { gpuTotal = gpuW; if (kvBytes > 0 && ctxOn === "GPU") gpuTotal += kvBytes }
-    lines.push("GPU Total: " + (gpuTotal >= 0 ? "~" + s.formatGB(gpuTotal) : "\u2014"))
 
-    var cpuTotal = -1
-    if (cpuW >= 0) { cpuTotal = cpuW; if (kvBytes > 0 && ctxOn === "CPU") cpuTotal += kvBytes }
-    lines.push("CPU Total: " + (cpuTotal >= 0 ? "~" + s.formatGB(cpuTotal) : "\u2014"))
+    // Per-device totals. A cache that sits entirely on one device joins that
+    // device's total. A SPLIT cache is added by tier 5's own per-device
+    // `context` sums when it answered, because those are the only per-device KV
+    // split that exists. When tier 5 did not answer, the cache is added to
+    // NEITHER total and both are marked "~": rung 2 BOUNDS the split (at most
+    // `memBytes` can be in host) without stating it, and a bounded range is not a
+    // number — rendering mem/kv would put the error back.
+    var kvGpuSplit = num(r.kvGpuBytes.value)
+    var kvCpuSplit = num(r.kvCpuBytes.value)
+    var splitKnown = (ctxOn === "GPU/CPU") && kvGpuSplit >= 0 && kvCpuSplit >= 0
+
+    // One device's weights plus whatever of the cache PROVABLY belongs to it. The
+    // marker is the worst of the inputs that went in, not a hardcoded "~".
+    function deviceTotal(bytes, weightMarker, isGpu) {
+      if (bytes < 0) return EM
+      var total = bytes
+      var mark = (weightMarker === "~") ? "~" : ""
+      if (kvBytes > 0) {
+        if ((isGpu && ctxOn === "GPU") || (!isGpu && ctxOn === "CPU")) {
+          total += kvBytes
+          if (r.kvBytes.glyph === "~") mark = "~"
+        } else if (splitKnown) {
+          // Tier 5's per-class `context` sums: the only per-device KV split that
+          // exists. It is an estimate by construction, so the total is "~".
+          total += isGpu ? kvGpuSplit : kvCpuSplit
+          mark = "~"
+        } else {
+          // The cache belongs to neither total here: a split whose halves are
+          // unknown, or a placement that is still deciding. Both under-report, so
+          // both are "~". Rung 2 only BOUNDS the split (at most `memBytes` can be
+          // in host), and a bounded range is not a number — rendering mem/kv would
+          // put the error back.
+          mark = "~"
+        }
+      }
+      return mark + s.formatGB(total)
+    }
+    lines.push("GPU Total: " + deviceTotal(gpuW, r.weightBytes.gpuMarker, true))
+    lines.push("CPU Total: " + deviceTotal(cpuW, r.weightBytes.cpuMarker, false))
 
     return s.sanitize(lines.join("\n"))
   }

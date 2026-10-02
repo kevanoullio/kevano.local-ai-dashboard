@@ -130,20 +130,25 @@ answer, which is exactly the distinction the enum forces you to make. See
 `--fit` and after `--ctx-size`. That is strictly better than `meta.n_ctx` from
 the availability list, which is the *declared* value and may be overridden.
 
-So `contextLen` reads `/slots` first and falls back to tier 2's
-`llama.context_length`, with the precedence stated as a unit test covering both
-cases:
+So `contextLen` is a **tier-1-only** field: `/slots` `n_ctx` supersedes
+`/v1/models` `meta.n_ctx`, and there is **no tier-2 fallback**. The GGUF
+`<arch>.context_length` is the model's *trained capacity*, not the running
+allocation; it is never parsed, stored, or displayed. Sizing `kvBytes` from it
+would overstate the cache by whatever factor separates capacity from allocation
+(`qwen35moe.context_length` is `262144`, the shipped model serves `n_ctx:
+102912`).
 
 | Case | Source | State |
 |---|---|---|
-| model loaded | `/slots` → `n_ctx` | exact |
-| model not loaded | tier 2 → `llama.context_length` | exact |
+| model loaded | `/slots` → `n_ctx` (resolved) | exact |
+| loaded, `/slots` declined | `/v1/models` → `meta.n_ctx` (declared) | exact |
+| model not loaded | **none** — left unanswered; never the header | `…`/`—` |
 
 The decline condition is the absence of a slot for the model, not an unparseable
 number: an absent slot means the engine has not allocated, so there is no
-resolved value to read and the declared header value is the best available. This
-also matters for `kvBytes`, whose `cells` term is `contextLen` — reading a
-declared length where a resolved one exists is how a projection comes out wrong.
+resolved value to read. This also matters for `kvBytes`, whose `cells` term is
+`contextLen` — reading a trained capacity where a resolved length exists is
+exactly how a projection comes out several times too large.
 
 ## 3. What it cannot answer
 

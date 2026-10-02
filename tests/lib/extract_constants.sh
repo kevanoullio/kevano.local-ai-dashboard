@@ -11,6 +11,7 @@ CONSTS="$T/.cache/consts"
 mkdir -p "$CONSTS"
 
 # Assemble a run dir ({dump.qml, Common, Ui}) so qs.Commons resolves for Service.
+rm -rf "$T/.cache/Commons" "$T/.cache/Ui"
 cp -r "$T/support/Common"* "$T/support/Ui" "$T/.cache/"
 sed "s|@SERVICE_QML_PATH@|file://$ROOT/Service.qml|g" \
   < "$T/support/dump_constants.qml" > "$T/.cache/dump.qml"

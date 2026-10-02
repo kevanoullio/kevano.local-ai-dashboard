@@ -30,11 +30,12 @@ Item {
   Component.onCompleted: {
     s = A.service("@SERVICE_QML_PATH@", root, "llama.cpp")
     if (!s) return
-    A.ok("meta-e2e/service-created", s !== null, true)
+    A.ok("meta-e2e/service-created", s !== null)
 
     var fixture = { data: [
       { id: "test-model",
-        status: { value: "loaded", processor: "CPU", args: [] },
+        status: { value: "loaded", processor: "CPU",
+                  args: ["/usr/bin/llama-server", "--model", "/m/test-model.gguf"] },
         meta: { size: "1073741824", n_ctx: "131072", n_params: "30500000000" } },
       { id: "fit-model",
         status: { value: "loaded", processor: "CPU",
@@ -46,12 +47,14 @@ Item {
     s._finishJsonModels()
     A.ok("meta-e2e/running-populated", s.runningModels.length === 2)
 
-    // test-model: params came from the API (Tier 1); quant arrives via GGUF.
+    // test-model: params came from the API (Tier 1); quant arrives via GGUF. The
+    // model path arrives in args, because the resolver keys the store by it —
+    // patching the entry after the poll leaves it store-less, and every field in
+    // the block then reads "pending" for a reason that has nothing to do with meta.
     var testEntry = s.runningModels[0]
     A.check("meta-e2e/api-nparams", testEntry.nParams, 30500000000)
     A.check("meta-e2e/api-has-no-ftype", testEntry.ftype, -1)
     // Seed the real header-fold path: buffer a header that reports q4_k_m (15).
-    testEntry.modelPath = "/m/test-model.gguf"
     s._ggufCache = ({})
     s._ggufPath = "/m/test-model.gguf"
     s._ggufBuffer = "GGUF-OK\narch=qwen35\nblock_count=65\nhead_count=24\nhead_count_kv=4\nembedding_length=5120\nfile_type=15\n"
@@ -77,8 +80,14 @@ Item {
     // The Quant row is rendered FIRST, above the Model Size row.
     A.ok("meta-e2e/quant-first-line", String(d1).split("\n")[0].indexOf("Quant:") === 0)
     A.ok("meta-e2e/size-below-quant", String(d1).split("\n")[1].indexOf("Model Size:") === 0)
-    // fit-model: no n_params and never got a header → whole line omitted.
-    A.ok("meta-e2e/unknown-omits-quant", quantLineOf(d2) === "")
+// fit-model: no n_params and never got a header. The Quant row is NOT dropped:
+// each half renders its own state. The quant half is "…" — the header probe is
+// still out, so it is in flight — while the param half is "—" — the API reported
+// no n_params, so it is exhausted. Two different nothings, two different glyphs;
+// before the store they collapsed into one em-dash on both sides.
+    A.check("meta-e2e/unknown-keeps-quant-row", quantLineOf(d2), "Quant: … | — params")
+    A.check("meta-e2e/params-exhausted", s._stores["/m/fit-model.gguf"].read("nParams").state, "absent")
+    A.check("meta-e2e/quant-in-flight", s._stores["/m/fit-model.gguf"].read("ftype").state, "pending")
 
     A.finish()
   }

@@ -277,11 +277,10 @@ implies anything about the split, so a resolver that reported "tier 3 answered
 
 ## 9. Gaps to close
 
-1. **The `_queueKvProbe`-style need gate does not exist here yet.** A preset
-   read is cheap and once-per-session, so it is *not* worth gating — but the
-    resolver's `capabilities(3)` should still list only the fields tier 3 can
-    truly answer, so the walk does not report "tier 3 tried" for a field it never
-   looked at.
+1. ~~**The `_queueKvProbe`-style need gate does not exist here yet.**~~ **Closed
+   by construction.** A preset read is cheap and once-per-session, so it is *not*
+   gated — and `capabilities(3)` lists only `presetNgl`, so the walk never
+   reports "tier 3 tried" for a field it did not look at.
 2. **`_presetCache` is never invalidated on reload.** Correct under the plan
    (state is dropped on unload, re-fetched at load), but it must be added to
    the unload eviction list, or the "frozen while loaded" invariant breaks.
