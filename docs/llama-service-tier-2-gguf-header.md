@@ -6,10 +6,11 @@ This tier is part of the llama.cpp service acquisition ladder. The ollama
 backend does not use any of these tiers — it reads everything directly from the
 engine.
 
-A bounded read of the first 16 KiB of the `.gguf` file. No weights are read,
-nothing is mmapped past the prefix, no model is loaded, no device is touched.
-This tier is the reason the panel can report layer counts, the quantization,
-and the full KV-cache shape without running the engine.
+A bounded structural walk of the metadata KV section — at most the first
+32 MiB of the `.gguf` file. No weights are read, nothing is mmapped past the
+read window, no model is loaded, no device is touched. This tier is the reason
+the panel can report layer counts, the quantization, and the full KV-cache
+shape without running the engine.
 
 It answers **what the model is**. It never answers **where the model is** —
 the file knows nothing about the machine it was loaded on.
@@ -18,21 +19,43 @@ the file knows nothing about the machine it was loaded on.
 
 ## 1. The script
 
-`ggufScript` (`Service.qml:392`) is the most intricate single constant in the
-codebase, and it runs in **two passes** for a reason worth understanding.
+`ggufScript` (`Service.qml:407`) is the most intricate single constant in the
+codebase. It makes **one sequential structural walk** of the GGUF metadata KV
+section — not two passes, and not a search for key names.
 
-### Pass 1 — the hyperparameter prefix (16 KiB)
+### The walk
 
 ```bash
-head -c 16384 -- "$f" | od -A n -t x1 -v | awk '…'
+head -c 33554432 -- "$f" | od -A n -t x1 -v | awk -v SZ="$sz" '…'   # … | head -c "$2"
 ```
 
 `od -t x1` gives a flat hex stream; the awk program reassembles it into
-little-endian accessors (`u32le`, `u64le`, `u64lehex`, `byteat`, `unhex`) and
-searches for each wanted key by its length-prefixed UTF-8 name. The GGUF
-metadata KV section precedes the tensor table, and hyperparameters sit in the
-first few hundred bytes — long before the vocabulary and blob metadata, which
-run to megabytes.
+little-endian accessors (`byteat`, `u32le`, `u64le`, `unhex`) and consumes it
+exactly along the real GGUF boundaries — `magic u32 | version u32 | n_tensors
+u64 | n_kv u64`, then `n_kv` sequential entries of `keylen u64 | key | type
+u32 | value`. It keeps a small rolling buffer and, for each entry, decides by
+the (key, type) pair:
+
+- **wanted scalar** — `general.file_type` plus the 16 namespaced
+  hyperparameters below → buffer it, emit `key=value`;
+- **wanted per-layer array** with `count ≤ 1024` (`head_count_kv`,
+  `sliding_window_pattern`, `recurrent_layers`) → buffer it, emit
+  `key=a:v1,v2,…`;
+- **everything else** — every other string, every string array, and every
+  numeric array longer than 1024 elements → **skipped by its declared length**
+  (`skipn`), never buffered.
+
+The walk anchors on `general.architecture`: once it has the architecture name
+it knows the exact `<arch>.*` key names to capture (plus `general.file_type`),
+and it keeps walking until all `n_kv` entries are consumed. That is why it
+reaches `general.file_type` wherever it sits — in a real file, after the
+MB-sized vocabulary blob — and why it **stops at the end of the KV section**,
+never reading into the tensor table. Skipping everything it does not want by
+declared length is what makes the read memory-flat and bounded: only key names
+(≤256 B) and the wanted values are ever held, so a 14 GB model costs the same
+as a 1 GB one. The input is capped at the first 32 MiB (`head -c 33554432`);
+real KV sections are far shorter, so the walk normally finishes well before the
+cap.
 
 Keys are namespaced by the architecture read out of `general.architecture`:
 
@@ -54,35 +77,44 @@ Keys are namespaced by the architecture read out of `general.architecture`:
 | `rope_dimension_count` | `<arch>.attention.rope.dimension_count` |
 | `size` | from `stat -c %s`, not from the file |
 
-Output is `GGUF-OK`/`GGUF-NO` on line 1, then `arch=<name>`, then one
-`key=value` (scalars) or `key=a:v1,v2,…` (arrays) per hit.
+### Decoy immunity
 
-### Pass 2 — `general.file_type` (streamed)
+The walker recognizes a key only at a real KV boundary — the instant it has
+consumed that entry's own `keylen | key | type`. Bytes that spell a key name
+but sit **inside another key's string value** are payload: they were consumed
+as part of that value's declared length and dropped by `skipn`, never
+re-interpreted as a key. So a model publisher embedding decoy
+`general.architecture` / `<arch>.block_count` bytes in ordinary string
+metadata (a name, a description, a comment) cannot spoof the arch or layer
+count — the walk reads the file's **real** values. This is why the reader is a
+structural walk and not a substring search: a search for the byte sequence of
+`<arch>.block_count` would match such a decoy; the walk does not.
 
-```bash
-off=16384; cap=33554432; found=0;
-while [ "$off" -lt "$cap" ] && [ "$found" -eq 0 ]; do
-  chunk=$(dd if="$f" bs=4194304 skip=… count=1 | od … | awk '…');   # prints on first hit
-  if [ -n "$chunk" ]; then echo "file_type=$chunk"; found=1; fi
-  off=$((off + 4194304))
-done
-```
+### The oversized-array skip (the 1024 ceiling)
 
-`general.file_type` is a scalar that sits **after** the tokenizer/vocabulary
-blob, so in a real file it is far beyond any small head cap. Pass 2 streams
-the file in fixed 4 MiB blocks up to 32 MiB and stops at the first hit. It is
-bounded and memory-flat — a 14 GB model costs the same as a 1 GB one.
+A hostile or corrupt file can declare a numeric array with `count` up to 2⁶⁴.
+Buffering it — reading it via `need()` and concatenating element by element —
+would make *this walker* the quadratic hang the layer ceiling exists to
+prevent, and the child-process timeout on `ggufScript` does not bound QML/JS
+loops. So any numeric array longer than `kvLayersCap` (1024) elements takes
+the linear drop-as-you-go skip (`skipn`) instead of being buffered. Anything
+longer than the ceiling is meaningless downstream anyway — every consumer
+rejects layer counts above 1024 (§2) — so skipping it loses nothing.
 
-**Without pass 2 the Quant row is `—` for every large model.** The
-`gguf_header.bats` test `file_type after a large vocab blob` pins the real
-ordering.
+### Output and the first-line marker
 
-### The two-pass contract in one line
+Every path emits a first-line marker, including EOF truncation:
 
-Pass 1 is *positional* (16 KiB, everything early). Pass 2 is *searched*
-(streamed, one known key late). They share the same awk prologue, which is why
-`byteat` / `u32le` / `u64lehex` are duplicated verbatim at `Service.qml:407-412`
-and `:491-493`.
+- **`GGUF-NO`** (line 1, nothing else) — the file is missing, a symlink or
+  special file, not a GGUF magic, has an implausible KV count, is truncated
+  before `general.architecture`, or an entry fails its structural check. The
+  QML side treats this as "no header", not an error.
+- **`GGUF-OK`** (line 1) — `general.architecture` was confirmed. Followed by
+  `arch=<name>`, then one `key=value` (scalars) or `key=a:v1,v2,…` (arrays)
+  per wanted key found within the read window, and finally `size=<bytes>`
+  (from `stat -c %s`, not from the file). A file that is valid up to the
+  32 MiB window but truncated beyond it still reports `GGUF-OK` with whatever
+  keys fit — bounded by design.
 
 ### Reader safety
 
@@ -92,7 +124,8 @@ if [ ! -e "$f" ] || [ -L "$f" ] || [ ! -f "$f" ]; then echo GGUF-NO; exit 0; fi;
 
 Symlinks and special files are refused; a missing or non-GGUF file emits
 `GGUF-NO` and exits 0, which the QML side treats as "no header" rather than an
-error. The whole pipeline is `| head -c "$2"` with `$2 = capGguf` (2048).
+error. The input is capped at 32 MiB (`head -c 33554432`) and the output at
+`| head -c "$2"` with `$2 = capGguf` (2048).
 
 ## 2. Array typing and the trust guard
 
@@ -105,23 +138,34 @@ reading only u32 silently dropped it, fell back to the scalar `head_count`
 (8 heads instead of 2 on its full-attention layers), and reported
 **21.6 GiB instead of 2.81 GiB** — an 8× error on the KV cache.
 
-The trust guard:
+The trust guard (in the walker today):
 
 ```awk
-if (SP[NM[i]] == 1) { if (cnt == 0 || cnt > BC) continue }   # sparse index list
-else if (cnt != BC) continue                                  # per-layer array
+nm = (WANT[curkey] == 1 && arrcnt <= 1024) ? outname(curkey) : ""   # > 1024 → skipn
+good = (SP[nm] == 1) ? (arrcnt > 0 && arrcnt <= BC) : (BC > 0 && arrcnt == BC)
 ```
 
 - A **per-layer array** must have exactly `count == block_count`. Anything
   else is a misparse and is discarded.
 - **`recurrent_layers` is a sparse index list** and accepts
-  `0 < count <= block_count`, dropping out-of-range entries individually. It is
-  flagged sparse by `SP["recurrent_layers"] = 1`.
-- Every entry is bounds-checked against the bytes actually read
-  (`kb + klen2 + 16 + cnt*esz > blen → continue`).
+  `0 < count <= block_count`, dropping out-of-range entries individually
+  (`v >= block_count`). It is flagged sparse by `SP["recurrent_layers"] = 1`.
+- Every array read is bounds-checked against the bytes actually read:
+  `need(12 + nbyte)` returns 0 on EOF and the walk stops under the first-line
+  marker protocol (§1) — a truncated array never emits partial data.
+
+**The layer-count ceiling (`kvLayersCap`).** The same 1024 ceiling is
+re-enforced on the QML side: `_applyGguf` parses `block_count` as
+`bc = isFinite(val) && val <= kvLayersCap ? val : -1`
+(`Service.qml:4141`), and `_buildKvLayers` rejects `m > kvLayersCap`
+(`Service.qml:2178`). So a file that claims more than 1024 layers — genuine or
+spoofed — parses as `bc = -1`, the header is untrusted, every tier-2 field
+stays `—`, and tier 6 answers. The ceiling bounds `_buildKvLayers`' per-layer
+loops to ~200 KB of JS objects even against hostile input; the child-process
+timeout on `ggufScript` does not bound QML/JS loops.
 
 A header is only cached when it is **confirmed** and carries a usable layer
-count: `if (!ok || bc < 0 || path === "") return` (`Service.qml:2448`).
+count: `if (!ok || bc < 0 || path === "") return` (`Service.qml:4161`).
 "Confirmed but marker-less" is still cached — the marker is the KV
 derivation's business, not the header's.
 
@@ -427,7 +471,7 @@ tier-2 field is not enqueued at all.
 
 ## 8. Tests
 
-- **`gguf_header.bats`** (16 tests) — the binary contract, with a Python
+- **`gguf_header.bats`** (19 tests) — the binary contract, with a Python
   fixture (`gen_gguf`) that is the single source of truth for the layout:
   valid file → `arch`/`block_count`/`head_count`/`head_count_kv`/
   `embedding_length`/`file_type`; hybrid keys absent; `file_type` **after** a
@@ -435,7 +479,9 @@ tier-2 field is not enqueued at all.
   per-layer arrays and the `count != block_count` trust guard; sparse
   `recurrent_layers` accepted; out-of-range entries dropped; bool-element
   arrays; MLA `kv_lora_rank` + `rope.dimension_count`; i32 arrays (gemma4);
-  64-bit strides.
+  64-bit strides; decoy `arch`/`block_count` KVs embedded in a string value
+  cannot spoof the walk; decoy `file_type` KV in a string value is ignored;
+  truncated file → `GGUF-NO` first, no `size=`.
 - **`tst_derivation.qml`**, prefixes `gguf/*`, `hybrid/*`, `kvarch/*`,
   `cells/*`, `dense-declared/*`, `keylen-explicit`:
   `gguf/array-hckv-first`, `gguf/array-hckv-last`, `gguf/array-fold-kv`,
@@ -444,7 +490,12 @@ tier-2 field is not enqueued at all.
   `gguf/no-marker-layers`, `gguf/no-marker-still-uncached`;
   `kvarch/gemma4-deployed-mib`, `kvarch/gemma4-deployed-bytes`,
   `kvarch/gemma4-spec`, `kvarch/no-arch-table`, `kvarch/no-arch-switch`,
-  `kvarch/absent-window-not-dense`.
+  `kvarch/absent-window-not-dense`;
+  `kvarch/cap-property`, `kvarch/cap-at-limit`, `kvarch/cap-over-limit`,
+  `kvarch/cap-bc-fallback-over`, `kvarch/cap-buffer-uncached`,
+  `kvarch/cap-buffer-totalLayers` (the `kvLayersCap` boundary: a spec at
+  exactly 1024 layers builds, 1025 declines, and an over-ceiling
+  `block_count` parses to `-1` → uncached → `totalLayers` stays `—`).
   The `gemma4-deployed-*` group asserts the **deployed file's** byte total and
   its `formatGB` rendering, which is what caught the 8× i32 bug.
 - **`e2e_mtp_draft.qml`** (39 asserts) — the built-in-MTP arc through the real
@@ -458,5 +509,5 @@ tier-2 field is not enqueued at all.
 2. **`_ggufCache` is never evicted.** Under the plan, per-model state is
    dropped on unload — which must include the header entry.
 3. **`_finishGguf` has no `pending` gate**, so a header read already running
-   when every tier-2 field resolved is not cancelled. Low cost (one 16 KiB
-   read) but it is a `capabilities()`-consistency item.
+   when every tier-2 field resolved is not cancelled. Low cost (one read
+   bounded by the 32 MiB window) but it is a `capabilities()`-consistency item.

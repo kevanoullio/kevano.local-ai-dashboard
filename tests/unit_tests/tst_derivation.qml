@@ -335,6 +335,42 @@ Item {
     A.check("kvarch/unknown-vbits", s._kvEstimateBytesArch(sv4, 16, -1), -1)
     A.check("kvarch/null-spec", s._kvEstimateBytesArch(null, 16, 16), -1)
 
+    // Layer-count ceiling (kvLayersCap 1024): 1024 builds a full spec, 1025
+    // declines — the boundary must be exact, and a hostile block_count
+    // (spoofed u32, e.g. 4e9) must decline through BOTH entry paths: the
+    // mainLayers argument and the g.bc fallback.
+    var gCap = { arch: "qwen35", bc: 1024, hc: 24, hckv: 4, hckvArr: null, embd: 5120,
+      kl: -1, vl: -1, klswa: -1, vlswa: -1, swa: 0, swaPattern: -1,
+      swaPatternArr: null, recurrentArr: null, fai: -1, sharedKv: -1,
+      kvLoraRank: -1, ropeDim: -1 }
+    A.check("kvarch/cap-property", s.kvLayersCap, 1024)
+    var svCap = s._buildKvLayers(gCap, 1024, 96256,
+      { ubatch: 512, parallel: 1, swaFull: false, kvUnified: true })
+    A.ok("kvarch/cap-at-limit", svCap !== null)
+    A.check("kvarch/cap-at-limit-count", svCap.layers.length, 1024)
+    A.check("kvarch/cap-over-limit", s._buildKvLayers(gCap, 1025, 96256,
+      { ubatch: 512, parallel: 1, swaFull: false, kvUnified: true }), null)
+    var gCapHuge = {}
+    for (var capK in gCap) gCapHuge[capK] = gCap[capK]
+    gCapHuge.bc = 4000000000
+    A.check("kvarch/cap-bc-fallback-over", s._buildKvLayers(gCapHuge, -1, 96256,
+      { ubatch: 512, parallel: 1, swaFull: false, kvUnified: true }), null)
+    // Parse-side gate: a buffer carrying block_count=4000000000 must not
+    // produce a cached header (totalLayers stays unknown). Mirrors the exact
+    // _ggufBuffer injection pattern at tst_derivation.qml:658-662: setting
+    // _ggufBuffer does NOT auto-trigger the parse (no change handler), so
+    // _ggufPath must be set and _finishGguf() called explicitly — without
+    // the path the function returns at its path === "" gate and the test
+    // would pass vacuously.
+    s._ggufCache = ({})
+    s.runningModels = [{ modelPath: "/m/gcap.gguf", draftPath: "", ngl: "all",
+      contextLen: 96256, sizeBytes: 0, cacheK: "", cacheV: "", totalLayers: -1 }]
+    s._ggufPath = "/m/gcap.gguf"
+    s._ggufBuffer = "GGUF-OK\narch=qwen35\nblock_count=4000000000\nhead_count=24\nhead_count_kv=4\nembedding_length=5120\n"
+    s._finishGguf()
+    A.ok("kvarch/cap-buffer-uncached", s._ggufCache["/m/gcap.gguf"] === undefined)
+    A.check("kvarch/cap-buffer-totalLayers", s.runningModels[0].totalLayers, -1)
+
     // _finishGguf array-line parse: key=a:v1,v2,... → hckvArr/swaPatternArr.
     s._ggufCache = ({})
     s.runningModels = [{ modelPath: "/m/g5.gguf", draftPath: "", ngl: "all", contextLen: 262144,

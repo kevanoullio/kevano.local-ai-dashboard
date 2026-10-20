@@ -56,8 +56,8 @@ kevano.local-ai-dashboard/
 ├── manifest.json                    # Plugin metadata + entry point declaration
 ├── tests/                           # Hermetic test suite (unit, integration, e2e)
 │   ├── run_all.sh                   #   Orchestrates all test phases
-│   ├── unit_tests/                  #   8 QML harnesses (855 assertions)
-│   ├── integration_tests/           #   11 BATS files (86 tests)
+│   ├── unit_tests/                  #   8 QML harnesses (862 assertions)
+│   ├── integration_tests/           #   11 BATS files (89 tests)
 │   └── e2e_tests/                   #   7 sandbox lifecycle harnesses (154 assertions)
 └── README.md
 ```
@@ -80,7 +80,7 @@ The full architectural design is documented in [`docs/`](docs/). This section pr
 | # | Tier | Cost | Role | Status | Mechanism |
 |---|---|---|---|---|---|
 | 1 | Server API | ~5 ms | definitive | active | `GET /v1/models` incl. `status.args`, plus `GET /slots` for resolved `n_ctx` |
-| 2 | Model file (GGUF header) | ~15 ms | definitive | active | bounded 16 KiB header read — provides `totalLayers`, shape, quant |
+| 2 | Model file (GGUF header) | ~15 ms | definitive | active | bounded structural GGUF KV walk (first 32 MiB, no-load, decoy-immune) — provides `totalLayers`, shape, quant |
 | 3 | Preset config | ~5 ms | definitive | active | `models.ini` section over `[*]` globals — acquires the raw `n-gpu-layers` token; the split is derived |
 | 4 | System observation | ~20 ms | definitive | active | per-PID GPU memory + cgroup `anon+shmem` — hardware truth for placement |
 | 5 | Engine projection | ~555 ms | **permanently approximate** | active | `llama-fit-params --fit off --fit-print on -ngl N` — per-device byte breakdown, integer MiB |
@@ -112,7 +112,7 @@ no confirmation tier exists or is planned
 |---|---|
 | [docs/llama-service-tiers-overview.md](docs/llama-service-tiers-overview.md) | **Start here.** Governing principles, all six tiers at a glance, resolver logic, certainty rules, lifecycle. |
 | [docs/llama-service-tier-1-server-api.md](docs/llama-service-tier-1-server-api.md) | `GET /v1/models` + resolved `status.args` command line parsing. |
-| [docs/llama-service-tier-2-gguf-header.md](docs/llama-service-tier-2-gguf-header.md) | Bounded 16 KiB GGUF header read. Provides `totalLayers`, shape, quantization. |
+| [docs/llama-service-tier-2-gguf-header.md](docs/llama-service-tier-2-gguf-header.md) | Bounded structural GGUF header walk (first 32 MiB, decoy-immune). Provides `totalLayers`, shape, quantization. |
 | [docs/llama-service-tier-3-preset-config.md](docs/llama-service-tier-3-preset-config.md) | `models.ini` preset, section over `[*]` globals. Resolves `n-gpu-layers` intent to a split. |
 | [docs/llama-service-tier-4-system-observation.md](docs/llama-service-tier-4-system-observation.md) | cgroup `anon+shmem` and per-PID GPU memory. The authoritative tier. |
 | [docs/llama-service-tier-5-engine-projection.md](docs/llama-service-tier-5-engine-projection.md) | `llama-fit-params --fit-print on` per-device decomposition. |
@@ -152,8 +152,8 @@ bash tests/run_all.sh
 
 Individual phases:
 
-- **Unit tests** (`tests/run_unit_tests.sh`) — 8 Quickshell harnesses (855 assertions) covering config parsing, defaults, exit-code maps, provisioning state, security contracts, input validators, and field derivation.
-- **Integration tests** (`tests/run_integration_tests.sh`) — 86 BATS tests across 11 files, exercising the embedded bash scripts (config reader/writer, env writer, provision create flows, rollback/unsafe matrices) against mocked `systemctl` and `systemd-analyze`.
+- **Unit tests** (`tests/run_unit_tests.sh`) — 8 Quickshell harnesses (862 assertions) covering config parsing, defaults, exit-code maps, provisioning state, security contracts, input validators, and field derivation.
+- **Integration tests** (`tests/run_integration_tests.sh`) — 89 BATS tests across 11 files, exercising the embedded bash scripts (config reader/writer, env writer, provision create flows, rollback/unsafe matrices) against mocked `systemctl` and `systemd-analyze`.
 - **End-to-end tests** (`tests/run_e2e_tests.sh`) — 7 sandbox harnesses (154 assertions) covering llama.cpp full lifecycle, rollback on start failure, and Dashboard→section signal wiring.
 
 These counts are derived, not typed: `tests/integration_tests/docs.bats` re-derives each one and fails naming the README line if it drifts. A contributor who adds a test and does not update this section gets a red test, which is the intended friction.

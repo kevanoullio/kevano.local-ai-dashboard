@@ -382,129 +382,217 @@ elif command -v rocm-smi >/dev/null 2>&1; then
  rocm-smi --showmeminfo vram 2>/dev/null | head -2;
  fi | head -c $2`
 
+   // Layer-count ceiling for header-derived values. The deepest published
+   // models are ~92 layers (Qwen 3.8 2.4T-A95B); 1024 is ~11x that headroom
+   // while bounding the per-layer loops in _buildKvLayers to ~200 KB of JS
+   // objects and sub-millisecond time even against a hostile block_count — an
+   // unbounded spoofed u32 (up to 2^32) would stall or OOM the shared shell,
+   // and the child-process timeout on ggufScript does not bound QML/JS loops.
+   readonly property int kvLayersCap: 1024
+
    // Bounded no-load GGUF header read (llama.cpp). $1 = .gguf path, $2 = cap.
-   // Reads ONLY the first 16 KiB (the metadata KV section precedes the tensor
-   // table) and pulls the arch id plus the u32 keys needed for totalLayers,
-   // the KV-cache estimate, and the quantization (general.file_type → ftype).
-   // No weights are read, nothing is mmap'd past the prefix, and no model is
-   // loaded. Emits a first-line marker (GGUF-OK / GGUF-NO) then `key=value`
-   // lines. Refuses symlinks / special files.
+   // ONE structural walk of the metadata KV section: the GGUF header is
+   // `magic u32 | version u32 | n_tensors u64 | n_kv u64`, then n_kv sequential
+   // entries of `keylen u64 | key | type u32 | value`. The walker consumes the
+   // stream exactly along those structural boundaries (buffering only the key
+   // and the values it needs; skipping all other strings/arrays by their
+   // declared lengths), so key-name bytes embedded inside another key's STRING
+   // value can never be mistaken for a real key — a model publisher embedding
+   // decoy `general.architecture` / `<arch>.block_count` bytes in ordinary
+   // string metadata reads the file's REAL arch and layer count, not the decoy.
+   // Reads at most the first 32 MiB of the file (general.file_type sits after
+   // the MB-sized vocab metadata); no weights are read, nothing is mmap'd, and
+   // no model is loaded. Emits a first-line marker (GGUF-OK / GGUF-NO) then
+   // `key=value` lines. Refuses symlinks / special files.
    readonly property string ggufScript: `
 f="$1";
 if [ ! -e "$f" ] || [ -L "$f" ] || [ ! -f "$f" ]; then echo GGUF-NO; exit 0; fi;
 sz=$(stat -c %s -- "$f" 2>/dev/null);
-{
-# Pass 1: bounded 16 KiB read for the early hyperparameters (scalar u32 OR
-# per-layer arrays; hyperparameters sit in the first few hundred bytes while the
-# vocab/blob metadata comes much later). Arrays are emitted as key=a:v1,v2,...
-# with a count==block_count trust guard (recurrent_layers is a sparse index list
-# so it accepts count <= block_count, dropping any out-of-range entries).
-# Element types: u32/i32 (4 B), u64/i64 (8 B), bool (1 B). head_count_kv is an
-# i32 array in gemma4, a u32 array elsewhere — only reading u32/bool silently
-# dropped it and fell the KV estimate back to head_count (8x too large).
-head -c 16384 -- "$f" | od -A n -t x1 -v | awk -v SZ="$sz" '
-BEGIN { for (i = 0; i < 256; i++) HEXVAL[sprintf("%02x", i)] = i; for (i = 32; i < 127; i++) { c = sprintf("%c", i); ORD[c] = i; HEXC[sprintf("%02x", i)] = c } }
-function hexof(s,  n, i, out) { out = ""; for (i = 1; i <= length(s); i++) out = out sprintf("%02x", ORD[substr(s, i, 1)]); return out }
+head -c 33554432 -- "$f" | od -A n -t x1 -v | awk -v SZ="$sz" '
+BEGIN {
+  for (i = 0; i < 256; i++) HEXVAL[sprintf("%02x", i)] = i
+  for (i = 32; i < 127; i++) { c = sprintf("%c", i); ORD[c] = i; HEXC[sprintf("%02x", i)] = c }
+  # phase: 0=magic 1=header 2=keylen 3=key 4=valtype 5=scalar 6=str-array-skip
+  phase = 0; H = ""; eof = 0; ok = 0; nodata = 0; nkvleft = -1
+  arch = ""; BC = 0
+  NSPLIT = 16
+  SFX[0] = "block_count";                    OUTN[0] = "block_count"
+  SFX[1] = "attention.head_count";           OUTN[1] = "head_count"
+  SFX[2] = "attention.head_count_kv";        OUTN[2] = "head_count_kv"
+  SFX[3] = "embedding_length";               OUTN[3] = "embedding_length"
+  SFX[4] = "nextn_predict_layers";           OUTN[4] = "nextn_predict_layers"
+  SFX[5] = "full_attention_interval";        OUTN[5] = "full_attention_interval"
+  SFX[6] = "attention.key_length";           OUTN[6] = "key_length"
+  SFX[7] = "attention.value_length";         OUTN[7] = "value_length"
+  SFX[8] = "attention.key_length_swa";       OUTN[8] = "key_length_swa"
+  SFX[9] = "attention.value_length_swa";     OUTN[9] = "value_length_swa"
+  SFX[10] = "attention.sliding_window";      OUTN[10] = "sliding_window"
+  SFX[11] = "attention.shared_kv_layers";    OUTN[11] = "shared_kv_layers"
+  SFX[12] = "attention.sliding_window_pattern"; OUTN[12] = "sliding_window_pattern"
+  SFX[13] = "attention.recurrent_layers";    OUTN[13] = "recurrent_layers"
+  SFX[14] = "attention.kv_lora_rank";        OUTN[14] = "kv_lora_rank"
+  SFX[15] = "attention.rope.dimension_count"; OUTN[15] = "rope_dimension_count"
+  SP["recurrent_layers"] = 1
+}
 function unhex(h,  n, i, out) { out = ""; for (i = 1; i + 1 <= length(h); i += 2) out = out HEXC[substr(h, i, 2)]; return out }
 function byteat(off) { return HEXVAL[substr(H, off * 2 + 1, 2)] }
 function u32le(off) { return byteat(off) + byteat(off + 1) * 256 + byteat(off + 2) * 65536 + byteat(off + 3) * 16777216 }
 function u64le(off,  i, out) { out = 0; for (i = 0; i < 8; i++) out = out + byteat(off + i) * (256 ^ i); return out }
-function u64lehex(v,  i, out) { out = ""; for (i = 0; i < 8; i++) out = out sprintf("%02x", int(v / (256 ^ i)) % 256); return out }
-{ buf = buf $0 }
-END {
-  gsub(/[ \t\r]/, "", buf)
-  H = buf
-  blen = int(length(H) / 2)
-  if (substr(H, 1, 8) != "47475546") { print "GGUF-NO"; exit }
-  pa = index(H, u64lehex(20) hexof("general.architecture"))
-  if (pa == 0) { print "GGUF-NO"; exit }
-  pb = int((pa - 1) / 2)
-  if (u32le(pb + 28) != 8) { print "GGUF-NO"; exit }
-  klen = u32le(pb + 32)
-  if (klen < 1 || klen > 64) { print "GGUF-NO"; exit }
-  arch = unhex(substr(H, (pb + 40) * 2 + 1, klen * 2))
-  print "GGUF-OK"
-  print "arch=" arch
-  n = 16
-  KS[0] = arch ".block_count";                  NM[0] = "block_count"
-  KS[1] = arch ".attention.head_count";         NM[1] = "head_count"
-  KS[2] = arch ".attention.head_count_kv";      NM[2] = "head_count_kv"
-  KS[3] = arch ".embedding_length";             NM[3] = "embedding_length"
-  KS[4] = arch ".nextn_predict_layers";         NM[4] = "nextn_predict_layers"
-  KS[5] = arch ".full_attention_interval";      NM[5] = "full_attention_interval"
-  KS[6] = arch ".attention.key_length";         NM[6] = "key_length"
-  KS[7] = arch ".attention.value_length";       NM[7] = "value_length"
-  KS[8] = arch ".attention.key_length_swa";     NM[8] = "key_length_swa"
-  KS[9] = arch ".attention.value_length_swa";   NM[9] = "value_length_swa"
-  KS[10] = arch ".attention.sliding_window";    NM[10] = "sliding_window"
-  KS[11] = arch ".attention.shared_kv_layers";  NM[11] = "shared_kv_layers"
-  KS[12] = arch ".attention.sliding_window_pattern"; NM[12] = "sliding_window_pattern"
-  KS[13] = arch ".attention.recurrent_layers";  NM[13] = "recurrent_layers"
-  KS[14] = arch ".attention.kv_lora_rank";      NM[14] = "kv_lora_rank"
-  KS[15] = arch ".attention.rope.dimension_count"; NM[15] = "rope_dimension_count"
-  SP["recurrent_layers"] = 1
-  for (i = 0; i < n; i++) {
-    p = index(H, u64lehex(length(KS[i])) hexof(KS[i]))
-    if (p == 0) continue
-    kb = int((p - 1) / 2) + 8
-    klen2 = length(KS[i])
-    vt = u32le(kb + klen2)
-    if (vt == 4) {
-      v = u32le(kb + klen2 + 4)
-      print NM[i] "=" v
-      if (NM[i] == "block_count" && v > 0) BC = v
-    } else if (vt == 9) {
-      et = u32le(kb + klen2 + 4)
-      cnt = u64le(kb + klen2 + 8)
-      if (et == 4 || et == 5) esz = 4
-      else if (et == 10 || et == 11) esz = 8
-      else if (et == 7) esz = 1
-      else continue
-      if (kb + klen2 + 16 + cnt * esz > blen) continue
-      if (SP[NM[i]] == 1) { if (cnt == 0 || cnt > BC) continue }
-      else if (cnt != BC) continue
-      line = NM[i] "=a:"
-      nv = 0
-      for (j = 0; j < cnt; j++) {
-        eo = kb + klen2 + 16 + j * esz
-        if (esz == 8) v = u64le(eo)
-        else if (esz == 4) v = u32le(eo)
-        else v = byteat(eo)
-        if (SP[NM[i]] == 1 && !(v < BC)) continue
-        if (nv > 0) line = line ","
-        line = line v
-        nv++
-      }
-      if (nv > 0) print line
+function drop(n) { H = substr(H, n * 2 + 1) }
+function need(n,  __s) {
+  while (length(H) < n * 2) {
+    if (eof) return 0
+    if ((getline __s) <= 0) { eof = 1; return 0 }
+    gsub(/[ \t\r]/, "", __s); H = H __s
+  }
+  return 1
+}
+function skipn(n,  __t) {
+  while (n > 0) {
+    if (!need(1)) return 0
+    __t = int(length(H) / 2); if (__t > n) __t = n
+    drop(__t); n -= __t
+  }
+  return 1
+}
+function outname(name,  __i) {
+  if (name == "general.file_type") return "file_type"
+  for (__i = 0; __i < NSPLIT; __i++) if (name == arch "." SFX[__i]) return OUTN[__i]
+  return ""
+}
+function fail1() {
+  if (!ok) { print "GGUF-NO"; ok = 1 }
+  else if (!nodata && SZ ~ /^[0-9]+$/) print "size=" SZ
+  nodata = 1; exit 0
+}
+function pump() {
+  while (1) {
+    if (phase == 0) {
+      if (!need(4)) return
+      if (substr(H, 1, 8) != "47475546") fail1()
+      drop(4); phase = 1; continue
     }
+    if (phase == 1) {
+      if (!need(20)) return
+      nkvleft = u64le(12)
+      if (nkvleft <= 0 || nkvleft > 100000) fail1()
+      drop(20); phase = 2; continue
+    }
+    if (phase == 2) {
+      if (nkvleft <= 0) exit 0
+      if (!need(8)) return
+      klen = u64le(0)
+      if (klen < 1 || klen > 256) fail1()
+      drop(8); curkey = ""; phase = 3; continue
+    }
+    if (phase == 3) {
+      if (!need(klen)) return
+      curkey = unhex(substr(H, 1, klen * 2))
+      drop(klen); phase = 4; continue
+    }
+    if (phase == 4) {
+      if (!need(4)) return
+      vt = u32le(0); drop(4)
+      vrem = -1
+      if (vt == 0 || vt == 1) vrem = 1
+      else if (vt == 2 || vt == 3) vrem = 2
+      else if (vt == 4 || vt == 5 || vt == 6) vrem = 4
+      else if (vt == 7) vrem = 1
+      else if (vt == 10 || vt == 11 || vt == 12) vrem = 8
+      if (vrem > 0) { phase = 5; continue }
+      if (vt == 8) {
+        if (!need(8)) return
+        slen = u64le(0)
+        if (curkey == "general.architecture" && arch == "" && slen >= 1 && slen <= 64) {
+          if (!need(8 + slen)) return
+          arch = unhex(substr(H, 17, slen * 2))
+          drop(8 + slen); nkvleft--
+          if (arch == "") fail1()
+          ok = 1; print "GGUF-OK"; print "arch=" arch
+          WANT["general.file_type"] = 1
+          for (wi = 0; wi < NSPLIT; wi++) WANT[arch "." SFX[wi]] = 1
+          phase = 2; continue
+        }
+        if (!skipn(8) || !skipn(slen)) return
+        nkvleft--; phase = 2; continue
+      }
+      if (vt == 9) {
+        if (!need(12)) return
+        arret = u32le(0); arrcnt = u64le(4)
+        arresz = 0
+        if (arret == 0 || arret == 1 || arret == 7) arresz = 1
+        else if (arret == 2 || arret == 3) arresz = 2
+        else if (arret == 4 || arret == 5 || arret == 6) arresz = 4
+        else if (arret == 10 || arret == 11 || arret == 12) arresz = 8
+        if (arresz > 0) {
+          nbyte = arrcnt * arresz
+          # Emit only arrays no longer than the layer ceiling (kvLayersCap).
+          # A hostile file can declare count up to 2^64; buffering it via
+          # need() and concatenating it element-by-element would make THIS
+          # walker the quadratic hang the ceiling exists to prevent. Anything
+          # longer than the ceiling is meaningless downstream (every consumer
+          # rejects layer counts > 1024), so it takes the linear
+          # drop-as-you-go skip instead — bounded by the 32 MiB input cap.
+          nm = (WANT[curkey] == 1 && arrcnt <= 1024) ? outname(curkey) : ""
+          if (nm != "" && (arret == 4 || arret == 5 || arret == 10 || arret == 11 || arret == 7)) {
+            if (!need(12 + nbyte)) return
+            good = (SP[nm] == 1) ? (arrcnt > 0 && arrcnt <= BC) : (BC > 0 && arrcnt == BC)
+            if (good) {
+              line = nm "=a:"; nv = 0
+              for (aj = 0; aj < arrcnt; aj++) {
+                eo = 12 + aj * arresz
+                if (arret == 10 || arret == 11) v = u64le(eo)
+                else if (arret == 7) v = byteat(eo)
+                else v = u32le(eo)
+                if (SP[nm] == 1 && !(v < BC)) continue
+                if (nv > 0) line = line ","
+                line = line v; nv++
+              }
+              if (nv > 0) print line
+            }
+            drop(12 + nbyte); nkvleft--; phase = 2; continue
+          }
+          if (!skipn(12 + nbyte)) return
+          nkvleft--; phase = 2; continue
+        }
+        if (arret == 8) { drop(12); nkvleft--; saleft = arrcnt; phase = 6; continue }
+        fail1()
+      }
+      fail1()
+    }
+    if (phase == 5) {
+      if (!need(vrem)) return
+      if (vt == 4 && WANT[curkey] == 1) {
+        v = u32le(0); nm = outname(curkey)
+        print nm "=" v
+        if (nm == "block_count" && v > 0) BC = v
+      }
+      drop(vrem); nkvleft--; phase = 2; continue
+    }
+    if (phase == 6) {
+      while (saleft > 0) {
+        if (!need(8)) return
+        el = u64le(0)
+        if (el > 1048576) fail1()
+        drop(8)
+        if (!skipn(el)) return
+        saleft--
+      }
+      phase = 2; continue
+    }
+    fail1()
   }
-  if (SZ ~ /^[0-9]+$/) print "size=" SZ
-}';
-# Pass 2: general.file_type is a scalar AFTER the (often MB-sized) tokenizer/
-# vocab metadata, so it is beyond any small head cap in real files. Stream the
-# file in fixed blocks (bounded, memory-flat) and print the value on first hit.
-off=16384; cap=33554432; found=0;
-while [ "$off" -lt "$cap" ] && [ "$found" -eq 0 ]; do
-  chunk=$(dd if="$f" bs=4194304 skip=$((off / 4194304)) count=1 2>/dev/null | od -A n -t x1 -v | awk '
-BEGIN { for (i = 0; i < 256; i++) HEXVAL[sprintf("%02x", i)] = i; for (i = 32; i < 127; i++) { c = sprintf("%c", i); ORD[c] = i; HEXC[sprintf("%02x", i)] = c } }
-function hexof(s,  n, i, out) { out = ""; for (i = 1; i <= length(s); i++) out = out sprintf("%02x", ORD[substr(s, i, 1)]); return out }
-function byteat(off) { return HEXVAL[substr(H, off * 2 + 1, 2)] }
-function u32le(off) { return byteat(off) + byteat(off + 1) * 256 + byteat(off + 2) * 65536 + byteat(off + 3) * 16777216 }
-function u64lehex(v,  i, out) { out = ""; for (i = 0; i < 8; i++) out = out sprintf("%02x", int(v / (256 ^ i)) % 256); return out }
-{ buf = buf $0 }
+}
+# Seed H from the FIRST input record: all reads happen via getline inside
+# need(), and the awk getline builtin starts at record 2 — without this the
+# main rule sees ($0, which carries the GGUF magic) is never consumed and
+# every valid file misparses as GGUF-NO.
+NR == 1 { gsub(/[ \t\r]/, "", $0); H = $0 }
+{ pump() }
 END {
-  gsub(/[ \t\r]/, "", buf)
-  H = buf
-  p = index(H, u64lehex(17) hexof("general.file_type"))
-  if (p) {
-    kb = int((p - 1) / 2) + 8
-    if (u32le(kb + 17) == 4) print u32le(kb + 17 + 4)
-  }
-}');
-  if [ -n "$chunk" ]; then echo "file_type=$chunk"; found=1; fi
-  off=$((off + 4194304))
-done
-} | head -c "$2"`
+  if (!ok) print "GGUF-NO"
+  else if (!nodata && SZ ~ /^[0-9]+$/) print "size=" SZ
+}' | head -c "$2"`
 
    // Tier-5 models.ini preset reader (llama.cpp). $1 = preset path, $2 = cap.
    // Bounded read: at most $2 bytes in and $2 bytes out. Emits normalized
@@ -947,7 +1035,7 @@ case "q5_0": return 5.25
       1: ["name", "sizeBytes", "contextLen", "nParams", "modelPath", "draftPath",
           "isCloud", "ngl", "nglDraft", "cacheK", "cacheV", "noKvOffload",
           "ubatch", "parallel", "swaFull", "noKvUnified", "specType"],
-      // 2 — Model file: bounded 16 KiB GGUF header
+      // 2 — Model file: bounded structural GGUF KV walk (first 32 MiB, no-load)
       2: ["ftype", "totalLayers", "mtpLayers", "draftSizeBytes",
           "kvDescribed", "kvBlockAligned"],
       // 3 — Preset config: models.ini section over [*] globals
@@ -2087,7 +2175,7 @@ case "q5_0": return 5.25
       if (_kvArchTemplate(g.arch) === null) return null
       var m = (isFinite(mainLayers) && mainLayers > 0) ? Math.round(mainLayers)
             : ((isFinite(g.bc) && g.bc > 0) ? Math.round(g.bc) : -1)
-      if (m <= 0) return null
+      if (m <= 0 || m > kvLayersCap) return null
       var a = args || {}
       var ubatch = (isFinite(a.ubatch) && a.ubatch > 0) ? Math.round(a.ubatch) : 512
       var parallel = (isFinite(a.parallel) && a.parallel > 0) ? Math.round(a.parallel) : 1
@@ -4049,7 +4137,9 @@ case "q5_0": return 5.25
       }
       var val = parseInt(rest, 10)
       if (key === "arch") arch = rest
-      else if (key === "block_count") bc = isFinite(val) ? val : -1
+      else if (key === "block_count") {
+        bc = isFinite(val) && val > 0 && val <= kvLayersCap ? val : -1
+      }
       else if (key === "head_count_kv") hckv = isFinite(val) ? val : -1
       else if (key === "head_count") hc = isFinite(val) ? val : -1
       else if (key === "embedding_length") embd = isFinite(val) ? val : -1
@@ -4720,7 +4810,7 @@ case "q5_0": return 5.25
   // llama.cpp → bounded no-load GGUF header read for the loaded model's own
   // metadata (totalLayers + KV-cache inputs). $1 = .gguf path, $2 = cap. The
   // path arrives only as a positional arg (never concatenated into the script);
-  // the script refuses symlinks/special files and reads at most 16 KiB.
+  // the script refuses symlinks/special files and reads at most the first 32 MiB.
   Process {
     id: ggufProcess
     running: false
