@@ -66,7 +66,7 @@ tests/
 │   ├── dump_constants.qml          # marker-JSON dump of Service.qml constants
 │   ├── Commons/                    # qs.Commons stubs (Style, Color, Border, Util)
 │   └── Ui/                         # qs.Ui stubs (Panel*, CursorSurface, ...)
-├── unit_tests/                     # Phase 2 — 8 quickshell harnesses (855 assertions)
+├── unit_tests/                     # Phase 2 — 8 quickshell harnesses (862 assertions)
 │   ├── tst_config_parser.qml
 │   ├── tst_defaults.qml
 │   ├── tst_derivation.qml
@@ -75,7 +75,7 @@ tests/
 │   ├── tst_security_contract.qml
 │   ├── tst_unload.qml
 │   └── tst_validators.qml
-├── integration_tests/              # Phase 3 — 11 bats files (86 tests)
+├── integration_tests/              # Phase 3 — 11 bats files (89 tests)
 │   ├── config_reader.bats
 │   ├── config_writer.bats
 │   ├── docs.bats

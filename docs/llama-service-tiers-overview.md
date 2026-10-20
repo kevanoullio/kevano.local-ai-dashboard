@@ -49,7 +49,7 @@ answering badly.**
 | # | Tier | Cost | Role | Mechanism | Status |
 |---|---|---|---|---|---|
 | 1 | Server API | ~5 ms | definitive | `GET /v1/models` incl. `status.args` | **exists** |
-| 2 | Model file | ~15 ms | definitive | bounded 16 KiB GGUF header | **exists** |
+| 2 | Model file | ~15 ms | definitive | bounded structural GGUF KV walk (first 32 MiB, no-load, decoy-immune) | **exists** |
 | 3 | Preset config | ~5 ms | definitive | `models.ini` section over `[*]` → `presetNgl` | **exists** |
 | 4 | System observation | ~20 ms | measured | per-PID `nvidia-smi`/`rocm-smi`, cgroup `anon+shmem` | **exists** |
 | 5 | Engine projection | ~555 ms typical | decomposition | `llama-fit-params --fit off --fit-print on -ngl N` | **exists** |

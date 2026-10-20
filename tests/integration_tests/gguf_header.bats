@@ -14,23 +14,41 @@ teardown() { [ "$FAIL" -eq 0 ]; sandbox_teardown; }
 # inserts a large tokenizer.ggml.tokens array BEFORE general.file_type to mimic
 # real llama.cpp ordering (file_type sits after the MB-sized vocab metadata).
 # Any optional arg omitted → not written.
+# gen_gguf gains an 11th optional arg `decoy`:
+#   "kv" — prepend a general.name string KV whose VALUE embeds a byte-for-byte
+#          fake general.architecture KV (value "spoofedarch") AND a fake
+#          <arch>.block_count KV (u32 4000000000). The pre-fix substring
+#          search matched these inside the string payload; the structural
+#          walker must read the file's REAL arch and layer count instead.
+#   "ft" — append a general.comment string KV (before general.file_type)
+#          embedding a fake general.file_type KV (u32 999); the walker must
+#          emit the REAL file_type.
+#   "" / omitted — unchanged behavior.
 gen_gguf() {
-  local out="$1" arch="$2" bc="$3" hc="$4" hckv="$5" embd="$6" npl="${7:-}" fai="${8:-}" ft="${9:-}" vocab="${10:-}"
-  python3 - "$out" "$arch" "$bc" "$hc" "$hckv" "$embd" "$npl" "$fai" "$ft" "$vocab" <<'PY'
+  local out="$1" arch="$2" bc="$3" hc="$4" hckv="$5" embd="$6" npl="${7:-}" fai="${8:-}" ft="${9:-}" vocab="${10:-}" decoy="${11:-}"
+  python3 - "$out" "$arch" "$bc" "$hc" "$hckv" "$embd" "$npl" "$fai" "$ft" "$vocab" "$decoy" <<'PY'
 import struct, sys
 
-out, arch, bc, hc, hckv, embd, npl, fai, ft, vocab = sys.argv[1:11]
+out, arch, bc, hc, hckv, embd, npl, fai, ft, vocab, decoy = sys.argv[1:12]
 
 def u32(v): return struct.pack('<I', int(v))
 def u64(v): return struct.pack('<Q', int(v))
-# GGUF string: u64 byte length + data (keys AND values).
-def sval(s): d = s.encode('utf-8'); return u64(len(d)) + d
-# GGUF array of strings: type ARRAY + elem type STRING + count + elements.
-def astr(n, fill): return u32(9) + u32(8) + u64(n) + b''.join(sval(fill) for _ in range(n))
+def sval(s): d = s.encode('utf-8') if isinstance(s, str) else s; return u64(len(d)) + d
+# GGUF array of strings: [u32 elem_type=STRING][u64 count][elements] — the
+# ARRAY value-type byte is written separately by the key loop below (a real
+# file's array value is [9][elem_type][count]; do NOT duplicate the 9).
+def astr(n, fill): return u32(8) + u64(n) + b''.join(sval(fill) for _ in range(n))
 
-keys = [
-    ('general.architecture', 8, sval(arch)),          # GGML_TYPE_STRING
-    (arch + '.block_count', 4, u32(bc)),              # GGML_TYPE_I32
+keys = []
+if decoy == 'kv':
+    fake = (u64(20) + b'general.architecture' + u32(8) + sval('spoofedarch')
+            + u64(len(arch.encode()) + 12) + (arch + '.block_count').encode()
+            + u32(4) + u32(4000000000))
+    name = b'decoy:' + fake + b':tail'
+    keys.append(('general.name', 8, u64(len(name)) + name))
+keys += [
+    ('general.architecture', 8, sval(arch)),
+    (arch + '.block_count', 4, u32(bc)),
     (arch + '.attention.head_count', 4, u32(hc)),
     (arch + '.attention.head_count_kv', 4, u32(hckv)),
     (arch + '.embedding_length', 4, u32(embd)),
@@ -39,13 +57,16 @@ if npl: keys.append((arch + '.nextn_predict_layers', 4, u32(npl)))
 if fai: keys.append((arch + '.full_attention_interval', 4, u32(fai)))
 if vocab and int(vocab) > 0:
     keys.append(('tokenizer.ggml.tokens', 9, astr(int(vocab), 'f' * 240)))
+if decoy == 'ft':
+    fake_ft = u64(17) + b'general.file_type' + u32(4) + u32(999)
+    keys.append(('general.comment', 8, u64(len(fake_ft)) + fake_ft))
 if ft:  keys.append(('general.file_type', 4, u32(ft)))
 
 with open(out, 'wb') as f:
-    f.write(b'GGUF')                     # magic
-    f.write(u32(3))                       # version
-    f.write(u64(0))                       # n_tensors
-    f.write(u64(len(keys)))              # n_metadata
+    f.write(b'GGUF')
+    f.write(u32(3))
+    f.write(u64(0))
+    f.write(u64(len(keys)))
     for k, t, v in keys:
         f.write(sval(k))
         f.write(u32(t))
@@ -126,8 +147,9 @@ PY
 
 @test "gguf header reader: file_type after a large vocab blob (real ordering)" {
   local fixture="$SB/cfg/tiny4.gguf"
-  # 70 × 240-byte vocab tokens push general.file_type well past the 16 KiB
-  # window of pass 1; the chunked follow-up scan must still report it.
+  # 70 × 240-byte vocab tokens push general.file_type deep into the KV section
+  # (past where any small prefix read would stop); the structural walk must
+  # still reach it before the tensor table.
   gen_gguf "$fixture" "qwen35" "65" "24" "4" "5120" "1" "4" "15" "70"
   run run_script "$GG" "$fixture" 512
   [ "$status" -eq 0 ]
@@ -275,4 +297,39 @@ PY
   [ "$status" -eq 0 ]
   [[ "$output" == *"head_count_kv=a:4,4,4,4,4,1"* ]]
   [[ "$output" == *"sliding_window_pattern=a:1,1,1,1,1,0"* ]]
+}
+
+@test "gguf header reader: decoy key bytes inside string metadata cannot spoof arch/block_count" {
+  local fixture="$SB/cfg/decoy.gguf"
+  gen_gguf "$fixture" "qwen35" "65" "24" "4" "5120" "" "" "" "" "kv"
+  run run_script "$GG" "$fixture" 512
+  [ "$status" -eq 0 ]
+  [[ "$output" == GGUF-OK* ]]
+  [[ "$output" == *"arch=qwen35"* ]]
+  [[ "$output" == *"block_count=65"* ]]
+  [[ "$output" != *"spoofed"* ]]
+  [[ "$output" != *"4000000000"* ]]
+}
+
+@test "gguf header reader: decoy file_type KV inside string metadata is ignored" {
+  local fixture="$SB/cfg/decoy-ft.gguf"
+  gen_gguf "$fixture" "qwen35" "65" "24" "4" "5120" "" "" "15" "" "ft"
+  run run_script "$GG" "$fixture" 512
+  [ "$status" -eq 0 ]
+  [[ "$output" == GGUF-OK* ]]
+  [[ "$output" == *"file_type=15"* ]]
+  [[ "$output" != *"file_type=999"* ]]
+}
+
+# Marker-first protocol on EOF truncation: a file that starts with the GGUF
+# magic but ends before the header completes must emit GGUF-NO on line 1 (the
+# pre-fix END block printed size= first, violating the first-line-marker
+# contract the plan documents).
+@test "gguf header reader: truncated file emits GGUF-NO first, no size=" {
+  local fixture="$SB/cfg/trunc.gguf"
+  printf 'GGUF\x03\x00\x00\x00' > "$fixture"
+  run run_script "$GG" "$fixture" 512
+  [ "$status" -eq 0 ]
+  [[ "$output" == GGUF-NO* ]]
+  [[ "$output" != *"size="* ]]
 }
